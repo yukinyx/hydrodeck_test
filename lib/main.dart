@@ -840,10 +840,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _telemetrySub = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
       if (event != null && mounted) {
         setState(() {
-          _connectionStatus = (event['isConnected'] == true) ? "Connected" : "Disconnected";
-          _lastValidPhValue = (event['ph'] as num).toDouble();
-          _lastValidWaterTemp = event['temp'];
-          _lastValidWaterStatus = event['water'];
+          bool isConnected = (event['isConnected'] == true);
+          _connectionStatus = isConnected ? "Connected" : "Disconnected";
+
+          // Only overwrite readings when connected; when disconnected/connecting, retain the last read readings
+          if (isConnected) {
+            if (event['ph'] != null) {
+              _lastValidPhValue = (event['ph'] as num).toDouble();
+            }
+            if (event['temp'] != null) {
+              _lastValidWaterTemp = event['temp'];
+            }
+            if (event['water'] != null) {
+              _lastValidWaterStatus = event['water'];
+            }
+          }
+
           if (event['ip'] != null) {
             _esp32Ip = event['ip'];
           }
@@ -1294,6 +1306,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                                 builder: (context) => SnapshotDetailScreen(
                                   data: log, 
                                   formattedTime: _formatDateTimeToReadable(log.timestamp),
+                                  minPh: _minPhThreshold,
+                                  maxPh: _maxPhThreshold,
                                 ),
                               ),
                             );
@@ -1488,11 +1502,21 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
 class SnapshotDetailScreen extends StatelessWidget {
   final HistoricalData data;
   final String formattedTime;
-  const SnapshotDetailScreen({super.key, required this.data, required this.formattedTime});
+  final double minPh;
+  final double maxPh;
+
+  const SnapshotDetailScreen({
+    super.key, 
+    required this.data, 
+    required this.formattedTime,
+    this.minPh = 5.5,
+    this.maxPh = 6.8,
+  });
 
   @override
   Widget build(BuildContext context) {
     bool isWaterFull = data.waterLevel == "Water full";
+    bool isPhOptimal = data.pH >= minPh && data.pH <= maxPh;
 
     return Scaffold(
       appBar: AppBar(
@@ -1519,24 +1543,32 @@ class SnapshotDetailScreen extends StatelessWidget {
 
             const Text('Grow Bed 1 (Historical Metrics)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
             const SizedBox(height: 12),
-            _buildStaticGrid(isWaterFull),
+            _buildStaticGrid(isWaterFull, isPhOptimal),
             
             const SizedBox(height: 24),
             const Text('Grow Bed 2 (Historical Metrics)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
             const SizedBox(height: 12),
-            _buildStaticGrid(isWaterFull),
+            _buildStaticGrid(isWaterFull, isPhOptimal),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildStaticGrid(bool isWaterFull) {
+  Widget _buildStaticGrid(bool isWaterFull, bool isPhOptimal) {
     return Column(
       children: [
         Row(
           children: [
-            Expanded(child: _buildStaticCard('ACIDITY (PH)', '${data.pH.toStringAsFixed(2)} pH', 'Log Data')),
+            Expanded(
+              child: _buildStaticCard(
+                'ACIDITY (PH)', 
+                '${data.pH.toStringAsFixed(2)} pH', 
+                isPhOptimal ? 'Normal' : 'Unstable',
+                bgOverride: isPhOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
+                textOverride: isPhOptimal ? Colors.green : Colors.orange,
+              )
+            ),
             const SizedBox(width: 16),
             Expanded(child: _buildStaticCard('TDS', '650 PPM', 'Historical')),
           ],
