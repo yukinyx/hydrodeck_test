@@ -296,6 +296,14 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     final limits = await DatabaseHelper.instance.getSettingsConfig();
     minPhThreshold = limits['minPh']!;
     maxPhThreshold = limits['maxPh']!;
+    
+    // Load last recorded values from persistent database on service start
+    final logs = await DatabaseHelper.instance.getLogs();
+    if (logs.isNotEmpty) {
+      lastPh = logs.first.pH;
+      lastTemp = logs.first.temperature;
+      lastWater = logs.first.waterLevel == "Water full" ? "full" : "low";
+    }
   } catch (_) {}
 
   service.on('updateIp').listen((event) {
@@ -335,12 +343,12 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         if (res.statusCode == 200) {
           final data = jsonDecode(res.body);
           if (data['ph'] != null) {
-            lastPh = (data['ph'] is num) ? (data['ph'] as num).toDouble() : 7.00;
+            lastPh = (data['ph'] is num) ? (data['ph'] as num).toDouble() : lastPh;
           }
           if (data['temp'] != null && data['temp'] != 0.0) {
             lastTemp = "${data['temp']}°C";
           }
-          lastWater = data['water'] ?? 'low';
+          lastWater = data['water'] ?? lastWater;
           
           targetIp = host;
           isConnected = true;
@@ -833,6 +841,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
       _historyLogs = storedLogs;
       _minPhThreshold = config['minPh'] ?? 5.5;
       _maxPhThreshold = config['maxPh'] ?? 6.8;
+      
+      // Populate last readings from persistent logs if available
+      if (storedLogs.isNotEmpty) {
+        _lastValidPhValue = storedLogs.first.pH;
+        _lastValidWaterTemp = storedLogs.first.temperature;
+        _lastValidWaterStatus = storedLogs.first.waterLevel == "Water full" ? "full" : "low";
+      }
     });
   }
 
@@ -840,22 +855,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _telemetrySub = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
       if (event != null && mounted) {
         setState(() {
-          bool isConnected = (event['isConnected'] == true);
-          _connectionStatus = isConnected ? "Connected" : "Disconnected";
-
-          // Only overwrite readings when connected; when disconnected/connecting, retain the last read readings
-          if (isConnected) {
-            if (event['ph'] != null) {
-              _lastValidPhValue = (event['ph'] as num).toDouble();
-            }
-            if (event['temp'] != null) {
-              _lastValidWaterTemp = event['temp'];
-            }
-            if (event['water'] != null) {
-              _lastValidWaterStatus = event['water'];
-            }
+          _connectionStatus = (event['isConnected'] == true) ? "Connected" : "Disconnected";
+          if (event['ph'] != null) {
+            _lastValidPhValue = (event['ph'] as num).toDouble();
           }
-
+          if (event['temp'] != null) {
+            _lastValidWaterTemp = event['temp'];
+          }
+          if (event['water'] != null) {
+            _lastValidWaterStatus = event['water'];
+          }
           if (event['ip'] != null) {
             _esp32Ip = event['ip'];
           }
