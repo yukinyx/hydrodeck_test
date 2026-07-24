@@ -2,8 +2,174 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
+import 'package:sqflite/sqflite.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
-void main() {
+// --- LOCAL DATABASE SERVICE ---
+class DatabaseHelper {
+  static final DatabaseHelper instance = DatabaseHelper._init();
+  static Database? _database;
+
+  DatabaseHelper._init();
+
+  Future<Database> get database async {
+    if (_database != null) return _database!;
+    _database = await _initDB('hydrodeck.db');
+    return _database!;
+  }
+
+  Future<Database> _initDB(String filePath) async {
+    final dbPath = await getDatabasesPath();
+    final path = p.join(dbPath, filePath);
+
+    return await openDatabase(
+      path,
+      version: 1,
+      onCreate: _createDB,
+    );
+  }
+
+  Future _createDB(Database db, int version) async {
+    await db.execute('''
+      CREATE TABLE historical_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        pH REAL NOT NULL,
+        temperature TEXT NOT NULL,
+        waterLevel TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE planting_history (
+        batchNumber INTEGER PRIMARY KEY,
+        startDate TEXT NOT NULL,
+        endDate TEXT NOT NULL,
+        totalDays INTEGER NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE active_session (
+        id INTEGER PRIMARY KEY,
+        startDate TEXT NOT NULL
+      )
+    ''');
+  }
+
+  // Historical Logs Queries
+  Future<void> insertLog(HistoricalData log) async {
+    final db = await instance.database;
+    await db.insert('historical_logs', {
+      'timestamp': log.timestamp.toIso8601String(),
+      'pH': log.pH,
+      'temperature': log.temperature,
+      'waterLevel': log.waterLevel,
+    });
+  }
+
+  Future<List<HistoricalData>> getLogs() async {
+    final db = await instance.database;
+    final result = await db.query('historical_logs', orderBy: 'timestamp DESC');
+    return result.map((json) => HistoricalData(
+      timestamp: DateTime.parse(json['timestamp'] as String),
+      pH: json['pH'] as double,
+      temperature: json['temperature'] as String,
+      waterLevel: json['waterLevel'] as String,
+    )).toList();
+  }
+
+  // Planting Runs History Queries
+  Future<void> insertPlantingRecord(PlantingRecord record) async {
+    final db = await instance.database;
+    await db.insert('planting_history', {
+      'batchNumber': record.batchNumber,
+      'startDate': record.startDate.toIso8601String(),
+      'endDate': record.endDate.toIso8601String(),
+      'totalDays': record.totalDays,
+    });
+  }
+
+  Future<List<PlantingRecord>> getPlantingHistory() async {
+    final db = await instance.database;
+    final result = await db.query('planting_history', orderBy: 'batchNumber ASC');
+    return result.map((json) => PlantingRecord(
+      batchNumber: json['batchNumber'] as int,
+      startDate: DateTime.parse(json['startDate'] as String),
+      endDate: DateTime.parse(json['endDate'] as String),
+      totalDays: json['totalDays'] as int,
+    )).toList();
+  }
+
+  // Session State Persistence
+  Future<void> saveActiveSession(DateTime startDate) async {
+    final db = await instance.database;
+    await db.insert(
+      'active_session',
+      {'id': 1, 'startDate': startDate.toIso8601String()},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<DateTime?> getActiveSession() async {
+    final db = await instance.database;
+    final result = await db.query('active_session', where: 'id = ?', whereArgs: [1]);
+    if (result.isNotEmpty) {
+      return DateTime.parse(result.first['startDate'] as String);
+    }
+    return null;
+  }
+
+  Future<void> clearActiveSession() async {
+    final db = await instance.database;
+    await db.delete('active_session', where: 'id = ?', whereArgs: [1]);
+  }
+}
+
+// --- NOTIFICATION SERVICE ---
+class NotificationHelper {
+  static final FlutterLocalNotificationsPlugin _notificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+
+  static Future<void> init() async {
+    const AndroidInitializationSettings androidSettings =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+    const InitializationSettings settings =
+        InitializationSettings(android: androidSettings);
+
+    await _notificationsPlugin.initialize(settings);
+
+    // Request permissions for Android 13+
+    _notificationsPlugin
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
+  }
+
+  static Future<void> showPhAlertNotification(double ph) async {
+    const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+      'ph_alerts_channel',
+      'pH Level Alerts',
+      channelDescription: 'Notifications for critical pH level limits',
+      importance: Importance.max,
+      priority: Priority.high,
+    );
+
+    const NotificationDetails details = NotificationDetails(android: androidDetails);
+
+    await _notificationsPlugin.show(
+      0,
+      '⚠️ Critical pH Alert',
+      'pH level has remained in critical range (${ph.toStringAsFixed(2)}) for over 20 seconds!',
+      details,
+    );
+  }
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await NotificationHelper.init();
   runApp(const HydrodeckApp());
 }
 
@@ -64,18 +230,18 @@ class MainGatekeeper extends StatefulWidget {
 }
 
 class _MainGatekeeperState extends State<MainGatekeeper> {
+  bool _isLoading = true;
   bool _isPlantingActive = false;
   DateTime? _plantingStartDate;
   List<PlantingRecord> _pastPlantingRuns = [];
   
-  // Shared active IP string auto-discovered upon launch
   String _activeEsp32Ip = "hydrodeck.local";
   Timer? _autoConnectTimer;
 
   @override
   void initState() {
     super.initState();
-    // Auto-connect probe triggered as soon as app opens
+    _loadStoredSessionAndData();
     _startAutoConnectionDiscovery();
   }
 
@@ -85,13 +251,27 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     super.dispose();
   }
 
-  // Automatic connection sequence probing for ESP32 on startup
+  // Load saved session state and historical batch records from DB
+  Future<void> _loadStoredSessionAndData() async {
+    final activeDate = await DatabaseHelper.instance.getActiveSession();
+    final pastRuns = await DatabaseHelper.instance.getPlantingHistory();
+
+    setState(() {
+      _pastPlantingRuns = pastRuns;
+      if (activeDate != null) {
+        _plantingStartDate = activeDate;
+        _isPlantingActive = true;
+      }
+      _isLoading = false;
+    });
+  }
+
   void _startAutoConnectionDiscovery() {
     final List<String> candidateHosts = [
       "hydrodeck.local",
       "192.168.1.100",
       "192.168.0.100",
-      "10.0.2.2" // Android emulator loopback host
+      "10.0.2.2"
     ];
 
     _autoConnectTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
@@ -109,35 +289,39 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
             });
             break; 
           }
-        } catch (_) {
-          // Probe next candidate silently
-        }
+        } catch (_) {}
       }
     });
   }
 
-  void _startPlanting() {
+  void _startPlanting() async {
+    final now = DateTime.now();
+    await DatabaseHelper.instance.saveActiveSession(now);
+
     setState(() {
-      _plantingStartDate = DateTime.now();
+      _plantingStartDate = now;
       _isPlantingActive = true;
     });
   }
 
-  void _endPlanting() {
+  void _endPlanting() async {
     if (_plantingStartDate == null) return;
     
     final now = DateTime.now();
     int totalDays = now.difference(_plantingStartDate!).inDays + 1;
 
+    final newRecord = PlantingRecord(
+      batchNumber: _pastPlantingRuns.length + 1,
+      startDate: _plantingStartDate!,
+      endDate: now,
+      totalDays: totalDays,
+    );
+
+    await DatabaseHelper.instance.insertPlantingRecord(newRecord);
+    await DatabaseHelper.instance.clearActiveSession();
+
     setState(() {
-      _pastPlantingRuns.add(
-        PlantingRecord(
-          batchNumber: _pastPlantingRuns.length + 1,
-          startDate: _plantingStartDate!,
-          endDate: now,
-          totalDays: totalDays,
-        ),
-      );
+      _pastPlantingRuns.add(newRecord);
       _isPlantingActive = false;
       _plantingStartDate = null;
     });
@@ -145,6 +329,14 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(color: Color(0xFF2DC867)),
+        ),
+      );
+    }
+
     if (!_isPlantingActive) {
       return StartPlantingScreen(
         onStart: _startPlanting,
@@ -374,11 +566,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   double _minPhThreshold = 5.5;
   double _maxPhThreshold = 6.8;
 
+  // Critical pH Notification Tracking
+  DateTime? _criticalPhStartTime;
+  bool _notificationTriggeredForCurrentAlert = false;
+
   @override
   void initState() {
     super.initState();
     _esp32Ip = widget.initialIp;
     _ipController = TextEditingController(text: _esp32Ip);
+    _loadStoredLogs();
     _startRealtimeMonitoring();
     _startHistoricalLogging();
   }
@@ -391,10 +588,38 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     super.dispose();
   }
 
+  // Load existing logs from sqlite DB
+  Future<void> _loadStoredLogs() async {
+    final storedLogs = await DatabaseHelper.instance.getLogs();
+    setState(() {
+      _historyLogs = storedLogs;
+    });
+  }
+
   int _getElapsedPlantingDay(DateTime timestamp) {
     final startDay = DateTime(widget.startDate.year, widget.startDate.month, widget.startDate.day);
     final currentDay = DateTime(timestamp.year, timestamp.month, timestamp.day);
     return currentDay.difference(startDay).inDays + 1;
+  }
+
+  // Check critical pH duration and trigger Push Notification if exceeded (20 seconds testing)
+  void _evaluatePhNotification(double ph) {
+    bool isPhCritical = (ph < _minPhThreshold || ph > _maxPhThreshold);
+
+    if (isPhCritical) {
+      _criticalPhStartTime ??= DateTime.now();
+      
+      final elapsed = DateTime.now().difference(_criticalPhStartTime!).inSeconds;
+
+      // Triggers if critical for 20 seconds or more (change to inMinutes >= 10 for production)
+      if (elapsed >= 20 && !_notificationTriggeredForCurrentAlert) {
+        NotificationHelper.showPhAlertNotification(ph);
+        _notificationTriggeredForCurrentAlert = true;
+      }
+    } else {
+      _criticalPhStartTime = null;
+      _notificationTriggeredForCurrentAlert = false;
+    }
   }
 
   // Poll real-time values using mDNS hostname or custom IP
@@ -408,6 +633,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
 
         if (response.statusCode == 200) {
           final Map<String, dynamic> data = jsonDecode(response.body);
+          
+          double currentPh = _lastValidPhValue;
+          if (data['ph'] != null) {
+            currentPh = (data['ph'] is num) ? (data['ph'] as num).toDouble() : 7.00;
+          }
+
+          _evaluatePhNotification(currentPh);
+
           setState(() {
             _connectionStatus = "Connected";
             _lastValidWaterStatus = data['water'] ?? 'low';
@@ -415,9 +648,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             if (data['temp'] != null && data['temp'] != 0.0) {
               _lastValidWaterTemp = "${data['temp']}°C";
             }
-            if (data['ph'] != null) {
-              _lastValidPhValue = (data['ph'] is num) ? (data['ph'] as num).toDouble() : 7.00;
-            }
+            _lastValidPhValue = currentPh;
           });
         } else {
           setState(() {
@@ -434,19 +665,20 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   }
 
   void _startHistoricalLogging() {
-    _historicalLoggerTimer = Timer.periodic(const Duration(seconds: 20), (timer) {
+    _historicalLoggerTimer = Timer.periodic(const Duration(seconds: 20), (timer) async {
+      final newLog = HistoricalData(
+        timestamp: DateTime.now(),
+        pH: _lastValidPhValue,
+        temperature: _lastValidWaterTemp,
+        waterLevel: _getProcessedWaterStatus(),
+      );
+
+      await DatabaseHelper.instance.insertLog(newLog);
+
       if (!mounted) return;
       
       setState(() {
-        _historyLogs.insert(
-          0,
-          HistoricalData(
-            timestamp: DateTime.now(),
-            pH: _lastValidPhValue,
-            temperature: _lastValidWaterTemp,
-            waterLevel: _getProcessedWaterStatus(),
-          ),
-        );
+        _historyLogs.insert(0, newLog);
       });
     });
   }
