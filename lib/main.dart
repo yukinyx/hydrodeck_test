@@ -27,8 +27,19 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 1,
+      version: 2,
       onCreate: _createDB,
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute('''
+            CREATE TABLE settings_config (
+              id INTEGER PRIMARY KEY,
+              minPh REAL NOT NULL,
+              maxPh REAL NOT NULL
+            )
+          ''');
+        }
+      },
     );
   }
 
@@ -63,6 +74,14 @@ class DatabaseHelper {
       CREATE TABLE active_ip (
         id INTEGER PRIMARY KEY,
         ip TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE settings_config (
+        id INTEGER PRIMARY KEY,
+        minPh REAL NOT NULL,
+        maxPh REAL NOT NULL
       )
     ''');
   }
@@ -153,6 +172,28 @@ class DatabaseHelper {
     }
     return "hydrodeck.local";
   }
+
+  // Settings Limits Persistence
+  Future<void> saveSettingsConfig(double minPh, double maxPh) async {
+    final db = await instance.database;
+    await db.insert(
+      'settings_config',
+      {'id': 1, 'minPh': minPh, 'maxPh': maxPh},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<Map<String, double>> getSettingsConfig() async {
+    final db = await instance.database;
+    final result = await db.query('settings_config', where: 'id = ?', whereArgs: [1]);
+    if (result.isNotEmpty) {
+      return {
+        'minPh': (result.first['minPh'] as num).toDouble(),
+        'maxPh': (result.first['maxPh'] as num).toDouble(),
+      };
+    }
+    return {'minPh': 5.5, 'maxPh': 6.8};
+  }
 }
 
 // --- NOTIFICATION SERVICE ---
@@ -186,7 +227,7 @@ class NotificationHelper {
     const NotificationDetails details = NotificationDetails(android: androidDetails);
 
     await _notificationsPlugin.show(
-      0,
+      DateTime.now().millisecondsSinceEpoch ~/ 1000,
       '⚠️ Critical pH Alert',
       'pH level has remained in critical range (${ph.toStringAsFixed(2)}) for over 20 seconds!',
       details,
@@ -242,17 +283,39 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   String lastWater = "low";
   bool isConnected = false;
 
+  bool isAppClosed = false; 
+
+  double minPhThreshold = 5.5;
+  double maxPhThreshold = 6.8;
+
   DateTime? criticalPhStart;
-  bool alertTriggered = false;
+  DateTime? lastAlertTime;
 
   try {
     targetIp = await DatabaseHelper.instance.getActiveIp();
+    final limits = await DatabaseHelper.instance.getSettingsConfig();
+    minPhThreshold = limits['minPh']!;
+    maxPhThreshold = limits['maxPh']!;
   } catch (_) {}
 
   service.on('updateIp').listen((event) {
     if (event != null && event['ip'] != null) {
       targetIp = event['ip'];
       DatabaseHelper.instance.saveActiveIp(targetIp);
+    }
+  });
+
+  service.on('updateLimits').listen((event) {
+    if (event != null) {
+      if (event['minPh'] != null) minPhThreshold = (event['minPh'] as num).toDouble();
+      if (event['maxPh'] != null) maxPhThreshold = (event['maxPh'] as num).toDouble();
+      DatabaseHelper.instance.saveSettingsConfig(minPhThreshold, maxPhThreshold);
+    }
+  });
+
+  service.on('appState').listen((event) {
+    if (event != null && event['state'] != null) {
+      isAppClosed = (event['state'] == 'background');
     }
   });
 
@@ -291,15 +354,28 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       isConnected = false;
     }
 
-    if (lastPh < 5.5 || lastPh > 6.8) {
+    bool isCritical = (lastPh < minPhThreshold || lastPh > maxPhThreshold);
+
+    if (isCritical) {
       criticalPhStart ??= DateTime.now();
-      if (DateTime.now().difference(criticalPhStart!).inSeconds >= 20 && !alertTriggered) {
-        NotificationHelper.showPhAlertNotification(lastPh);
-        alertTriggered = true;
+      final durationInCritical = DateTime.now().difference(criticalPhStart!).inSeconds;
+
+      if (durationInCritical >= 20) {
+        bool shouldNotify = false;
+        if (lastAlertTime == null) {
+          shouldNotify = true;
+        } else if (DateTime.now().difference(lastAlertTime!).inSeconds >= 20) {
+          shouldNotify = true;
+        }
+
+        if (shouldNotify && isAppClosed) {
+          NotificationHelper.showPhAlertNotification(lastPh);
+          lastAlertTime = DateTime.now();
+        }
       }
     } else {
       criticalPhStart = null;
-      alertTriggered = false;
+      lastAlertTime = null;
     }
 
     service.invoke('telemetryUpdate', {
@@ -338,8 +414,35 @@ void main() async {
   runApp(const HydrodeckApp());
 }
 
-class HydrodeckApp extends StatelessWidget {
+class HydrodeckApp extends StatefulWidget {
   const HydrodeckApp({super.key});
+
+  @override
+  State<HydrodeckApp> createState() => _HydrodeckAppState();
+}
+
+class _HydrodeckAppState extends State<HydrodeckApp> with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    FlutterBackgroundService().invoke('appState', {'state': 'foreground'});
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
+      FlutterBackgroundService().invoke('appState', {'state': 'background'});
+    } else if (state == AppLifecycleState.resumed) {
+      FlutterBackgroundService().invoke('appState', {'state': 'foreground'});
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -711,7 +814,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     super.initState();
     _esp32Ip = widget.initialIp;
     _ipController = TextEditingController(text: _esp32Ip);
-    _loadStoredLogs();
+    _loadStoredLogsAndSettings();
     _subscribeToBackgroundUpdates();
   }
 
@@ -723,10 +826,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     super.dispose();
   }
 
-  Future<void> _loadStoredLogs() async {
+  Future<void> _loadStoredLogsAndSettings() async {
     final storedLogs = await DatabaseHelper.instance.getLogs();
+    final config = await DatabaseHelper.instance.getSettingsConfig();
     setState(() {
       _historyLogs = storedLogs;
+      _minPhThreshold = config['minPh'] ?? 5.5;
+      _maxPhThreshold = config['maxPh'] ?? 6.8;
     });
   }
 
@@ -1266,6 +1372,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                     setState(() {
                       _minPhThreshold = val;
                     });
+                    DatabaseHelper.instance.saveSettingsConfig(_minPhThreshold, _maxPhThreshold);
+                    FlutterBackgroundService().invoke('updateLimits', {
+                      'minPh': _minPhThreshold,
+                      'maxPh': _maxPhThreshold,
+                    });
                   },
                 ),
               ],
@@ -1295,6 +1406,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                   onChanged: (val) {
                     setState(() {
                       _maxPhThreshold = val;
+                    });
+                    DatabaseHelper.instance.saveSettingsConfig(_minPhThreshold, _maxPhThreshold);
+                    FlutterBackgroundService().invoke('updateLimits', {
+                      'minPh': _minPhThreshold,
+                      'maxPh': _maxPhThreshold,
                     });
                   },
                 ),
