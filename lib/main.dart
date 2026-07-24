@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
 
 // --- LOCAL DATABASE SERVICE ---
 class DatabaseHelper {
@@ -56,6 +58,13 @@ class DatabaseHelper {
         startDate TEXT NOT NULL
       )
     ''');
+
+    await db.execute('''
+      CREATE TABLE active_ip (
+        id INTEGER PRIMARY KEY,
+        ip TEXT NOT NULL
+      )
+    ''');
   }
 
   // Historical Logs Queries
@@ -74,7 +83,7 @@ class DatabaseHelper {
     final result = await db.query('historical_logs', orderBy: 'timestamp DESC');
     return result.map((json) => HistoricalData(
       timestamp: DateTime.parse(json['timestamp'] as String),
-      pH: json['pH'] as double,
+      pH: (json['pH'] as num).toDouble(),
       temperature: json['temperature'] as String,
       waterLevel: json['waterLevel'] as String,
     )).toList();
@@ -125,6 +134,25 @@ class DatabaseHelper {
     final db = await instance.database;
     await db.delete('active_session', where: 'id = ?', whereArgs: [1]);
   }
+
+  // Saved Target IP Persistence
+  Future<void> saveActiveIp(String ip) async {
+    final db = await instance.database;
+    await db.insert(
+      'active_ip',
+      {'id': 1, 'ip': ip},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<String> getActiveIp() async {
+    final db = await instance.database;
+    final result = await db.query('active_ip', where: 'id = ?', whereArgs: [1]);
+    if (result.isNotEmpty) {
+      return result.first['ip'] as String;
+    }
+    return "hydrodeck.local";
+  }
 }
 
 // --- NOTIFICATION SERVICE ---
@@ -140,7 +168,6 @@ class NotificationHelper {
 
     await _notificationsPlugin.initialize(settings);
 
-    // Request permissions for Android 13+
     _notificationsPlugin
         .resolvePlatformSpecificImplementation<
             AndroidFlutterLocalNotificationsPlugin>()
@@ -167,9 +194,147 @@ class NotificationHelper {
   }
 }
 
+// --- BACKGROUND SERVICE MANAGEMENT ---
+Future<void> initializeBackgroundService() async {
+  final service = FlutterBackgroundService();
+
+  const AndroidNotificationChannel channel = AndroidNotificationChannel(
+    'hydrodeck_bg_service',
+    'Hydrodeck Background Engine',
+    description: 'Keeps ESP32 connection live and records metrics continuous logs.',
+    importance: Importance.low,
+  );
+
+  final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+
+  await flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(channel);
+
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: onBackgroundServiceStart,
+      autoStart: true,
+      isForegroundMode: true,
+      notificationChannelId: 'hydrodeck_bg_service',
+      initialNotificationTitle: 'Hydrodeck Service Active',
+      initialNotificationContent: 'Monitoring ESP32 and logging sensors in background...',
+      foregroundServiceNotificationId: 888,
+    ),
+    iosConfiguration: IosConfiguration(
+      autoStart: true,
+      onForeground: onBackgroundServiceStart,
+    ),
+  );
+
+  await service.startService();
+}
+
+@pragma('vm:entry-point')
+void onBackgroundServiceStart(ServiceInstance service) async {
+  DartPluginRegistrant.ensureInitialized();
+
+  String targetIp = "hydrodeck.local";
+  double lastPh = 7.0;
+  String lastTemp = "25.0°C";
+  String lastWater = "low";
+  bool isConnected = false;
+
+  DateTime? criticalPhStart;
+  bool alertTriggered = false;
+
+  try {
+    targetIp = await DatabaseHelper.instance.getActiveIp();
+  } catch (_) {}
+
+  service.on('updateIp').listen((event) {
+    if (event != null && event['ip'] != null) {
+      targetIp = event['ip'];
+      DatabaseHelper.instance.saveActiveIp(targetIp);
+    }
+  });
+
+  Timer.periodic(const Duration(seconds: 2), (timer) async {
+    final List<String> candidateHosts = [
+      targetIp,
+      "hydrodeck.local",
+      "192.168.1.100",
+      "192.168.0.100",
+      "10.0.2.2"
+    ];
+
+    bool found = false;
+    for (String host in candidateHosts) {
+      try {
+        final res = await http.get(Uri.parse('http://$host/status')).timeout(const Duration(milliseconds: 1500));
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body);
+          if (data['ph'] != null) {
+            lastPh = (data['ph'] is num) ? (data['ph'] as num).toDouble() : 7.00;
+          }
+          if (data['temp'] != null && data['temp'] != 0.0) {
+            lastTemp = "${data['temp']}°C";
+          }
+          lastWater = data['water'] ?? 'low';
+          
+          targetIp = host;
+          isConnected = true;
+          found = true;
+          break;
+        }
+      } catch (_) {}
+    }
+
+    if (!found) {
+      isConnected = false;
+    }
+
+    if (lastPh < 5.5 || lastPh > 6.8) {
+      criticalPhStart ??= DateTime.now();
+      if (DateTime.now().difference(criticalPhStart!).inSeconds >= 20 && !alertTriggered) {
+        NotificationHelper.showPhAlertNotification(lastPh);
+        alertTriggered = true;
+      }
+    } else {
+      criticalPhStart = null;
+      alertTriggered = false;
+    }
+
+    service.invoke('telemetryUpdate', {
+      'isConnected': isConnected,
+      'ip': targetIp,
+      'ph': lastPh,
+      'temp': lastTemp,
+      'water': lastWater,
+    });
+  });
+
+  Timer.periodic(const Duration(seconds: 20), (timer) async {
+    final snapshot = HistoricalData(
+      timestamp: DateTime.now(),
+      pH: lastPh,
+      temperature: lastTemp,
+      waterLevel: lastWater == "full" ? "Water full" : "Needs water",
+    );
+
+    try {
+      await DatabaseHelper.instance.insertLog(snapshot);
+      service.invoke('newSnapshotLogged', {
+        'timestamp': snapshot.timestamp.toIso8601String(),
+        'pH': snapshot.pH,
+        'temperature': snapshot.temperature,
+        'waterLevel': snapshot.waterLevel,
+      });
+    } catch (_) {}
+  });
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await NotificationHelper.init();
+  await initializeBackgroundService();
   runApp(const HydrodeckApp());
 }
 
@@ -191,7 +356,6 @@ class HydrodeckApp extends StatelessWidget {
   }
 }
 
-// Data model representing captured historical snapshots
 class HistoricalData {
   final DateTime timestamp;
   final double pH;
@@ -206,7 +370,6 @@ class HistoricalData {
   });
 }
 
-// Data model representing completed planting campaigns
 class PlantingRecord {
   final int batchNumber;
   final DateTime startDate;
@@ -221,7 +384,6 @@ class PlantingRecord {
   });
 }
 
-// Gatekeeper widget to determine if the user is currently in an active session
 class MainGatekeeper extends StatefulWidget {
   const MainGatekeeper({super.key});
 
@@ -236,28 +398,29 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
   List<PlantingRecord> _pastPlantingRuns = [];
   
   String _activeEsp32Ip = "hydrodeck.local";
-  Timer? _autoConnectTimer;
+  StreamSubscription? _bgSubscription;
 
   @override
   void initState() {
     super.initState();
     _loadStoredSessionAndData();
-    _startAutoConnectionDiscovery();
+    _listenToBackgroundService();
   }
 
   @override
   void dispose() {
-    _autoConnectTimer?.cancel();
+    _bgSubscription?.cancel();
     super.dispose();
   }
 
-  // Load saved session state and historical batch records from DB
   Future<void> _loadStoredSessionAndData() async {
     final activeDate = await DatabaseHelper.instance.getActiveSession();
     final pastRuns = await DatabaseHelper.instance.getPlantingHistory();
+    final savedIp = await DatabaseHelper.instance.getActiveIp();
 
     setState(() {
       _pastPlantingRuns = pastRuns;
+      _activeEsp32Ip = savedIp;
       if (activeDate != null) {
         _plantingStartDate = activeDate;
         _isPlantingActive = true;
@@ -266,30 +429,12 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     });
   }
 
-  void _startAutoConnectionDiscovery() {
-    final List<String> candidateHosts = [
-      "hydrodeck.local",
-      "192.168.1.100",
-      "192.168.0.100",
-      "10.0.2.2"
-    ];
-
-    _autoConnectTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
-      for (String host in candidateHosts) {
-        try {
-          final response = await http
-              .get(Uri.parse('http://$host/status'))
-              .timeout(const Duration(milliseconds: 1500));
-
-          if (!mounted) return;
-
-          if (response.statusCode == 200) {
-            setState(() {
-              _activeEsp32Ip = host;
-            });
-            break; 
-          }
-        } catch (_) {}
+  void _listenToBackgroundService() {
+    _bgSubscription = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
+      if (event != null && event['ip'] != null && mounted) {
+        setState(() {
+          _activeEsp32Ip = event['ip'];
+        });
       }
     });
   }
@@ -351,7 +496,6 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
   }
 }
 
-// --- START / WELCOME GATEWAY SCREEN ---
 class StartPlantingScreen extends StatelessWidget {
   final VoidCallback onStart;
   final List<PlantingRecord> history;
@@ -546,29 +690,21 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   
   String _connectionStatus = "Fetching...";
   
-  // Storage for persistent last known values to retain data when offline
   String _lastValidWaterStatus = "low";
   String _lastValidWaterTemp = "25.0°C";
   double _lastValidPhValue = 7.00; 
 
-  Timer? _realtimeTimer;
-  Timer? _historicalLoggerTimer;
+  StreamSubscription? _telemetrySub;
+  StreamSubscription? _snapshotSub;
 
-  // Historical Storage Array
   List<HistoricalData> _historyLogs = [];
   DateTime? _selectedFilterDate;
 
-  // Active LED Pin toggles
   bool _led1On = false;
   bool _led2On = false;
 
-  // Target Boundaries
   double _minPhThreshold = 5.5;
   double _maxPhThreshold = 6.8;
-
-  // Critical pH Notification Tracking
-  DateTime? _criticalPhStartTime;
-  bool _notificationTriggeredForCurrentAlert = false;
 
   @override
   void initState() {
@@ -576,19 +712,17 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _esp32Ip = widget.initialIp;
     _ipController = TextEditingController(text: _esp32Ip);
     _loadStoredLogs();
-    _startRealtimeMonitoring();
-    _startHistoricalLogging();
+    _subscribeToBackgroundUpdates();
   }
 
   @override
   void dispose() {
-    _realtimeTimer?.cancel();
-    _historicalLoggerTimer?.cancel();
+    _telemetrySub?.cancel();
+    _snapshotSub?.cancel();
     _ipController.dispose();
     super.dispose();
   }
 
-  // Load existing logs from sqlite DB
   Future<void> _loadStoredLogs() async {
     final storedLogs = await DatabaseHelper.instance.getLogs();
     setState(() {
@@ -596,91 +730,40 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     });
   }
 
-  int _getElapsedPlantingDay(DateTime timestamp) {
-    final startDay = DateTime(widget.startDate.year, widget.startDate.month, widget.startDate.day);
-    final currentDay = DateTime(timestamp.year, timestamp.month, timestamp.day);
-    return currentDay.difference(startDay).inDays + 1;
-  }
-
-  // Check critical pH duration and trigger Push Notification if exceeded (20 seconds testing)
-  void _evaluatePhNotification(double ph) {
-    bool isPhCritical = (ph < _minPhThreshold || ph > _maxPhThreshold);
-
-    if (isPhCritical) {
-      _criticalPhStartTime ??= DateTime.now();
-      
-      final elapsed = DateTime.now().difference(_criticalPhStartTime!).inSeconds;
-
-      // Triggers if critical for 20 seconds or more (change to inMinutes >= 10 for production)
-      if (elapsed >= 20 && !_notificationTriggeredForCurrentAlert) {
-        NotificationHelper.showPhAlertNotification(ph);
-        _notificationTriggeredForCurrentAlert = true;
-      }
-    } else {
-      _criticalPhStartTime = null;
-      _notificationTriggeredForCurrentAlert = false;
-    }
-  }
-
-  // Poll real-time values using mDNS hostname or custom IP
-  void _startRealtimeMonitoring() {
-    _realtimeTimer = Timer.periodic(const Duration(milliseconds: 2000), (timer) async {
-      final Uri url = Uri.parse('http://$_esp32Ip/status');
-      try {
-        final response = await http.get(url).timeout(const Duration(milliseconds: 2500));
-        
-        if (!mounted) return;
-
-        if (response.statusCode == 200) {
-          final Map<String, dynamic> data = jsonDecode(response.body);
-          
-          double currentPh = _lastValidPhValue;
-          if (data['ph'] != null) {
-            currentPh = (data['ph'] is num) ? (data['ph'] as num).toDouble() : 7.00;
-          }
-
-          _evaluatePhNotification(currentPh);
-
-          setState(() {
-            _connectionStatus = "Connected";
-            _lastValidWaterStatus = data['water'] ?? 'low';
-            
-            if (data['temp'] != null && data['temp'] != 0.0) {
-              _lastValidWaterTemp = "${data['temp']}°C";
-            }
-            _lastValidPhValue = currentPh;
-          });
-        } else {
-          setState(() {
-            _connectionStatus = "Disconnected";
-          });
-        }
-      } catch (e) {
-        if (!mounted) return;
+  void _subscribeToBackgroundUpdates() {
+    _telemetrySub = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
+      if (event != null && mounted) {
         setState(() {
-          _connectionStatus = "Disconnected";
+          _connectionStatus = (event['isConnected'] == true) ? "Connected" : "Disconnected";
+          _lastValidPhValue = (event['ph'] as num).toDouble();
+          _lastValidWaterTemp = event['temp'];
+          _lastValidWaterStatus = event['water'];
+          if (event['ip'] != null) {
+            _esp32Ip = event['ip'];
+          }
+        });
+      }
+    });
+
+    _snapshotSub = FlutterBackgroundService().on('newSnapshotLogged').listen((event) {
+      if (event != null && mounted) {
+        final newLog = HistoricalData(
+          timestamp: DateTime.parse(event['timestamp']),
+          pH: (event['pH'] as num).toDouble(),
+          temperature: event['temperature'],
+          waterLevel: event['waterLevel'],
+        );
+        setState(() {
+          _historyLogs.insert(0, newLog);
         });
       }
     });
   }
 
-  void _startHistoricalLogging() {
-    _historicalLoggerTimer = Timer.periodic(const Duration(seconds: 20), (timer) async {
-      final newLog = HistoricalData(
-        timestamp: DateTime.now(),
-        pH: _lastValidPhValue,
-        temperature: _lastValidWaterTemp,
-        waterLevel: _getProcessedWaterStatus(),
-      );
-
-      await DatabaseHelper.instance.insertLog(newLog);
-
-      if (!mounted) return;
-      
-      setState(() {
-        _historyLogs.insert(0, newLog);
-      });
-    });
+  int _getElapsedPlantingDay(DateTime timestamp) {
+    final startDay = DateTime(widget.startDate.year, widget.startDate.month, widget.startDate.day);
+    final currentDay = DateTime(timestamp.year, timestamp.month, timestamp.day);
+    return currentDay.difference(startDay).inDays + 1;
   }
 
   String _getProcessedWaterStatus() {
@@ -766,7 +849,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     );
   }
 
-  // --- HOME SCREEN DESIGN ---
   Widget _buildHomeScreen(String waterLabel) {
     bool isWaterFull = _lastValidWaterStatus == "full";
     Color statusColor = _connectionStatus == "Connected" ? Colors.green : Colors.orange;
@@ -979,7 +1061,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     );
   }
 
-  // --- DATA HISTORICAL SCREEN ---
   Widget _buildDataScreen() {
     List<HistoricalData> filteredLogs = _historyLogs.where((log) {
       if (_selectedFilterDate == null) return true;
@@ -1121,7 +1202,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     );
   }
 
-  // --- SETTINGS SCREEN DESIGN WITH END PLANTING ---
   Widget _buildSettingsScreen() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24.0),
@@ -1147,9 +1227,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                     suffixIcon: Icon(Icons.wifi),
                   ),
                   onChanged: (val) {
+                    final trimmed = val.trim();
                     setState(() {
-                      _esp32Ip = val.trim();
+                      _esp32Ip = trimmed;
                     });
+                    FlutterBackgroundService().invoke('updateIp', {'ip': trimmed});
                   },
                 ),
               ],
@@ -1287,7 +1369,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   }
 }
 
-// --- SNAPSHOT DETAIL VIEW SCREEN ---
 class SnapshotDetailScreen extends StatelessWidget {
   final HistoricalData data;
   final String formattedTime;
