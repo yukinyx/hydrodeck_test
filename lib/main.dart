@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ui';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:local_auth/local_auth.dart';
 
 // --- LOCAL DATABASE SERVICE ---
 class DatabaseHelper {
@@ -15,10 +17,15 @@ class DatabaseHelper {
 
   DatabaseHelper._init();
 
-  Future<Database> get database async {
+  Future<Database?> get database async {
+    if (kIsWeb) return null; // Web bypass to avoid sqflite runtime exceptions
     if (_database != null) return _database!;
-    _database = await _initDB('hydrodeck.db');
-    return _database!;
+    try {
+      _database = await _initDB('hydrodeck.db');
+      return _database!;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<Database> _initDB(String filePath) async {
@@ -27,7 +34,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 2,
+      version: 3,
       onCreate: _createDB,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -36,6 +43,15 @@ class DatabaseHelper {
               id INTEGER PRIMARY KEY,
               minPh REAL NOT NULL,
               maxPh REAL NOT NULL
+            )
+          ''');
+        }
+        if (oldVersion < 3) {
+          await db.execute('''
+            CREATE TABLE app_security (
+              id INTEGER PRIMARY KEY,
+              customPin TEXT,
+              isBiometricsEnabled INTEGER NOT NULL
             )
           ''');
         }
@@ -84,11 +100,48 @@ class DatabaseHelper {
         maxPh REAL NOT NULL
       )
     ''');
+
+    await db.execute('''
+      CREATE TABLE app_security (
+        id INTEGER PRIMARY KEY,
+        customPin TEXT,
+        isBiometricsEnabled INTEGER NOT NULL
+      )
+    ''');
+  }
+
+  // Security Configuration Queries
+  Future<void> saveSecurityConfig({String? customPin, required bool isBiometricsEnabled}) async {
+    final db = await instance.database;
+    if (db == null) return;
+    await db.insert(
+      'app_security',
+      {
+        'id': 1,
+        'customPin': customPin,
+        'isBiometricsEnabled': isBiometricsEnabled ? 1 : 0,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<Map<String, dynamic>?> getSecurityConfig() async {
+    final db = await instance.database;
+    if (db == null) return null;
+    final result = await db.query('app_security', where: 'id = ?', whereArgs: [1]);
+    if (result.isNotEmpty) {
+      return {
+        'customPin': result.first['customPin'] as String?,
+        'isBiometricsEnabled': (result.first['isBiometricsEnabled'] as int) == 1,
+      };
+    }
+    return null;
   }
 
   // Historical Logs Queries
   Future<void> insertLog(HistoricalData log) async {
     final db = await instance.database;
+    if (db == null) return;
     await db.insert('historical_logs', {
       'timestamp': log.timestamp.toIso8601String(),
       'pH': log.pH,
@@ -99,6 +152,7 @@ class DatabaseHelper {
 
   Future<List<HistoricalData>> getLogs() async {
     final db = await instance.database;
+    if (db == null) return [];
     final result = await db.query('historical_logs', orderBy: 'timestamp DESC');
     return result.map((json) => HistoricalData(
       timestamp: DateTime.parse(json['timestamp'] as String),
@@ -111,6 +165,7 @@ class DatabaseHelper {
   // Planting Runs History Queries
   Future<void> insertPlantingRecord(PlantingRecord record) async {
     final db = await instance.database;
+    if (db == null) return;
     await db.insert('planting_history', {
       'batchNumber': record.batchNumber,
       'startDate': record.startDate.toIso8601String(),
@@ -121,6 +176,7 @@ class DatabaseHelper {
 
   Future<List<PlantingRecord>> getPlantingHistory() async {
     final db = await instance.database;
+    if (db == null) return [];
     final result = await db.query('planting_history', orderBy: 'batchNumber ASC');
     return result.map((json) => PlantingRecord(
       batchNumber: json['batchNumber'] as int,
@@ -133,6 +189,7 @@ class DatabaseHelper {
   // Session State Persistence
   Future<void> saveActiveSession(DateTime startDate) async {
     final db = await instance.database;
+    if (db == null) return;
     await db.insert(
       'active_session',
       {'id': 1, 'startDate': startDate.toIso8601String()},
@@ -142,6 +199,7 @@ class DatabaseHelper {
 
   Future<DateTime?> getActiveSession() async {
     final db = await instance.database;
+    if (db == null) return null;
     final result = await db.query('active_session', where: 'id = ?', whereArgs: [1]);
     if (result.isNotEmpty) {
       return DateTime.parse(result.first['startDate'] as String);
@@ -151,12 +209,14 @@ class DatabaseHelper {
 
   Future<void> clearActiveSession() async {
     final db = await instance.database;
+    if (db == null) return;
     await db.delete('active_session', where: 'id = ?', whereArgs: [1]);
   }
 
   // Saved Target IP Persistence
   Future<void> saveActiveIp(String ip) async {
     final db = await instance.database;
+    if (db == null) return;
     await db.insert(
       'active_ip',
       {'id': 1, 'ip': ip},
@@ -166,6 +226,7 @@ class DatabaseHelper {
 
   Future<String> getActiveIp() async {
     final db = await instance.database;
+    if (db == null) return "hydrodeck.local";
     final result = await db.query('active_ip', where: 'id = ?', whereArgs: [1]);
     if (result.isNotEmpty) {
       return result.first['ip'] as String;
@@ -176,6 +237,7 @@ class DatabaseHelper {
   // Settings Limits Persistence
   Future<void> saveSettingsConfig(double minPh, double maxPh) async {
     final db = await instance.database;
+    if (db == null) return;
     await db.insert(
       'settings_config',
       {'id': 1, 'minPh': minPh, 'maxPh': maxPh},
@@ -185,6 +247,7 @@ class DatabaseHelper {
 
   Future<Map<String, double>> getSettingsConfig() async {
     final db = await instance.database;
+    if (db == null) return {'minPh': 5.5, 'maxPh': 6.8};
     final result = await db.query('settings_config', where: 'id = ?', whereArgs: [1]);
     if (result.isNotEmpty) {
       return {
@@ -202,6 +265,8 @@ class NotificationHelper {
       FlutterLocalNotificationsPlugin();
 
   static Future<void> init() async {
+    if (kIsWeb) return;
+
     const AndroidInitializationSettings androidSettings =
         AndroidInitializationSettings('@mipmap/ic_launcher');
     const InitializationSettings settings =
@@ -216,6 +281,8 @@ class NotificationHelper {
   }
 
   static Future<void> showPhAlertNotification(double ph) async {
+    if (kIsWeb) return;
+
     const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
       'ph_alerts_channel',
       'pH Level Alerts',
@@ -237,6 +304,8 @@ class NotificationHelper {
 
 // --- BACKGROUND SERVICE MANAGEMENT ---
 Future<void> initializeBackgroundService() async {
+  if (kIsWeb) return;
+
   final service = FlutterBackgroundService();
 
   const AndroidNotificationChannel channel = AndroidNotificationChannel(
@@ -284,6 +353,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   bool isConnected = false;
 
   bool isAppClosed = false; 
+  bool isPlantingActive = false;
 
   double minPhThreshold = 5.5;
   double maxPhThreshold = 6.8;
@@ -297,7 +367,9 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     minPhThreshold = limits['minPh']!;
     maxPhThreshold = limits['maxPh']!;
     
-    // Load last recorded values from persistent database on service start
+    final activeSession = await DatabaseHelper.instance.getActiveSession();
+    isPlantingActive = activeSession != null;
+
     final logs = await DatabaseHelper.instance.getLogs();
     if (logs.isNotEmpty) {
       lastPh = logs.first.pH;
@@ -305,6 +377,12 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       lastWater = logs.first.waterLevel == "Water full" ? "full" : "low";
     }
   } catch (_) {}
+
+  service.on('setPlantingState').listen((event) {
+    if (event != null && event['active'] != null) {
+      isPlantingActive = event['active'] as bool;
+    }
+  });
 
   service.on('updateIp').listen((event) {
     if (event != null && event['ip'] != null) {
@@ -328,6 +406,18 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   });
 
   Timer.periodic(const Duration(seconds: 2), (timer) async {
+    // Only connect and poll ESP32 if planting has been started
+    if (!isPlantingActive) {
+      service.invoke('telemetryUpdate', {
+        'isConnected': false,
+        'ip': targetIp,
+        'ph': lastPh,
+        'temp': lastTemp,
+        'water': lastWater,
+      });
+      return;
+    }
+
     final List<String> candidateHosts = [
       targetIp,
       "hydrodeck.local",
@@ -396,6 +486,8 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   });
 
   Timer.periodic(const Duration(seconds: 20), (timer) async {
+    if (!isPlantingActive) return;
+
     final snapshot = HistoricalData(
       timestamp: DateTime.now(),
       pH: lastPh,
@@ -417,8 +509,10 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await NotificationHelper.init();
-  await initializeBackgroundService();
+  if (!kIsWeb) {
+    await NotificationHelper.init();
+    await initializeBackgroundService();
+  }
   runApp(const HydrodeckApp());
 }
 
@@ -434,7 +528,9 @@ class _HydrodeckAppState extends State<HydrodeckApp> with WidgetsBindingObserver
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    FlutterBackgroundService().invoke('appState', {'state': 'foreground'});
+    if (!kIsWeb) {
+      FlutterBackgroundService().invoke('appState', {'state': 'foreground'});
+    }
   }
 
   @override
@@ -445,6 +541,7 @@ class _HydrodeckAppState extends State<HydrodeckApp> with WidgetsBindingObserver
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (kIsWeb) return;
     if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
       FlutterBackgroundService().invoke('appState', {'state': 'background'});
     } else if (state == AppLifecycleState.resumed) {
@@ -495,6 +592,497 @@ class PlantingRecord {
   });
 }
 
+// --- INITIAL APP GATEKEEPER & AUTHENTICATION SCREEN ---
+class PinSetupScreen extends StatefulWidget {
+  final VoidCallback onAuthenticated;
+
+  const PinSetupScreen({super.key, required this.onAuthenticated});
+
+  @override
+  State<PinSetupScreen> createState() => _PinSetupScreenState();
+}
+
+class _PinSetupScreenState extends State<PinSetupScreen> {
+  static const String _defaultPin = "6967";
+  
+  final TextEditingController _pinController = TextEditingController();
+  final TextEditingController _customPinController = TextEditingController();
+  final LocalAuthentication _localAuth = LocalAuthentication();
+
+  int _failedAttempts = 0;
+  int _lockoutTimeRemaining = 0;
+  Timer? _lockoutTimer;
+
+  bool _isPinVerified = false;
+  bool _enableBiometrics = false;
+  String? _errorMessage;
+
+  @override
+  void dispose() {
+    _pinController.dispose();
+    _customPinController.dispose();
+    _lockoutTimer?.cancel();
+    super.dispose();
+  }
+
+  void _startLockoutTimer() {
+    setState(() {
+      _lockoutTimeRemaining = 60;
+    });
+
+    _lockoutTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_lockoutTimeRemaining > 1) {
+        setState(() {
+          _lockoutTimeRemaining--;
+        });
+      } else {
+        timer.cancel();
+        setState(() {
+          _failedAttempts = 0;
+          _lockoutTimeRemaining = 0;
+          _errorMessage = null;
+        });
+      }
+    });
+  }
+
+  void _verifyPin() {
+    if (_lockoutTimeRemaining > 0) return;
+
+    final enteredPin = _pinController.text.trim();
+
+    if (enteredPin == _defaultPin) {
+      setState(() {
+        _isPinVerified = true;
+        _errorMessage = null;
+      });
+    } else {
+      _failedAttempts++;
+      if (_failedAttempts >= 5) {
+        _startLockoutTimer();
+      } else {
+        setState(() {
+          _errorMessage = "Invalid PIN. ${5 - _failedAttempts} attempts left.";
+        });
+      }
+      _pinController.clear();
+    }
+  }
+
+  Future<void> _handleBiometricToggle(bool value) async {
+    if (value) {
+      try {
+        bool canCheck = await _localAuth.canCheckBiometrics || await _localAuth.isDeviceSupported();
+        if (!canCheck) {
+          setState(() {
+            _errorMessage = "Biometrics are not supported or available on this device.";
+            _enableBiometrics = false;
+          });
+          return;
+        }
+
+        bool authenticated = await _localAuth.authenticate(
+          localizedReason: 'Please authenticate to enable biometric login for Hydrodeck',
+          options: const AuthenticationOptions(
+            stickyAuth: true,
+            biometricOnly: true,
+          ),
+        );
+
+        if (authenticated) {
+          setState(() {
+            _enableBiometrics = true;
+            _errorMessage = null;
+          });
+        } else {
+          setState(() {
+            _enableBiometrics = false;
+            _errorMessage = "Biometric setup was cancelled or failed.";
+          });
+        }
+      } catch (e) {
+        setState(() {
+          _enableBiometrics = false;
+          _errorMessage = "Error prompting OS biometrics: $e";
+        });
+      }
+    } else {
+      setState(() {
+        _enableBiometrics = false;
+      });
+    }
+  }
+
+  Future<void> _completeSetup() async {
+    String? newPin = _customPinController.text.trim();
+    if (newPin.isEmpty) {
+      newPin = null; 
+    } else if (newPin.length != 4) {
+      setState(() {
+        _errorMessage = "Device PIN must be exactly 4 digits.";
+      });
+      return;
+    }
+
+    await DatabaseHelper.instance.saveSecurityConfig(
+      customPin: newPin,
+      isBiometricsEnabled: _enableBiometrics,
+    );
+
+    widget.onAuthenticated();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(32.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              const SizedBox(height: 20),
+              const Text(
+                'HYDRODECK',
+                style: TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 2.0,
+                  color: Color(0xFF232323),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                !_isPinVerified ? 'Initial Setup Authorization' : 'Preferences Setup',
+                style: const TextStyle(fontSize: 14, color: Colors.grey, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 40),
+
+              if (!_isPinVerified) ...[
+                Container(
+                  padding: const EdgeInsets.all(24),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(24),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withAlpha(10),
+                        blurRadius: 10,
+                        offset: const Offset(0, 4),
+                      )
+                    ],
+                  ),
+                  child: Column(
+                    children: [
+                      const Icon(Icons.lock_outline, size: 48, color: Color(0xFF2DC867)),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'Enter 4-Digit Manual PIN',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Please enter the default factory PIN included in your device user manual.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 12, color: Colors.grey),
+                      ),
+                      const SizedBox(height: 24),
+                      TextField(
+                        controller: _pinController,
+                        enabled: _lockoutTimeRemaining == 0,
+                        keyboardType: TextInputType.number,
+                        maxLength: 4,
+                        obscureText: true,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(fontSize: 24, letterSpacing: 12, fontWeight: FontWeight.bold),
+                        decoration: InputDecoration(
+                          counterText: "",
+                          hintText: "••••",
+                          contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(16),
+                            borderSide: const BorderSide(color: Color(0xFF2DC867), width: 2),
+                          ),
+                        ),
+                      ),
+                      if (_errorMessage != null) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          _errorMessage!,
+                          style: const TextStyle(color: Colors.redAccent, fontSize: 12, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                      if (_lockoutTimeRemaining > 0) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          "Locked out. Retry in $_lockoutTimeRemaining seconds.",
+                          style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 13),
+                        ),
+                      ],
+                      const SizedBox(height: 24),
+                      ElevatedButton(
+                        onPressed: _lockoutTimeRemaining > 0 ? null : _verifyPin,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF2DC867),
+                          foregroundColor: Colors.white,
+                          minimumSize: const Size(double.infinity, 50),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(25),
+                          ),
+                        ),
+                        child: const Text('Verify PIN', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                      ),
+                    ],
+                  ),
+                ),
+              ] else ...[
+                Container(
+                  padding: const EdgeInsets.all(24),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(24),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withAlpha(10),
+                        blurRadius: 10,
+                        offset: const Offset(0, 4),
+                      )
+                    ],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Center(
+                        child: Icon(Icons.phonelink_setup_rounded, size: 48, color: Color(0xFF2DC867)),
+                      ),
+                      const SizedBox(height: 16),
+                      const Center(
+                        child: Text(
+                          'Personalize Access',
+                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      const Text(
+                        'Device Custom PIN (Optional)',
+                        style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        'Change PIN specifically for opening the app on this device. The manual PIN (6967) remains usable for setup resets.',
+                        style: TextStyle(fontSize: 11, color: Colors.grey),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _customPinController,
+                        keyboardType: TextInputType.number,
+                        maxLength: 4,
+                        obscureText: true,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(fontSize: 18, letterSpacing: 8, fontWeight: FontWeight.bold),
+                        decoration: InputDecoration(
+                          counterText: "",
+                          hintText: "New PIN",
+                          contentPadding: const EdgeInsets.symmetric(vertical: 10),
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: const BorderSide(color: Color(0xFF2DC867), width: 2),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      const Divider(),
+                      const SizedBox(height: 8),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        activeColor: const Color(0xFF2DC867),
+                        title: const Text('Enable Biometrics', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                        subtitle: const Text('Use Fingerprint or Face ID for fast unlocking', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                        value: _enableBiometrics,
+                        onChanged: _handleBiometricToggle,
+                      ),
+                      if (_errorMessage != null) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          _errorMessage!,
+                          style: const TextStyle(color: Colors.redAccent, fontSize: 12, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                      const SizedBox(height: 24),
+                      ElevatedButton(
+                        onPressed: _completeSetup,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF2DC867),
+                          foregroundColor: Colors.white,
+                          minimumSize: const Size(double.infinity, 50),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(25),
+                          ),
+                        ),
+                        child: const Text('Save & Continue', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                      ),
+                    ],
+                  ),
+                ),
+              ]
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// --- UNLOCK AUTHENTICATION SCREEN FOR OPENING APP ---
+class AppUnlockScreen extends StatefulWidget {
+  final Map<String, dynamic> securityConfig;
+  final VoidCallback onAuthenticated;
+
+  const AppUnlockScreen({
+    super.key,
+    required this.securityConfig,
+    required this.onAuthenticated,
+  });
+
+  @override
+  State<AppUnlockScreen> createState() => _AppUnlockScreenState();
+}
+
+class _AppUnlockScreenState extends State<AppUnlockScreen> {
+  final TextEditingController _pinController = TextEditingController();
+  final LocalAuthentication _localAuth = LocalAuthentication();
+  String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.securityConfig['isBiometricsEnabled'] == true) {
+      _tryBiometricAuth();
+    }
+  }
+
+  @override
+  void dispose() {
+    _pinController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _tryBiometricAuth() async {
+    try {
+      bool authenticated = await _localAuth.authenticate(
+        localizedReason: 'Authenticate to access Hydrodeck',
+        options: const AuthenticationOptions(
+          stickyAuth: true,
+          biometricOnly: true,
+        ),
+      );
+      if (authenticated) {
+        widget.onAuthenticated();
+      }
+    } catch (_) {}
+  }
+
+  void _verifyPin() {
+    final enteredPin = _pinController.text.trim();
+    final customPin = widget.securityConfig['customPin'] as String?;
+
+    bool isCorrect = false;
+    if (customPin != null && customPin.isNotEmpty) {
+      isCorrect = (enteredPin == customPin || enteredPin == "6967");
+    } else {
+      isCorrect = (enteredPin == "6967");
+    }
+
+    if (isCorrect) {
+      widget.onAuthenticated();
+    } else {
+      setState(() {
+        _errorMessage = "Incorrect PIN. Try again.";
+      });
+      _pinController.clear();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    bool bioEnabled = widget.securityConfig['isBiometricsEnabled'] == true;
+
+    return Scaffold(
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(32.0),
+          child: Center(
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.security, size: 64, color: Color(0xFF2DC867)),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'HYDRODECK LOCKED',
+                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, letterSpacing: 1.5),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text('Enter your PIN to open the application', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  const SizedBox(height: 32),
+                  TextField(
+                    controller: _pinController,
+                    keyboardType: TextInputType.number,
+                    maxLength: 4,
+                    obscureText: true,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 24, letterSpacing: 12, fontWeight: FontWeight.bold),
+                    decoration: InputDecoration(
+                      counterText: "",
+                      hintText: "••••",
+                      contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(16)),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(16),
+                        borderSide: const BorderSide(color: Color(0xFF2DC867), width: 2),
+                      ),
+                    ),
+                  ),
+                  if (_errorMessage != null) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      _errorMessage!,
+                      style: const TextStyle(color: Colors.redAccent, fontSize: 12, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                  const SizedBox(height: 24),
+                  ElevatedButton(
+                    onPressed: _verifyPin,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF2DC867),
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size(double.infinity, 50),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
+                    ),
+                    child: const Text('Unlock', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                  ),
+                  if (bioEnabled) ...[
+                    const SizedBox(height: 16),
+                    IconButton(
+                      iconSize: 40,
+                      icon: const Icon(Icons.fingerprint, color: Color(0xFF2DC867)),
+                      onPressed: _tryBiometricAuth,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class MainGatekeeper extends StatefulWidget {
   const MainGatekeeper({super.key});
 
@@ -502,8 +1090,12 @@ class MainGatekeeper extends StatefulWidget {
   State<MainGatekeeper> createState() => _MainGatekeeperState();
 }
 
-class _MainGatekeeperState extends State<MainGatekeeper> {
+class _MainGatekeeperState extends State<MainGatekeeper> with WidgetsBindingObserver {
   bool _isLoading = true;
+  bool _isPinVerified = false;
+  bool _isFirstSetupRequired = false;
+  Map<String, dynamic>? _securityConfig;
+
   bool _isPlantingActive = false;
   DateTime? _plantingStartDate;
   List<PlantingRecord> _pastPlantingRuns = [];
@@ -514,33 +1106,60 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadStoredSessionAndData();
     _listenToBackgroundService();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _bgSubscription?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
+      if (mounted && !_isFirstSetupRequired) {
+        setState(() {
+          _isPinVerified = false;
+        });
+      }
+    }
   }
 
   Future<void> _loadStoredSessionAndData() async {
     final activeDate = await DatabaseHelper.instance.getActiveSession();
     final pastRuns = await DatabaseHelper.instance.getPlantingHistory();
     final savedIp = await DatabaseHelper.instance.getActiveIp();
+    final securityConfig = await DatabaseHelper.instance.getSecurityConfig();
 
-    setState(() {
-      _pastPlantingRuns = pastRuns;
-      _activeEsp32Ip = savedIp;
-      if (activeDate != null) {
-        _plantingStartDate = activeDate;
-        _isPlantingActive = true;
-      }
-      _isLoading = false;
-    });
+    if (mounted) {
+      setState(() {
+        _pastPlantingRuns = pastRuns;
+        _activeEsp32Ip = savedIp;
+        _securityConfig = securityConfig;
+
+        if (securityConfig == null) {
+          _isFirstSetupRequired = true;
+          _isPinVerified = false;
+        } else {
+          _isFirstSetupRequired = false;
+          _isPinVerified = false; 
+        }
+
+        if (activeDate != null) {
+          _plantingStartDate = activeDate;
+          _isPlantingActive = true;
+        }
+        _isLoading = false;
+      });
+    }
   }
 
   void _listenToBackgroundService() {
+    if (kIsWeb) return;
     _bgSubscription = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
       if (event != null && event['ip'] != null && mounted) {
         setState(() {
@@ -553,6 +1172,10 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
   void _startPlanting() async {
     final now = DateTime.now();
     await DatabaseHelper.instance.saveActiveSession(now);
+
+    if (!kIsWeb) {
+      FlutterBackgroundService().invoke('setPlantingState', {'active': true});
+    }
 
     setState(() {
       _plantingStartDate = now;
@@ -576,6 +1199,10 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     await DatabaseHelper.instance.insertPlantingRecord(newRecord);
     await DatabaseHelper.instance.clearActiveSession();
 
+    if (!kIsWeb) {
+      FlutterBackgroundService().invoke('setPlantingState', {'active': false});
+    }
+
     setState(() {
       _pastPlantingRuns.add(newRecord);
       _isPlantingActive = false;
@@ -590,6 +1217,30 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
         body: Center(
           child: CircularProgressIndicator(color: Color(0xFF2DC867)),
         ),
+      );
+    }
+
+    if (_isFirstSetupRequired) {
+      return PinSetupScreen(
+        onAuthenticated: () async {
+          final updatedConfig = await DatabaseHelper.instance.getSecurityConfig();
+          setState(() {
+            _securityConfig = updatedConfig;
+            _isFirstSetupRequired = false;
+            _isPinVerified = true;
+          });
+        },
+      );
+    }
+
+    if (!_isPinVerified && _securityConfig != null) {
+      return AppUnlockScreen(
+        securityConfig: _securityConfig!,
+        onAuthenticated: () {
+          setState(() {
+            _isPinVerified = true;
+          });
+        },
       );
     }
 
@@ -837,21 +1488,23 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   Future<void> _loadStoredLogsAndSettings() async {
     final storedLogs = await DatabaseHelper.instance.getLogs();
     final config = await DatabaseHelper.instance.getSettingsConfig();
-    setState(() {
-      _historyLogs = storedLogs;
-      _minPhThreshold = config['minPh'] ?? 5.5;
-      _maxPhThreshold = config['maxPh'] ?? 6.8;
-      
-      // Populate last readings from persistent logs if available
-      if (storedLogs.isNotEmpty) {
-        _lastValidPhValue = storedLogs.first.pH;
-        _lastValidWaterTemp = storedLogs.first.temperature;
-        _lastValidWaterStatus = storedLogs.first.waterLevel == "Water full" ? "full" : "low";
-      }
-    });
+    if (mounted) {
+      setState(() {
+        _historyLogs = storedLogs;
+        _minPhThreshold = config['minPh'] ?? 5.5;
+        _maxPhThreshold = config['maxPh'] ?? 6.8;
+        
+        if (storedLogs.isNotEmpty) {
+          _lastValidPhValue = storedLogs.first.pH;
+          _lastValidWaterTemp = storedLogs.first.temperature;
+          _lastValidWaterStatus = storedLogs.first.waterLevel == "Water full" ? "full" : "low";
+        }
+      });
+    }
   }
 
   void _subscribeToBackgroundUpdates() {
+    if (kIsWeb) return;
     _telemetrySub = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
       if (event != null && mounted) {
         setState(() {
@@ -1360,7 +2013,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                     setState(() {
                       _esp32Ip = trimmed;
                     });
-                    FlutterBackgroundService().invoke('updateIp', {'ip': trimmed});
+                    if (!kIsWeb) {
+                      FlutterBackgroundService().invoke('updateIp', {'ip': trimmed});
+                    }
                   },
                 ),
               ],
@@ -1396,10 +2051,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                       _minPhThreshold = val;
                     });
                     DatabaseHelper.instance.saveSettingsConfig(_minPhThreshold, _maxPhThreshold);
-                    FlutterBackgroundService().invoke('updateLimits', {
-                      'minPh': _minPhThreshold,
-                      'maxPh': _maxPhThreshold,
-                    });
+                    if (!kIsWeb) {
+                      FlutterBackgroundService().invoke('updateLimits', {
+                        'minPh': _minPhThreshold,
+                        'maxPh': _maxPhThreshold,
+                      });
+                    }
                   },
                 ),
               ],
@@ -1431,10 +2088,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                       _maxPhThreshold = val;
                     });
                     DatabaseHelper.instance.saveSettingsConfig(_minPhThreshold, _maxPhThreshold);
-                    FlutterBackgroundService().invoke('updateLimits', {
-                      'minPh': _minPhThreshold,
-                      'maxPh': _maxPhThreshold,
-                    });
+                    if (!kIsWeb) {
+                      FlutterBackgroundService().invoke('updateLimits', {
+                        'minPh': _minPhThreshold,
+                        'maxPh': _maxPhThreshold,
+                      });
+                    }
                   },
                 ),
               ],
