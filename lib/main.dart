@@ -34,7 +34,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 3,
+      version: 4,
       onCreate: _createDB,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -55,6 +55,11 @@ class DatabaseHelper {
             )
           ''');
         }
+        if (oldVersion < 4) {
+          await db.execute('''
+            ALTER TABLE historical_logs ADD COLUMN tds REAL NOT NULL DEFAULT 0.0
+          ''');
+        }
       },
     );
   }
@@ -66,7 +71,8 @@ class DatabaseHelper {
         timestamp TEXT NOT NULL,
         pH REAL NOT NULL,
         temperature TEXT NOT NULL,
-        waterLevel TEXT NOT NULL
+        waterLevel TEXT NOT NULL,
+        tds REAL NOT NULL DEFAULT 0.0
       )
     ''');
 
@@ -147,6 +153,7 @@ class DatabaseHelper {
       'pH': log.pH,
       'temperature': log.temperature,
       'waterLevel': log.waterLevel,
+      'tds': log.tds,
     });
   }
 
@@ -159,6 +166,7 @@ class DatabaseHelper {
       pH: (json['pH'] as num).toDouble(),
       temperature: json['temperature'] as String,
       waterLevel: json['waterLevel'] as String,
+      tds: (json['tds'] as num?)?.toDouble() ?? 0.0,
     )).toList();
   }
 
@@ -350,6 +358,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   double lastPh = 7.0;
   String lastTemp = "25.0°C";
   String lastWater = "low";
+  double lastTds = 0.0;
   bool isConnected = false;
 
   bool isAppClosed = false; 
@@ -360,6 +369,8 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
   DateTime? criticalPhStart;
   DateTime? lastAlertTime;
+
+  bool isPolling = false; // Prevents timer stack overlap
 
   try {
     targetIp = await DatabaseHelper.instance.getActiveIp();
@@ -375,6 +386,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       lastPh = logs.first.pH;
       lastTemp = logs.first.temperature;
       lastWater = logs.first.waterLevel == "Water full" ? "full" : "low";
+      lastTds = logs.first.tds;
     }
   } catch (_) {}
 
@@ -405,7 +417,32 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     }
   });
 
-  Timer.periodic(const Duration(seconds: 2), (timer) async {
+  String sanitizeHost(String input) {
+    String host = input.trim();
+    host = host.replaceAll(RegExp(r'^https?://'), '');
+    host = host.replaceAll(RegExp(r'/.*$'), '');
+    return host.isEmpty ? "hydrodeck.local" : host;
+  }
+
+  Future<Map<String, dynamic>?> fetchStatus(String host, Duration timeout) async {
+    try {
+      final res = await http.get(
+        Uri.parse('http://$host/status'),
+        headers: {'Connection': 'close'},
+      ).timeout(timeout);
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        return {'host': host, 'data': data};
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Timer.periodic(const Duration(seconds: 3), (timer) async {
+    if (isPolling) return; // Skip if previous poll hasn't resolved
+    isPolling = true;
+
     // Only connect and poll ESP32 if planting has been started
     if (!isPlantingActive) {
       service.invoke('telemetryUpdate', {
@@ -414,38 +451,72 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         'ph': lastPh,
         'temp': lastTemp,
         'water': lastWater,
+        'tds': lastTds,
       });
+      isPolling = false;
       return;
     }
 
-    final List<String> candidateHosts = [
-      targetIp,
-      "hydrodeck.local",
-      "192.168.1.100",
-      "192.168.0.100",
-      "10.0.2.2"
-    ];
-
     bool found = false;
-    for (String host in candidateHosts) {
-      try {
-        final res = await http.get(Uri.parse('http://$host/status')).timeout(const Duration(milliseconds: 1500));
-        if (res.statusCode == 200) {
-          final data = jsonDecode(res.body);
+    String cleanTargetIp = sanitizeHost(targetIp);
+
+    // 1. Fast attempt to primary target IP
+    final primaryResult = await fetchStatus(cleanTargetIp, const Duration(milliseconds: 1200));
+
+    if (primaryResult != null) {
+      final data = primaryResult['data'];
+      if (data['ph'] != null) {
+        lastPh = (data['ph'] is num) ? (data['ph'] as num).toDouble() : lastPh;
+      }
+      if (data['temp'] != null && data['temp'] != 0.0) {
+        lastTemp = "${data['temp']}°C";
+      }
+      if (data['tds'] != null) {
+        lastTds = (data['tds'] is num) ? (data['tds'] as num).toDouble() : lastTds;
+      }
+      lastWater = data['water'] ?? lastWater;
+      
+      targetIp = cleanTargetIp;
+      isConnected = true;
+      found = true;
+    }
+
+    // 2. Concurrently probe fallback hosts if primary target failed
+    if (!found) {
+      final List<String> fallbackHosts = [
+        "hydrodeck.local",
+        "192.168.1.100",
+        "192.168.0.100",
+        "10.0.2.2"
+      ].map(sanitizeHost).where((h) => h != cleanTargetIp).toSet().toList();
+
+      final results = await Future.wait(
+        fallbackHosts.map((h) => fetchStatus(h, const Duration(milliseconds: 1200))),
+      );
+
+      for (final res in results) {
+        if (res != null) {
+          final host = res['host'] as String;
+          final data = res['data'];
+
           if (data['ph'] != null) {
             lastPh = (data['ph'] is num) ? (data['ph'] as num).toDouble() : lastPh;
           }
           if (data['temp'] != null && data['temp'] != 0.0) {
             lastTemp = "${data['temp']}°C";
           }
+          if (data['tds'] != null) {
+            lastTds = (data['tds'] is num) ? (data['tds'] as num).toDouble() : lastTds;
+          }
           lastWater = data['water'] ?? lastWater;
           
           targetIp = host;
+          DatabaseHelper.instance.saveActiveIp(targetIp);
           isConnected = true;
           found = true;
           break;
         }
-      } catch (_) {}
+      }
     }
 
     if (!found) {
@@ -482,7 +553,10 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       'ph': lastPh,
       'temp': lastTemp,
       'water': lastWater,
+      'tds': lastTds,
     });
+
+    isPolling = false;
   });
 
   Timer.periodic(const Duration(seconds: 20), (timer) async {
@@ -493,6 +567,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       pH: lastPh,
       temperature: lastTemp,
       waterLevel: lastWater == "full" ? "Water full" : "Needs water",
+      tds: lastTds,
     );
 
     try {
@@ -502,6 +577,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         'pH': snapshot.pH,
         'temperature': snapshot.temperature,
         'waterLevel': snapshot.waterLevel,
+        'tds': snapshot.tds,
       });
     } catch (_) {}
   });
@@ -569,12 +645,14 @@ class HistoricalData {
   final double pH;
   final String temperature;
   final String waterLevel;
+  final double tds;
 
   HistoricalData({
     required this.timestamp,
     required this.pH,
     required this.temperature,
     required this.waterLevel,
+    required this.tds,
   });
 }
 
@@ -1455,6 +1533,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   String _lastValidWaterStatus = "low";
   String _lastValidWaterTemp = "25.0°C";
   double _lastValidPhValue = 7.00; 
+  double _lastValidTdsValue = 0.0;
 
   StreamSubscription? _telemetrySub;
   StreamSubscription? _snapshotSub;
@@ -1498,6 +1577,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           _lastValidPhValue = storedLogs.first.pH;
           _lastValidWaterTemp = storedLogs.first.temperature;
           _lastValidWaterStatus = storedLogs.first.waterLevel == "Water full" ? "full" : "low";
+          _lastValidTdsValue = storedLogs.first.tds;
         }
       });
     }
@@ -1518,6 +1598,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           if (event['water'] != null) {
             _lastValidWaterStatus = event['water'];
           }
+          if (event['tds'] != null) {
+            _lastValidTdsValue = (event['tds'] as num).toDouble();
+          }
           if (event['ip'] != null) {
             _esp32Ip = event['ip'];
           }
@@ -1532,6 +1615,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           pH: (event['pH'] as num).toDouble(),
           temperature: event['temperature'],
           waterLevel: event['waterLevel'],
+          tds: (event['tds'] as num?)?.toDouble() ?? 0.0,
         );
         setState(() {
           _historyLogs.insert(0, newLog);
@@ -1579,9 +1663,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
       if (ledNumber == 2) _led2On = !_led2On;
     });
 
-    final Uri url = Uri.parse('http://$_esp32Ip/$endpoint');
+    String cleanHost = _esp32Ip.trim().replaceAll(RegExp(r'^https?://'), '').replaceAll(RegExp(r'/.*$'), '');
+    if (cleanHost.isEmpty) cleanHost = "hydrodeck.local";
+
+    final Uri url = Uri.parse('http://$cleanHost/$endpoint');
     try {
-      final response = await http.get(url).timeout(const Duration(seconds: 3));
+      final response = await http.get(url, headers: {'Connection': 'close'}).timeout(const Duration(seconds: 3));
       if (!mounted) return;
       if (response.statusCode == 200) {
         setState(() {});
@@ -1746,6 +1833,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
 
   Widget _buildMetricGrid(String waterLabel, bool isWaterFull) {
     bool isPhOptimal = _lastValidPhValue >= _minPhThreshold && _lastValidPhValue <= _maxPhThreshold;
+    bool isTdsOptimal = _lastValidTdsValue >= 400 && _lastValidTdsValue <= 900;
 
     return Column(
       children: [
@@ -1761,7 +1849,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
               )
             ),
             const SizedBox(width: 16),
-            Expanded(child: _buildCleanCard('TDS', '650 PPM', 'Optimal', const Color(0xFFE8F7ED), Colors.green)),
+            Expanded(
+              child: _buildCleanCard(
+                'TDS', 
+                '${_lastValidTdsValue.toStringAsFixed(0)} PPM', 
+                isTdsOptimal ? 'Optimal' : 'Warning', 
+                isTdsOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0), 
+                isTdsOptimal ? Colors.green : Colors.orange
+              )
+            ),
           ],
         ),
         const SizedBox(height: 16),
@@ -2224,6 +2320,8 @@ class SnapshotDetailScreen extends StatelessWidget {
   }
 
   Widget _buildStaticGrid(bool isWaterFull, bool isPhOptimal) {
+    bool isTdsOptimal = data.tds >= 400 && data.tds <= 900;
+
     return Column(
       children: [
         Row(
@@ -2238,7 +2336,15 @@ class SnapshotDetailScreen extends StatelessWidget {
               )
             ),
             const SizedBox(width: 16),
-            Expanded(child: _buildStaticCard('TDS', '650 PPM', 'Historical')),
+            Expanded(
+              child: _buildStaticCard(
+                'TDS', 
+                '${data.tds.toStringAsFixed(0)} PPM', 
+                isTdsOptimal ? 'Optimal' : 'Warning',
+                bgOverride: isTdsOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
+                textOverride: isTdsOptimal ? Colors.green : Colors.orange,
+              )
+            ),
           ],
         ),
         const SizedBox(height: 16),
