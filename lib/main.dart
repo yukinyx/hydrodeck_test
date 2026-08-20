@@ -9,6 +9,15 @@ import 'package:sqflite/sqflite.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:local_auth/local_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'firebase_options.dart';
+
+bool get _supportsBackgroundService =>
+  !kIsWeb &&
+  !const bool.fromEnvironment('FLUTTER_TEST') &&
+  (defaultTargetPlatform == TargetPlatform.android ||
+    defaultTargetPlatform == TargetPlatform.iOS);
 
 // --- LOCAL DATABASE SERVICE ---
 class DatabaseHelper {
@@ -280,7 +289,7 @@ class NotificationHelper {
     const InitializationSettings settings =
         InitializationSettings(android: androidSettings);
 
-    await _notificationsPlugin.initialize(settings);
+    await _notificationsPlugin.initialize(settings: settings);
 
     _notificationsPlugin
         .resolvePlatformSpecificImplementation<
@@ -302,10 +311,10 @@ class NotificationHelper {
     const NotificationDetails details = NotificationDetails(android: androidDetails);
 
     await _notificationsPlugin.show(
-      DateTime.now().millisecondsSinceEpoch ~/ 1000,
-      '⚠️ Critical pH Alert',
-      'pH level has remained in critical range (${ph.toStringAsFixed(2)}) for over 20 seconds!',
-      details,
+      id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      title: '⚠️ Critical pH Alert',
+      body: 'pH level has remained in critical range (${ph.toStringAsFixed(2)}) for over 20 seconds!',
+      notificationDetails: details,
     );
   }
 }
@@ -353,6 +362,12 @@ Future<void> initializeBackgroundService() async {
 @pragma('vm:entry-point')
 void onBackgroundServiceStart(ServiceInstance service) async {
   DartPluginRegistrant.ensureInitialized();
+
+  try {
+    if (Firebase.apps.isEmpty) {
+      await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+    }
+  } catch (_) {}
 
   String targetIp = "hydrodeck.local";
   double lastPh = 7.0;
@@ -481,7 +496,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       found = true;
     }
 
-    // 2. Concurrently probe fallback hosts if primary target failed
+    // 2. Concurrently probe fallback local hosts if primary target failed
     if (!found) {
       final List<String> fallbackHosts = [
         "hydrodeck.local",
@@ -517,6 +532,35 @@ void onBackgroundServiceStart(ServiceInstance service) async {
           break;
         }
       }
+    }
+
+    // 3. Fallback to Firebase Realtime Database for Remote Network Connection
+    if (!found) {
+      try {
+        final dbRef = FirebaseDatabase.instanceFor(
+          app: Firebase.app(),
+          databaseURL: "https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/",
+        ).ref('hydrodeck');
+
+        final snapshot = await dbRef.get().timeout(const Duration(milliseconds: 2500));
+        if (snapshot.exists && snapshot.value != null) {
+          final data = Map<String, dynamic>.from(snapshot.value as Map);
+          if (data['ph'] != null) {
+            lastPh = (data['ph'] is num) ? (data['ph'] as num).toDouble() : lastPh;
+          }
+          if (data['temp'] != null) {
+            lastTemp = "${data['temp']}°C";
+          }
+          if (data['tds'] != null) {
+            lastTds = (data['tds'] is num) ? (data['tds'] as num).toDouble() : lastTds;
+          }
+          if (data['water'] != null) {
+            lastWater = data['water'].toString();
+          }
+          isConnected = true;
+          found = true;
+        }
+      } catch (_) {}
     }
 
     if (!found) {
@@ -585,7 +629,15 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  if (!kIsWeb) {
+  try {
+    if (Firebase.apps.isEmpty) {
+      await Firebase.initializeApp(
+        options: DefaultFirebaseOptions.currentPlatform,
+      );
+    }
+  } catch (_) {}
+
+  if (_supportsBackgroundService) {
     await NotificationHelper.init();
     await initializeBackgroundService();
   }
@@ -604,8 +656,10 @@ class _HydrodeckAppState extends State<HydrodeckApp> with WidgetsBindingObserver
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    if (!kIsWeb) {
-      FlutterBackgroundService().invoke('appState', {'state': 'foreground'});
+    if (_supportsBackgroundService) {
+      try {
+        FlutterBackgroundService().invoke('appState', {'state': 'foreground'});
+      } catch (_) {}
     }
   }
 
@@ -761,10 +815,8 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
 
         bool authenticated = await _localAuth.authenticate(
           localizedReason: 'Please authenticate to enable biometric login for Hydrodeck',
-          options: const AuthenticationOptions(
-            stickyAuth: true,
-            biometricOnly: true,
-          ),
+          biometricOnly: true,
+          persistAcrossBackgrounding: true,
         );
 
         if (authenticated) {
@@ -977,7 +1029,7 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                       const SizedBox(height: 8),
                       SwitchListTile(
                         contentPadding: EdgeInsets.zero,
-                        activeColor: const Color(0xFF2DC867),
+                        activeThumbColor: const Color(0xFF2DC867),
                         title: const Text('Enable Biometrics', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
                         subtitle: const Text('Use Fingerprint or Face ID for fast unlocking', style: TextStyle(fontSize: 11, color: Colors.grey)),
                         value: _enableBiometrics,
@@ -1053,10 +1105,8 @@ class _AppUnlockScreenState extends State<AppUnlockScreen> {
     try {
       bool authenticated = await _localAuth.authenticate(
         localizedReason: 'Authenticate to access Hydrodeck',
-        options: const AuthenticationOptions(
-          stickyAuth: true,
-          biometricOnly: true,
-        ),
+        biometricOnly: true,
+        persistAcrossBackgrounding: true,
       );
       if (authenticated) {
         widget.onAuthenticated();
@@ -1237,21 +1287,23 @@ class _MainGatekeeperState extends State<MainGatekeeper> with WidgetsBindingObse
   }
 
   void _listenToBackgroundService() {
-    if (kIsWeb) return;
-    _bgSubscription = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
-      if (event != null && event['ip'] != null && mounted) {
-        setState(() {
-          _activeEsp32Ip = event['ip'];
-        });
-      }
-    });
+    if (!_supportsBackgroundService) return;
+    try {
+      _bgSubscription = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
+        if (event != null && event['ip'] != null && mounted) {
+          setState(() {
+            _activeEsp32Ip = event['ip'];
+          });
+        }
+      });
+    } catch (_) {}
   }
 
   void _startPlanting() async {
     final now = DateTime.now();
     await DatabaseHelper.instance.saveActiveSession(now);
 
-    if (!kIsWeb) {
+    if (_supportsBackgroundService) {
       FlutterBackgroundService().invoke('setPlantingState', {'active': true});
     }
 
@@ -1277,7 +1329,7 @@ class _MainGatekeeperState extends State<MainGatekeeper> with WidgetsBindingObse
     await DatabaseHelper.instance.insertPlantingRecord(newRecord);
     await DatabaseHelper.instance.clearActiveSession();
 
-    if (!kIsWeb) {
+    if (_supportsBackgroundService) {
       FlutterBackgroundService().invoke('setPlantingState', {'active': false});
     }
 
@@ -1541,8 +1593,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   List<HistoricalData> _historyLogs = [];
   DateTime? _selectedFilterDate;
 
-  bool _led1On = false;
-  bool _led2On = false;
+  bool _pumpOn = false;
 
   double _minPhThreshold = 5.5;
   double _maxPhThreshold = 6.8;
@@ -1657,28 +1708,30 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     return "Pre-cycle Preparation";
   }
 
-  Future<void> _toggleLed(String endpoint, int ledNumber) async {
+  Future<void> _togglePump() async {
     setState(() {
-      if (ledNumber == 1) _led1On = !_led1On;
-      if (ledNumber == 2) _led2On = !_led2On;
+      _pumpOn = !_pumpOn;
     });
 
     String cleanHost = _esp32Ip.trim().replaceAll(RegExp(r'^https?://'), '').replaceAll(RegExp(r'/.*$'), '');
     if (cleanHost.isEmpty) cleanHost = "hydrodeck.local";
 
-    final Uri url = Uri.parse('http://$cleanHost/$endpoint');
+    final Uri url = Uri.parse('http://$cleanHost/togglePump');
     try {
-      final response = await http.get(url, headers: {'Connection': 'close'}).timeout(const Duration(seconds: 3));
+      final response = await http.get(url, headers: {'Connection': 'close'}).timeout(const Duration(seconds: 2));
       if (!mounted) return;
       if (response.statusCode == 200) {
         setState(() {});
-      } else {
-        setState(() {});
       }
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {});
-    }
+    } catch (_) {}
+
+    try {
+      final dbRef = FirebaseDatabase.instanceFor(
+        app: Firebase.app(),
+        databaseURL: "https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/",
+      ).ref('hydrodeck/commandPumpState');
+      await dbRef.set(_pumpOn);
+    } catch (_) {}
   }
 
   @override
@@ -1906,23 +1959,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             child: Column(
               children: [
                 ElevatedButton.icon(
-                  onPressed: () => _toggleLed('toggleLED', 1),
-                  icon: Icon(_led1On ? Icons.lightbulb : Icons.lightbulb_outline),
-                  label: Text("LED 1 (GPIO 23): ${_led1On ? 'ON' : 'OFF'}"),
+                  onPressed: _togglePump,
+                  icon: Icon(_pumpOn ? Icons.water_drop : Icons.water_drop_outlined),
+                  label: Text("Peristaltic Pump (GPIO 23): ${_pumpOn ? 'ON' : 'OFF'}"),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: _led1On ? const Color(0xFF2DC867) : Colors.redAccent,
-                    foregroundColor: Colors.white,
-                    minimumSize: const Size(280, 56),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                  ),
-                ),
-                const SizedBox(height: 20),
-                ElevatedButton.icon(
-                  onPressed: () => _toggleLed('toggleLED1', 2),
-                  icon: Icon(_led2On ? Icons.lightbulb : Icons.lightbulb_outline),
-                  label: Text("LED 2 (GPIO 22): ${_led2On ? 'ON' : 'OFF'}"),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _led2On ? const Color(0xFF2DC867) : Colors.redAccent,
+                    backgroundColor: _pumpOn ? const Color(0xFF2DC867) : Colors.redAccent,
                     foregroundColor: Colors.white,
                     minimumSize: const Size(280, 56),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -2109,7 +2150,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                     setState(() {
                       _esp32Ip = trimmed;
                     });
-                    if (!kIsWeb) {
+                    if (_supportsBackgroundService) {
                       FlutterBackgroundService().invoke('updateIp', {'ip': trimmed});
                     }
                   },
@@ -2147,7 +2188,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                       _minPhThreshold = val;
                     });
                     DatabaseHelper.instance.saveSettingsConfig(_minPhThreshold, _maxPhThreshold);
-                    if (!kIsWeb) {
+                    if (_supportsBackgroundService) {
                       FlutterBackgroundService().invoke('updateLimits', {
                         'minPh': _minPhThreshold,
                         'maxPh': _maxPhThreshold,
@@ -2184,7 +2225,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                       _maxPhThreshold = val;
                     });
                     DatabaseHelper.instance.saveSettingsConfig(_minPhThreshold, _maxPhThreshold);
-                    if (!kIsWeb) {
+                    if (_supportsBackgroundService) {
                       FlutterBackgroundService().invoke('updateLimits', {
                         'minPh': _minPhThreshold,
                         'maxPh': _maxPhThreshold,

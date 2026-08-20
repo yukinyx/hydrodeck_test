@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "129047565304",
+    "project_id": "hydrodeck-e6fea",
+    "storage_bucket": "hydrodeck-e6fea.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:129047565304:android:815e77ceb2af273450bc0d",
+        "android_client_info": {
+          "package_name": "com.example.hydrodeck_test"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBvqqaAZZUYp5OWYtILJlBm7OnxxstN2OQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

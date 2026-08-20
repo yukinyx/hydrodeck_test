@@ -1,0 +1,244 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+
+// FirebaseClient 2.x enables services through compile-time feature flags.
+#define ENABLE_USER_AUTH
+#define ENABLE_DATABASE
+#include <FirebaseClient.h>
+#include <WebServer.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ESPmDNS.h>
+
+// Install "FirebaseClient" by Mobizt in Arduino IDE.
+// Do not use a conflicting Firebase-ESP-Client FirebaseClient.h.
+const char* ssid = "TEST";
+const char* password = "12345678";
+
+#define API_KEY "AIzaSyBBz_dOxKgGkz84VTnmAWXP556dMqJWGLo"
+#define USER_EMAIL "patricianicole.santos01@gmail.com"
+#define USER_PASSWORD "asdqwe123"
+#define DATABASE_URL "https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+WiFiClientSecure ssl_client;
+using AsyncClient = AsyncClientClass;
+AsyncClient aClient(ssl_client);
+UserAuth user_auth(API_KEY, USER_EMAIL, USER_PASSWORD);
+FirebaseApp app;
+RealtimeDatabase Database;
+AsyncResult result;
+
+const int pumpRelayPin = 23;
+const int WATER_SENSOR_PIN = 21;
+#define DS18B20PIN 4
+const int pH_Pin = 34;
+const int TdsSensorPin = 35;
+#define SCOUNT 30
+#define VREF 3.3
+const int adc_resolution = 4095;
+const float v_ref = 3.3;
+const float tdsCalibrationFactor = 1.0;
+float calibration_value = 21.34;
+float slope = 0.18;
+
+WebServer server(80);
+OneWire oneWire(DS18B20PIN);
+DallasTemperature sensors(&oneWire);
+int analogBuffer[SCOUNT];
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0;
+bool pumpState = false;
+float currentTemperature = 0.0;
+float currentPhValue = 7.0;
+float currentTdsValue = 0.0;
+unsigned long lastSensorCheck = 0;
+unsigned long lastTempCheck = 0;
+unsigned long lastPhCheck = 0;
+unsigned long lastFirebasePush = 0;
+unsigned long lastFirebaseCommandCheck = 0;
+const unsigned long firebaseInterval = 5000;
+const unsigned long firebaseCommandInterval = 1000;
+const unsigned long sensorInterval = 200;
+const unsigned long tempInterval = 1000;
+const unsigned long phInterval = 1000;
+int lastSensorState = LOW;
+
+int getMedianNum(int values[], int length) {
+  int bTab[length];
+  for (byte i = 0; i < length; i++) {
+    bTab[i] = values[i];
+  }
+  int i, j, bTemp;
+  for (j = 0; j < length - 1; j++) {
+    for (i = 0; i < length - j - 1; i++) {
+      if (bTab[i] > bTab[i + 1]) {
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
+      }
+    }
+  }
+  if ((length & 1) > 0) {
+    bTemp = bTab[(length - 1) / 2];
+  } else {
+    bTemp = (bTab[length / 2] + bTab[length / 2 - 1]) / 2;
+  }
+  return bTemp;
+}
+
+float readPhSensor() {
+  int measurings = 0;
+  int samples = 10;
+  for (int i = 0; i < samples; i++) {
+    measurings += analogRead(pH_Pin);
+    delay(10);
+  }
+  float voltage = (v_ref / adc_resolution) * (float)measurings / (float)samples;
+  float ph = 7.0 + ((2.5 - voltage) / slope);
+  if (ph < 0.0) ph = 0.0;
+  if (ph > 14.0) ph = 14.0;
+  return ph;
+}
+
+void handleRootIdent() {
+  server.send(200, "text/plain", "HYDRO_ESP32_ACTIVE");
+}
+
+void handleTogglePump() {
+  pumpState = !pumpState;
+  digitalWrite(pumpRelayPin, pumpState ? HIGH : LOW);
+  Database.set<bool>(aClient, "/hydrodeck/pumpState", pumpState);
+  server.send(200, "text/plain", pumpState ? "Pump is now ON" : "Pump is now OFF");
+}
+
+void handleCombinedStatus() {
+  String json = "{\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN) == HIGH ? "full" : "low") +
+                "\",\"temp\":" + String(currentTemperature, 1) +
+                ",\"ph\":" + String(currentPhValue, 2) +
+                ",\"tds\":" + String(currentTdsValue, 0) +
+                ",\"pumpState\":" + String(pumpState ? "true" : "false") + "}";
+  server.send(200, "application/json", json);
+}
+
+void checkRemotePumpCommand() {
+  if (!app.ready()) return;
+  bool requestedState = Database.get<bool>(aClient, "/hydrodeck/commandPumpState");
+  if (aClient.lastError().code() != 0) return;
+  if (requestedState != pumpState) {
+    pumpState = requestedState;
+    digitalWrite(pumpRelayPin, pumpState ? HIGH : LOW);
+    Database.set<bool>(aClient, "/hydrodeck/pumpState", pumpState);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(pumpRelayPin, OUTPUT);
+  digitalWrite(pumpRelayPin, LOW);
+  pinMode(WATER_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(pH_Pin, INPUT);
+  pinMode(TdsSensorPin, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(pH_Pin, ADC_11db);
+  analogSetPinAttenuation(TdsSensorPin, ADC_11db);
+  sensors.begin();
+  sensors.requestTemperatures();
+  delay(750);
+  float tempReading = sensors.getTempCByIndex(0);
+  if (tempReading != DEVICE_DISCONNECTED_C && tempReading > -50.0) {
+    currentTemperature = tempReading;
+  }
+  sensors.setWaitForConversion(false);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.print("\nESP32 IP: ");
+  Serial.println(WiFi.localIP());
+  if (MDNS.begin("hydrodeck")) Serial.println("mDNS: hydrodeck.local");
+
+  ssl_client.setInsecure();
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(DATABASE_URL);
+  initializeApp(aClient, app, getAuth(user_auth), result);
+
+  server.on("/", HTTP_GET, handleRootIdent);
+  server.on("/togglePump", HTTP_GET, handleTogglePump);
+  server.on("/status", HTTP_GET, handleCombinedStatus);
+  server.begin();
+}
+
+void loop() {
+  app.loop();
+  server.handleClient();
+  unsigned long now = millis();
+
+  if (now - lastFirebaseCommandCheck >= firebaseCommandInterval) {
+    lastFirebaseCommandCheck = now;
+    checkRemotePumpCommand();
+  }
+
+  static unsigned long sampleTime = 0;
+  if (now - sampleTime > 40U) {
+    sampleTime = now;
+    analogBuffer[analogBufferIndex] = analogRead(TdsSensorPin);
+    analogBufferIndex++;
+    if (analogBufferIndex == SCOUNT) analogBufferIndex = 0;
+  }
+
+  static unsigned long tdsTime = 0;
+  if (now - tdsTime > 800U) {
+    tdsTime = now;
+    for (int i = 0; i < SCOUNT; i++) {
+      analogBufferTemp[i] = analogBuffer[i];
+    }
+    float averageVoltage = getMedianNum(analogBufferTemp, SCOUNT) * (float)VREF / 4096.0;
+    averageVoltage = constrain(averageVoltage, 0.0f, (float)VREF);
+    float compensationCoefficient = 1.0 + 0.02 * (currentTemperature - 25.0);
+    float compensationVoltage = averageVoltage / compensationCoefficient;
+    float tdsValue = (133.42 * compensationVoltage * compensationVoltage * compensationVoltage -
+      255.86 * compensationVoltage * compensationVoltage + 857.39 * compensationVoltage) * 0.5;
+    if (tdsValue < 0) tdsValue = 0;
+    currentTdsValue = tdsValue * tdsCalibrationFactor;
+  }
+
+  if (now - lastPhCheck >= phInterval) {
+    lastPhCheck = now;
+    currentPhValue = readPhSensor();
+  }
+
+  if (now - lastTempCheck >= tempInterval) {
+    lastTempCheck = now;
+    float reading = sensors.getTempCByIndex(0);
+    if (reading != DEVICE_DISCONNECTED_C && reading > -50.0) currentTemperature = reading;
+    sensors.requestTemperatures();
+  }
+
+  if (now - lastSensorCheck >= sensorInterval) {
+    lastSensorCheck = now;
+    lastSensorState = digitalRead(WATER_SENSOR_PIN);
+  }
+
+  if (app.ready() && now - lastFirebasePush >= firebaseInterval) {
+    lastFirebasePush = now;
+    Database.set<float>(aClient, "/hydrodeck/temp", currentTemperature);
+    Database.set<float>(aClient, "/hydrodeck/ph", currentPhValue);
+    Database.set<float>(aClient, "/hydrodeck/tds", currentTdsValue);
+    Database.set<String>(aClient, "/hydrodeck/water",
+      digitalRead(WATER_SENSOR_PIN) == HIGH ? "full" : "low");
+    Database.set<bool>(aClient, "/hydrodeck/pumpState", pumpState);
+  }
+}
+
+/*
+Arduino IDE setup:
+- Install Mobizt's FirebaseClient library.
+- Remove a conflicting library that also installs FirebaseClient.h.
+- Select an ESP32 board.
+- Ensure Firebase Realtime Database rules allow the Firebase account above.
+- The Flutter app's factory PIN is 6967; that PIN is app access control only.
+*/
