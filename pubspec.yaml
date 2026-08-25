@@ -40,8 +40,8 @@ dependencies:
   cupertino_icons: ^1.0.8
   firebase_core: ^4.13.0
   firebase_database: ^12.4.7
-
-
+  flutter_blue_plus: ^2.3.12
+  permission_handler: 11.3.1
 dev_dependencies:
   flutter_test:
     sdk: flutter

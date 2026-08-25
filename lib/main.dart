@@ -9,6 +9,8 @@ import 'package:sqflite/sqflite.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:local_auth/local_auth.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'firebase_options.dart';
@@ -43,7 +45,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 4,
+      version: 5,
       onCreate: _createDB,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -69,6 +71,10 @@ class DatabaseHelper {
             ALTER TABLE historical_logs ADD COLUMN tds REAL NOT NULL DEFAULT 0.0
           ''');
         }
+        if (oldVersion < 5) {
+          await db.execute('ALTER TABLE historical_logs ADD COLUMN batchNumber INTEGER');
+          await db.execute('ALTER TABLE active_session ADD COLUMN batchNumber INTEGER NOT NULL DEFAULT 1');
+        }
       },
     );
   }
@@ -81,7 +87,8 @@ class DatabaseHelper {
         pH REAL NOT NULL,
         temperature TEXT NOT NULL,
         waterLevel TEXT NOT NULL,
-        tds REAL NOT NULL DEFAULT 0.0
+        tds REAL NOT NULL DEFAULT 0.0,
+        batchNumber INTEGER
       )
     ''');
 
@@ -97,7 +104,8 @@ class DatabaseHelper {
     await db.execute('''
       CREATE TABLE active_session (
         id INTEGER PRIMARY KEY,
-        startDate TEXT NOT NULL
+        startDate TEXT NOT NULL,
+        batchNumber INTEGER NOT NULL
       )
     ''');
 
@@ -163,6 +171,7 @@ class DatabaseHelper {
       'temperature': log.temperature,
       'waterLevel': log.waterLevel,
       'tds': log.tds,
+      'batchNumber': log.batchNumber,
     });
   }
 
@@ -176,6 +185,21 @@ class DatabaseHelper {
       temperature: json['temperature'] as String,
       waterLevel: json['waterLevel'] as String,
       tds: (json['tds'] as num?)?.toDouble() ?? 0.0,
+      batchNumber: json['batchNumber'] as int?,
+    )).toList();
+  }
+
+  Future<List<HistoricalData>> getLogsForBatch(int batchNumber) async {
+    final db = await instance.database;
+    if (db == null) return [];
+    final result = await db.query('historical_logs', where: 'batchNumber = ?', whereArgs: [batchNumber], orderBy: 'timestamp DESC');
+    return result.map((json) => HistoricalData(
+      timestamp: DateTime.parse(json['timestamp'] as String),
+      pH: (json['pH'] as num).toDouble(),
+      temperature: json['temperature'] as String,
+      waterLevel: json['waterLevel'] as String,
+      tds: (json['tds'] as num?)?.toDouble() ?? 0.0,
+      batchNumber: json['batchNumber'] as int?,
     )).toList();
   }
 
@@ -204,12 +228,12 @@ class DatabaseHelper {
   }
 
   // Session State Persistence
-  Future<void> saveActiveSession(DateTime startDate) async {
+  Future<void> saveActiveSession(DateTime startDate, int batchNumber) async {
     final db = await instance.database;
     if (db == null) return;
     await db.insert(
       'active_session',
-      {'id': 1, 'startDate': startDate.toIso8601String()},
+      {'id': 1, 'startDate': startDate.toIso8601String(), 'batchNumber': batchNumber},
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
@@ -222,6 +246,13 @@ class DatabaseHelper {
       return DateTime.parse(result.first['startDate'] as String);
     }
     return null;
+  }
+
+  Future<int?> getActiveBatchNumber() async {
+    final db = await instance.database;
+    if (db == null) return null;
+    final result = await db.query('active_session', where: 'id = ?', whereArgs: [1]);
+    return result.isEmpty ? null : result.first['batchNumber'] as int?;
   }
 
   Future<void> clearActiveSession() async {
@@ -264,7 +295,7 @@ class DatabaseHelper {
 
   Future<Map<String, double>> getSettingsConfig() async {
     final db = await instance.database;
-    if (db == null) return {'minPh': 5.5, 'maxPh': 6.8};
+    if (db == null) return {'minPh': 5.5, 'maxPh': 7.0};
     final result = await db.query('settings_config', where: 'id = ?', whereArgs: [1]);
     if (result.isNotEmpty) {
       return {
@@ -272,7 +303,7 @@ class DatabaseHelper {
         'maxPh': (result.first['maxPh'] as num).toDouble(),
       };
     }
-    return {'minPh': 5.5, 'maxPh': 6.8};
+    return {'minPh': 5.5, 'maxPh': 7.0};
   }
 }
 
@@ -378,9 +409,10 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
   bool isAppClosed = false; 
   bool isPlantingActive = false;
+  int? activeBatchNumber;
 
   double minPhThreshold = 5.5;
-  double maxPhThreshold = 6.8;
+  double maxPhThreshold = 7.0;
 
   DateTime? criticalPhStart;
   DateTime? lastAlertTime;
@@ -394,6 +426,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     maxPhThreshold = limits['maxPh']!;
     
     final activeSession = await DatabaseHelper.instance.getActiveSession();
+    activeBatchNumber = await DatabaseHelper.instance.getActiveBatchNumber();
     isPlantingActive = activeSession != null;
 
     final logs = await DatabaseHelper.instance.getLogs();
@@ -408,6 +441,11 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   service.on('setPlantingState').listen((event) {
     if (event != null && event['active'] != null) {
       isPlantingActive = event['active'] as bool;
+      if (isPlantingActive) {
+        DatabaseHelper.instance.getActiveBatchNumber().then((batchNumber) {
+          activeBatchNumber = batchNumber;
+        });
+      }
     }
   });
 
@@ -612,6 +650,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       temperature: lastTemp,
       waterLevel: lastWater == "full" ? "Water full" : "Needs water",
       tds: lastTds,
+      batchNumber: activeBatchNumber,
     );
 
     try {
@@ -700,6 +739,7 @@ class HistoricalData {
   final String temperature;
   final String waterLevel;
   final double tds;
+  final int? batchNumber;
 
   HistoricalData({
     required this.timestamp,
@@ -707,6 +747,7 @@ class HistoricalData {
     required this.temperature,
     required this.waterLevel,
     required this.tds,
+    this.batchNumber,
   });
 }
 
@@ -1002,7 +1043,7 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                       ),
                       const SizedBox(height: 4),
                       const Text(
-                        'Change PIN specifically for opening the app on this device. The manual PIN (6967) remains usable for setup resets.',
+                        'Change PIN specifically for opening the app on this device. The factory PIN remains usable for setup resets.',
                         style: TextStyle(fontSize: 11, color: Colors.grey),
                       ),
                       const SizedBox(height: 12),
@@ -1301,7 +1342,8 @@ class _MainGatekeeperState extends State<MainGatekeeper> with WidgetsBindingObse
 
   void _startPlanting() async {
     final now = DateTime.now();
-    await DatabaseHelper.instance.saveActiveSession(now);
+    final batchNumber = _pastPlantingRuns.length + 1;
+    await DatabaseHelper.instance.saveActiveSession(now, batchNumber);
 
     if (_supportsBackgroundService) {
       FlutterBackgroundService().invoke('setPlantingState', {'active': true});
@@ -1317,7 +1359,7 @@ class _MainGatekeeperState extends State<MainGatekeeper> with WidgetsBindingObse
     if (_plantingStartDate == null) return;
     
     final now = DateTime.now();
-    int totalDays = now.difference(_plantingStartDate!).inDays + 1;
+    int totalDays = (now.difference(_plantingStartDate!).inDays + 1).clamp(1, 999999);
 
     final newRecord = PlantingRecord(
       batchNumber: _pastPlantingRuns.length + 1,
@@ -1453,6 +1495,14 @@ class StartPlantingScreen extends StatelessWidget {
                                   color: Color(0xFF2DC867),
                                 ),
                               ),
+                              onTap: () {
+                                Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (context) => BatchHistoryScreen(record: run),
+                                  ),
+                                );
+                              },
                             ),
                           );
                         },
@@ -1575,6 +1625,11 @@ class HydroponicsDashboard extends StatefulWidget {
 }
 
 class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
+  static final Guid _bleServiceUuid = Guid('7b7b0001-7b7b-4a4b-8b7b-000000000001');
+  static final Guid _bleWifiCharacteristicUuid = Guid('7b7b0002-7b7b-4a4b-8b7b-000000000002');
+  static final Guid _bleStatusCharacteristicUuid = Guid('7b7b0003-7b7b-4a4b-8b7b-000000000003');
+  static const String _bleDeviceName = 'ESP32-HYDRODECK';
+
   int _currentIndex = 0;
 
   late String _esp32Ip;
@@ -1593,16 +1648,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   List<HistoricalData> _historyLogs = [];
   DateTime? _selectedFilterDate;
 
-  bool _pumpOn = false;
+  final Map<String, bool> _hardwareStates = {};
+  late TextEditingController _wifiSsidController;
+  late TextEditingController _wifiPasswordController;
+  bool _isBleConnecting = false;
+  String _bleStatus = 'Bluetooth not connected';
 
   double _minPhThreshold = 5.5;
-  double _maxPhThreshold = 6.8;
+  double _maxPhThreshold = 7.0;
 
   @override
   void initState() {
     super.initState();
     _esp32Ip = widget.initialIp;
     _ipController = TextEditingController(text: _esp32Ip);
+    _wifiSsidController = TextEditingController();
+    _wifiPasswordController = TextEditingController();
     _loadStoredLogsAndSettings();
     _subscribeToBackgroundUpdates();
   }
@@ -1612,17 +1673,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _telemetrySub?.cancel();
     _snapshotSub?.cancel();
     _ipController.dispose();
+    _wifiSsidController.dispose();
+    _wifiPasswordController.dispose();
     super.dispose();
   }
 
   Future<void> _loadStoredLogsAndSettings() async {
-    final storedLogs = await DatabaseHelper.instance.getLogs();
+    final activeBatchNumber = await DatabaseHelper.instance.getActiveBatchNumber();
+    final storedLogs = activeBatchNumber == null
+      ? <HistoricalData>[]
+      : await DatabaseHelper.instance.getLogsForBatch(activeBatchNumber);
     final config = await DatabaseHelper.instance.getSettingsConfig();
     if (mounted) {
       setState(() {
         _historyLogs = storedLogs;
         _minPhThreshold = config['minPh'] ?? 5.5;
-        _maxPhThreshold = config['maxPh'] ?? 6.8;
+        _maxPhThreshold = config['maxPh'] ?? 7.0;
         
         if (storedLogs.isNotEmpty) {
           _lastValidPhValue = storedLogs.first.pH;
@@ -1678,7 +1744,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   int _getElapsedPlantingDay(DateTime timestamp) {
     final startDay = DateTime(widget.startDate.year, widget.startDate.month, widget.startDate.day);
     final currentDay = DateTime(timestamp.year, timestamp.month, timestamp.day);
-    return currentDay.difference(startDay).inDays + 1;
+    return (currentDay.difference(startDay).inDays + 1).clamp(1, 999999);
   }
 
   String _getProcessedWaterStatus() {
@@ -1708,30 +1774,138 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     return "Pre-cycle Preparation";
   }
 
-  Future<void> _togglePump() async {
+  void _toggleHardwareControl(String control) {
     setState(() {
-      _pumpOn = !_pumpOn;
+      _hardwareStates[control] = !(_hardwareStates[control] ?? false);
+    });
+  }
+
+  Widget _buildHardwareButton(String key, String label, IconData icon) {
+    final isOn = _hardwareStates[key] ?? false;
+    return Row(
+      children: [
+        Expanded(
+          child: Row(
+            children: [
+              Icon(icon, size: 18, color: const Color(0xFF2DC867)),
+              const SizedBox(width: 8),
+              Expanded(child: Text(label, style: const TextStyle(fontWeight: FontWeight.w600))),
+            ],
+          ),
+        ),
+        SizedBox(
+          width: 82,
+          child: ElevatedButton(
+            onPressed: () => _toggleHardwareControl(key),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: isOn ? const Color(0xFF2DC867) : Colors.grey.shade500,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 11),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+            child: Text(isOn ? 'ON' : 'OFF'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _connectAndProvisionWifi() async {
+    final ssid = _wifiSsidController.text.trim();
+    final password = _wifiPasswordController.text;
+    if (ssid.isEmpty || password.isEmpty) {
+      setState(() => _bleStatus = 'Enter both Wi-Fi fields first');
+      return;
+    }
+
+    setState(() {
+      _isBleConnecting = true;
+      _bleStatus = 'Searching for $_bleDeviceName...';
     });
 
-    String cleanHost = _esp32Ip.trim().replaceAll(RegExp(r'^https?://'), '').replaceAll(RegExp(r'/.*$'), '');
-    if (cleanHost.isEmpty) cleanHost = "hydrodeck.local";
-
-    final Uri url = Uri.parse('http://$cleanHost/togglePump');
+    BluetoothDevice? device;
     try {
-      final response = await http.get(url, headers: {'Connection': 'close'}).timeout(const Duration(seconds: 2));
-      if (!mounted) return;
-      if (response.statusCode == 200) {
-        setState(() {});
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+        final permissions = await [
+          Permission.bluetoothScan,
+          Permission.bluetoothConnect,
+        ].request();
+        if (permissions.values.any((status) => !status.isGranted)) {
+          throw Exception('Bluetooth permissions are required');
+        }
       }
-    } catch (_) {}
+      final adapterState = await FlutterBluePlus.adapterState.first;
+      if (adapterState != BluetoothAdapterState.on) {
+        await FlutterBluePlus.turnOn();
+        setState(() => _bleStatus = 'Turn Bluetooth on, then tap Connect again');
+        return;
+      }
 
-    try {
-      final dbRef = FirebaseDatabase.instanceFor(
-        app: Firebase.app(),
-        databaseURL: "https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/",
-      ).ref('hydrodeck/commandPumpState');
-      await dbRef.set(_pumpOn);
-    } catch (_) {}
+      await FlutterBluePlus.stopScan();
+      await FlutterBluePlus.startScan(
+        withServices: [_bleServiceUuid],
+        timeout: const Duration(seconds: 10),
+      );
+      final results = await FlutterBluePlus.scanResults.firstWhere((scanResults) {
+        return scanResults.any((result) =>
+            result.device.platformName == _bleDeviceName ||
+            result.advertisementData.advName == _bleDeviceName);
+      }).timeout(const Duration(seconds: 12));
+      for (final result in results) {
+        if (result.device.platformName == _bleDeviceName || result.advertisementData.advName == _bleDeviceName) {
+          device = result.device;
+          break;
+        }
+      }
+      await FlutterBluePlus.stopScan();
+      if (device == null) throw Exception('ESP32-HYDRODECK was not found');
+
+      await device.connect(timeout: const Duration(seconds: 15), license: License.free);
+      final services = await device.discoverServices();
+      BluetoothCharacteristic? wifiCharacteristic;
+      BluetoothCharacteristic? statusCharacteristic;
+      for (final service in services) {
+        for (final characteristic in service.characteristics) {
+          if (characteristic.uuid == _bleWifiCharacteristicUuid) {
+            wifiCharacteristic = characteristic;
+          }
+          if (characteristic.uuid == _bleStatusCharacteristicUuid) {
+            statusCharacteristic = characteristic;
+          }
+        }
+      }
+      if (wifiCharacteristic == null || statusCharacteristic == null) {
+        throw Exception('Wi-Fi setup characteristics not found');
+      }
+
+      await statusCharacteristic.setNotifyValue(true);
+      final acknowledgement = statusCharacteristic.onValueReceived
+          .map((value) => utf8.decode(value, allowMalformed: true))
+          .firstWhere((value) => value == 'WIFI_CONNECTED' || value == 'WIFI_FAILED')
+          .timeout(const Duration(seconds: 35));
+      final payload = utf8.encode('$ssid\n$password');
+      try {
+        await wifiCharacteristic.write(payload, allowLongWrite: true);
+      } catch (error) {
+        if (!error.toString().contains('133')) rethrow;
+      }
+      final result = await acknowledgement;
+      if (result == 'WIFI_FAILED') {
+        throw Exception('ESP32 could not connect to the supplied Wi-Fi');
+      }
+      setState(() => _bleStatus = '$_bleDeviceName connected to Wi-Fi');
+    } catch (error) {
+      final message = error is TimeoutException
+          ? 'ESP32-HYDRODECK was not found. Keep it powered and try again.'
+          : 'Bluetooth setup failed: $error';
+      setState(() => _bleStatus = message);
+    } finally {
+      await FlutterBluePlus.stopScan();
+      if (device != null && device.isConnected) {
+        await device.disconnect();
+      }
+      if (mounted) setState(() => _isBleConnecting = false);
+    }
   }
 
   @override
@@ -1954,25 +2128,49 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text('Hardware Controls', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
-          const Spacer(),
-          Center(
-            child: Column(
+          const SizedBox(height: 20),
+          Expanded(
+            child: ListView(
               children: [
-                ElevatedButton.icon(
-                  onPressed: _togglePump,
-                  icon: Icon(_pumpOn ? Icons.water_drop : Icons.water_drop_outlined),
-                  label: Text("Peristaltic Pump (GPIO 23): ${_pumpOn ? 'ON' : 'OFF'}"),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _pumpOn ? const Color(0xFF2DC867) : Colors.redAccent,
-                    foregroundColor: Colors.white,
-                    minimumSize: const Size(280, 56),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                  ),
-                ),
+                _buildGrowBedControls('Grow Bed 1'),
+                const SizedBox(height: 20),
+                _buildGrowBedControls('Grow Bed 2'),
               ],
             ),
           ),
-          const Spacer(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGrowBedControls(String bed) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(bed, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(child: _buildHardwareButton('$bed Lights', 'Lights', Icons.lightbulb_outline)),
+            const SizedBox(width: 10),
+            Expanded(child: _buildHardwareButton('$bed Water Pump', 'Water Pump', Icons.water_drop_outlined)),
+          ]),
+          const Divider(height: 20, color: Color(0xFFE5E5E5)),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(child: _buildHardwareButton('$bed pH Up', 'pH Up', Icons.arrow_upward)),
+            const SizedBox(width: 10),
+            Expanded(child: _buildHardwareButton('$bed pH Down', 'pH Down', Icons.arrow_downward)),
+          ]),
+          const Divider(height: 20, color: Color(0xFFE5E5E5)),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(child: _buildHardwareButton('$bed Nutrient Solution', 'Nutrient Solution', Icons.science_outlined)),
+            const SizedBox(width: 10),
+            const Expanded(child: SizedBox()),
+          ]),
         ],
       ),
     );
@@ -2160,6 +2358,48 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           ),
           const SizedBox(height: 24),
 
+          const Text('Bluetooth Wi-Fi Setup', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.black87)),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+            child: Column(
+              children: [
+                TextField(
+                  controller: _wifiSsidController,
+                  decoration: const InputDecoration(labelText: 'Wi-Fi SSID', border: OutlineInputBorder()),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _wifiPasswordController,
+                  obscureText: true,
+                  decoration: const InputDecoration(labelText: 'Wi-Fi Password', border: OutlineInputBorder()),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: _isBleConnecting ? null : _connectAndProvisionWifi,
+                    icon: const Icon(Icons.bluetooth),
+                    label: Text(_isBleConnecting ? 'Connecting...' : 'Connect using Bluetooth'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF2DC867),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(_bleStatus, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+
           const Text('Target Limit Parameters', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.black87)),
           const SizedBox(height: 8),
           
@@ -2304,6 +2544,74 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   }
 }
 
+class BatchHistoryScreen extends StatefulWidget {
+  final PlantingRecord record;
+
+  const BatchHistoryScreen({super.key, required this.record});
+
+  @override
+  State<BatchHistoryScreen> createState() => _BatchHistoryScreenState();
+}
+
+class _BatchHistoryScreenState extends State<BatchHistoryScreen> {
+  late Future<List<HistoricalData>> _logsFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _logsFuture = DatabaseHelper.instance.getLogsForBatch(widget.record.batchNumber);
+  }
+
+  String _formatDateTime(DateTime value) {
+    final hour = value.hour % 12 == 0 ? 12 : value.hour % 12;
+    final period = value.hour >= 12 ? 'PM' : 'AM';
+    return '${value.year}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')} $hour:${value.minute.toString().padLeft(2, '0')} $period';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('Batch #${widget.record.batchNumber} System Logs')),
+      body: FutureBuilder<List<HistoricalData>>(
+        future: _logsFuture,
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator(color: Color(0xFF2DC867)));
+          }
+          final logs = snapshot.data!;
+          if (logs.isEmpty) {
+            return const Center(child: Text('No system logs recorded for this batch.'));
+          }
+          return ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: logs.length,
+            itemBuilder: (context, index) {
+              final log = logs[index];
+              return Card(
+                child: ListTile(
+                  title: Text(_formatDateTime(log.timestamp)),
+                  subtitle: Text('pH ${log.pH.toStringAsFixed(2)}  |  ${log.temperature}  |  ${log.waterLevel}  |  TDS ${log.tds.toStringAsFixed(1)}'),
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => SnapshotDetailScreen(
+                        data: log,
+                        formattedTime: _formatDateTime(log.timestamp),
+                        minPh: 5.5,
+                        maxPh: 7.0,
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
 class SnapshotDetailScreen extends StatelessWidget {
   final HistoricalData data;
   final String formattedTime;
@@ -2315,7 +2623,7 @@ class SnapshotDetailScreen extends StatelessWidget {
     required this.data, 
     required this.formattedTime,
     this.minPh = 5.5,
-    this.maxPh = 6.8,
+    this.maxPh = 7.0,
   });
 
   @override

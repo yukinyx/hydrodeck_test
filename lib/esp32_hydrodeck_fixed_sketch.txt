@@ -10,11 +10,13 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ESPmDNS.h>
+#include <Preferences.h>
+#include <NimBLEDevice.h>
 
 // Install "FirebaseClient" by Mobizt in Arduino IDE.
 // Do not use a conflicting Firebase-ESP-Client FirebaseClient.h.
-const char* ssid = "TEST";
-const char* password = "12345678";
+char ssid[65] = "TEST";
+char password[65] = "12345678";
 
 #define API_KEY "AIzaSyBBz_dOxKgGkz84VTnmAWXP556dMqJWGLo"
 #define USER_EMAIL "patricianicole.santos01@gmail.com"
@@ -27,42 +29,99 @@ AsyncClient aClient(ssl_client);
 UserAuth user_auth(API_KEY, USER_EMAIL, USER_PASSWORD);
 FirebaseApp app;
 RealtimeDatabase Database;
-AsyncResult result;
 
-const int pumpRelayPin = 23;
 const int WATER_SENSOR_PIN = 21;
 #define DS18B20PIN 4
 const int pH_Pin = 34;
 const int TdsSensorPin = 35;
 #define SCOUNT 30
 #define VREF 3.3
-const int adc_resolution = 4095;
 const float v_ref = 3.3;
 const float tdsCalibrationFactor = 1.0;
-float calibration_value = 21.34;
 float slope = 0.18;
 
 WebServer server(80);
+Preferences wifiPreferences;
+NimBLECharacteristic* wifiCharacteristic = nullptr;
+NimBLECharacteristic* statusCharacteristic = nullptr;
+bool restartAfterProvisioning = false;
+unsigned long restartAt = 0;
+bool provisioningPending = false;
+unsigned long provisioningStartedAt = 0;
+const unsigned long provisioningTimeout = 30000;
+char previousSsid[65] = "";
+char previousPassword[65] = "";
+bool firebaseInitialized = false;
+unsigned long lastWifiRetry = 0;
+const unsigned long wifiRetryInterval = 10000;
+
+static const char* BLE_DEVICE_NAME = "ESP32-HYDRODECK";
+static const char* BLE_SERVICE_UUID = "7b7b0001-7b7b-4a4b-8b7b-000000000001";
+static const char* BLE_WIFI_CHARACTERISTIC_UUID = "7b7b0002-7b7b-4a4b-8b7b-000000000002";
+static const char* BLE_STATUS_CHARACTERISTIC_UUID = "7b7b0003-7b7b-4a4b-8b7b-000000000003";
+
+class WifiProvisioningCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& connInfo) override {
+    String payload = characteristic->getValue().c_str();
+    int separator = payload.indexOf('\n');
+    if (separator <= 0) return;
+
+    String newSsid = payload.substring(0, separator);
+    String newPassword = payload.substring(separator + 1);
+    newSsid.trim();
+    newPassword.trim();
+    if (newSsid.length() == 0 || newSsid.length() >= sizeof(ssid) || newPassword.length() >= sizeof(password)) return;
+
+    strncpy(previousSsid, ssid, sizeof(previousSsid));
+    strncpy(previousPassword, password, sizeof(previousPassword));
+    newSsid.toCharArray(ssid, sizeof(ssid));
+    newPassword.toCharArray(password, sizeof(password));
+    provisioningPending = true;
+    provisioningStartedAt = 0;
+  }
+};
+
+class BleServerCallbacks : public NimBLEServerCallbacks {
+  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
+    delay(100);
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+void setupBleProvisioning() {
+  NimBLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEServer* bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(new BleServerCallbacks());
+  NimBLEService* bleService = bleServer->createService(BLE_SERVICE_UUID);
+  wifiCharacteristic = bleService->createCharacteristic(
+    BLE_WIFI_CHARACTERISTIC_UUID,
+    NIMBLE_PROPERTY::WRITE
+  );
+  statusCharacteristic = bleService->createCharacteristic(
+    BLE_STATUS_CHARACTERISTIC_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+  statusCharacteristic->setValue("READY");
+  wifiCharacteristic->setCallbacks(new WifiProvisioningCallbacks());
+  bleService->start();
+  NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  NimBLEDevice::startAdvertising();
+}
 OneWire oneWire(DS18B20PIN);
 DallasTemperature sensors(&oneWire);
 int analogBuffer[SCOUNT];
 int analogBufferTemp[SCOUNT];
 int analogBufferIndex = 0;
-bool pumpState = false;
 float currentTemperature = 0.0;
 float currentPhValue = 7.0;
 float currentTdsValue = 0.0;
-unsigned long lastSensorCheck = 0;
 unsigned long lastTempCheck = 0;
 unsigned long lastPhCheck = 0;
 unsigned long lastFirebasePush = 0;
-unsigned long lastFirebaseCommandCheck = 0;
 const unsigned long firebaseInterval = 5000;
-const unsigned long firebaseCommandInterval = 1000;
-const unsigned long sensorInterval = 200;
 const unsigned long tempInterval = 1000;
 const unsigned long phInterval = 1000;
-int lastSensorState = LOW;
 
 int getMedianNum(int values[], int length) {
   int bTab[length];
@@ -94,7 +153,7 @@ float readPhSensor() {
     measurings += analogRead(pH_Pin);
     delay(10);
   }
-  float voltage = (v_ref / adc_resolution) * (float)measurings / (float)samples;
+  float voltage = (v_ref / 4095.0f) * (float)measurings / (float)samples;
   float ph = 7.0 + ((2.5 - voltage) / slope);
   if (ph < 0.0) ph = 0.0;
   if (ph > 14.0) ph = 14.0;
@@ -105,37 +164,54 @@ void handleRootIdent() {
   server.send(200, "text/plain", "HYDRO_ESP32_ACTIVE");
 }
 
-void handleTogglePump() {
-  pumpState = !pumpState;
-  digitalWrite(pumpRelayPin, pumpState ? HIGH : LOW);
-  Database.set<bool>(aClient, "/hydrodeck/pumpState", pumpState);
-  server.send(200, "text/plain", pumpState ? "Pump is now ON" : "Pump is now OFF");
-}
-
 void handleCombinedStatus() {
   String json = "{\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN) == HIGH ? "full" : "low") +
                 "\",\"temp\":" + String(currentTemperature, 1) +
                 ",\"ph\":" + String(currentPhValue, 2) +
-                ",\"tds\":" + String(currentTdsValue, 0) +
-                ",\"pumpState\":" + String(pumpState ? "true" : "false") + "}";
+                ",\"tds\":" + String(currentTdsValue, 0) + "}";
   server.send(200, "application/json", json);
 }
 
-void checkRemotePumpCommand() {
-  if (!app.ready()) return;
-  bool requestedState = Database.get<bool>(aClient, "/hydrodeck/commandPumpState");
-  if (aClient.lastError().code() != 0) return;
-  if (requestedState != pumpState) {
-    pumpState = requestedState;
-    digitalWrite(pumpRelayPin, pumpState ? HIGH : LOW);
-    Database.set<bool>(aClient, "/hydrodeck/pumpState", pumpState);
+void processFirebaseResult(AsyncResult& firebaseResult) {
+  if (!firebaseResult.isResult()) return;
+  if (firebaseResult.isError()) {
+    Serial.print("Firebase error [");
+    Serial.print(firebaseResult.uid());
+    Serial.print("] code: ");
+    Serial.print(firebaseResult.error().code());
+    Serial.print(" message: ");
+    Serial.println(firebaseResult.error().message());
   }
+  if (firebaseResult.isEvent()) {
+    Serial.print("Firebase event: ");
+    Serial.println(firebaseResult.eventLog().message());
+  }
+  if (firebaseResult.isDebug()) {
+    Serial.print("Firebase debug: ");
+    Serial.println(firebaseResult.debug());
+  }
+}
+
+void initializeFirebase() {
+  if (firebaseInitialized || WiFi.status() != WL_CONNECTED) return;
+  ssl_client.setInsecure();
+  ssl_client.setConnectionTimeout(1000);
+  ssl_client.setHandshakeTimeout(5);
+  initializeApp(aClient, app, getAuth(user_auth), processFirebaseResult, "authTask");
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(DATABASE_URL);
+  firebaseInitialized = true;
+  Serial.println("Firebase authentication starting...");
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(pumpRelayPin, OUTPUT);
-  digitalWrite(pumpRelayPin, LOW);
+  wifiPreferences.begin("wifi", false);
+  String savedSsid = wifiPreferences.getString("ssid", ssid);
+  String savedPassword = wifiPreferences.getString("password", password);
+  savedSsid.toCharArray(ssid, sizeof(ssid));
+  savedPassword.toCharArray(password, sizeof(password));
+  setupBleProvisioning();
   pinMode(WATER_SENSOR_PIN, INPUT_PULLUP);
   pinMode(pH_Pin, INPUT);
   pinMode(TdsSensorPin, INPUT);
@@ -153,21 +229,21 @@ void setup() {
 
   WiFi.begin(ssid, password);
   Serial.print("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
     delay(500);
     Serial.print('.');
   }
-  Serial.print("\nESP32 IP: ");
-  Serial.println(WiFi.localIP());
-  if (MDNS.begin("hydrodeck")) Serial.println("mDNS: hydrodeck.local");
-
-  ssl_client.setInsecure();
-  app.getApp<RealtimeDatabase>(Database);
-  Database.url(DATABASE_URL);
-  initializeApp(aClient, app, getAuth(user_auth), result);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("\nESP32 IP: ");
+    Serial.println(WiFi.localIP());
+    if (MDNS.begin("hydrodeck")) Serial.println("mDNS: hydrodeck.local");
+    initializeFirebase();
+  } else {
+    Serial.println("\nWi-Fi connection failed. BLE provisioning remains available.");
+  }
 
   server.on("/", HTTP_GET, handleRootIdent);
-  server.on("/togglePump", HTTP_GET, handleTogglePump);
   server.on("/status", HTTP_GET, handleCombinedStatus);
   server.begin();
 }
@@ -177,9 +253,48 @@ void loop() {
   server.handleClient();
   unsigned long now = millis();
 
-  if (now - lastFirebaseCommandCheck >= firebaseCommandInterval) {
-    lastFirebaseCommandCheck = now;
-    checkRemotePumpCommand();
+  if (WiFi.status() != WL_CONNECTED && !provisioningPending && now - lastWifiRetry >= wifiRetryInterval) {
+    lastWifiRetry = now;
+    if (firebaseInitialized) {
+      firebaseInitialized = false;
+      Serial.println("Wi-Fi lost; Firebase will re-authenticate after reconnect.");
+    }
+    Serial.println("Retrying Wi-Fi connection...");
+    WiFi.disconnect(false, false);
+    WiFi.begin(ssid, password);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    initializeFirebase();
+  }
+
+  if (provisioningPending) {
+    if (provisioningStartedAt == 0) {
+      WiFi.disconnect(false, false);
+      WiFi.begin(ssid, password);
+      provisioningStartedAt = now;
+    } else if (WiFi.status() == WL_CONNECTED) {
+      wifiPreferences.putString("ssid", ssid);
+      wifiPreferences.putString("password", password);
+      statusCharacteristic->setValue("WIFI_CONNECTED");
+      statusCharacteristic->notify();
+      provisioningPending = false;
+      restartAfterProvisioning = true;
+      restartAt = now + 1500;
+      Serial.println("Wi-Fi provisioning successful.");
+    } else if (now - provisioningStartedAt >= provisioningTimeout) {
+      strncpy(ssid, previousSsid, sizeof(ssid));
+      strncpy(password, previousPassword, sizeof(password));
+      WiFi.disconnect(false, false);
+      WiFi.begin(ssid, password);
+      statusCharacteristic->setValue("WIFI_FAILED");
+      statusCharacteristic->notify();
+      provisioningPending = false;
+      Serial.println("Wi-Fi provisioning failed.");
+    }
+  }
+
+  if (restartAfterProvisioning && now >= restartAt) {
+    ESP.restart();
   }
 
   static unsigned long sampleTime = 0;
@@ -218,25 +333,33 @@ void loop() {
     sensors.requestTemperatures();
   }
 
-  if (now - lastSensorCheck >= sensorInterval) {
-    lastSensorCheck = now;
-    lastSensorState = digitalRead(WATER_SENSOR_PIN);
-  }
-
-  if (app.ready() && now - lastFirebasePush >= firebaseInterval) {
+  if (firebaseInitialized && app.ready() && now - lastFirebasePush >= firebaseInterval) {
     lastFirebasePush = now;
     Database.set<float>(aClient, "/hydrodeck/temp", currentTemperature);
     Database.set<float>(aClient, "/hydrodeck/ph", currentPhValue);
     Database.set<float>(aClient, "/hydrodeck/tds", currentTdsValue);
     Database.set<String>(aClient, "/hydrodeck/water",
       digitalRead(WATER_SENSOR_PIN) == HIGH ? "full" : "low");
-    Database.set<bool>(aClient, "/hydrodeck/pumpState", pumpState);
+    if (aClient.lastError().code() != 0) {
+      Serial.print("Firebase update failed, code: ");
+      Serial.println(aClient.lastError().code());
+    } else {
+      Serial.println("Firebase update sent");
+    }
   }
 }
 
 /*
 Arduino IDE setup:
 - Install Mobizt's FirebaseClient library.
+- Install/select the Espressif ESP32 board package. Preferences is included with it.
+- Install the NimBLE-Arduino library by h2int. The sketch uses NimBLE to reduce RAM usage.
+- Install OneWire and DallasTemperature libraries.
+- In Arduino IDE choose Tools > Partition Scheme > Huge APP (3MB No OTA/1MB SPIFFS).
+- The default 1.31 MB app partition cannot hold Firebase HTTPS/authentication and BLE together.
+- The app sends Wi-Fi credentials over BLE as SSID, a newline, then password.
+- The ESP32 sends WIFI_CONNECTED or WIFI_FAILED over the status characteristic.
+- The ESP32 advertises as ESP32-HYDRODECK. Keep it powered while provisioning.
 - Remove a conflicting library that also installs FirebaseClient.h.
 - Select an ESP32 board.
 - Ensure Firebase Realtime Database rules allow the Firebase account above.
