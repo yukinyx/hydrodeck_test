@@ -350,6 +350,167 @@ class NotificationHelper {
   }
 }
 
+class GrowBedReading {
+  final double temperature;
+  final double ph;
+  final double tds;
+  final bool waterFull;
+
+  const GrowBedReading({
+    required this.temperature,
+    required this.ph,
+    required this.tds,
+    required this.waterFull,
+  });
+
+  factory GrowBedReading.empty() => const GrowBedReading(
+        temperature: 25.0,
+        ph: 7.0,
+        tds: 0.0,
+        waterFull: false,
+      );
+
+  factory GrowBedReading.fromMap(Map<String, dynamic> map) {
+    final temperature = (map['temp'] is num)
+        ? (map['temp'] as num).toDouble()
+        : double.tryParse((map['temp'] ?? '25.0').toString()) ?? 25.0;
+    final ph = (map['ph'] is num)
+        ? (map['ph'] as num).toDouble()
+        : double.tryParse((map['ph'] ?? '7.0').toString()) ?? 7.0;
+    final tds = (map['tds'] is num)
+        ? (map['tds'] as num).toDouble()
+        : double.tryParse((map['tds'] ?? '0').toString()) ?? 0.0;
+    final waterValue = map['water'];
+    final waterFull = switch (waterValue) {
+      bool b => b,
+      int i => i != 0,
+      String s => s.toLowerCase() == 'full' || s == '1' || s == 'on',
+      _ => false,
+    };
+
+    return GrowBedReading(
+      temperature: temperature,
+      ph: ph,
+      tds: tds,
+      waterFull: waterFull,
+    );
+  }
+
+  Map<String, dynamic> toMap() => {
+        'temp': temperature,
+        'ph': ph,
+        'tds': tds,
+        'water': waterFull ? 'full' : 'low',
+      };
+}
+
+class HydrodeckTelemetry {
+  final GrowBedReading bed1;
+  final GrowBedReading bed2;
+  final bool growLightOn;
+
+  const HydrodeckTelemetry({
+    required this.bed1,
+    required this.bed2,
+    required this.growLightOn,
+  });
+
+  static double _readDouble(Map<String, dynamic> json, String key, {double fallback = 0.0}) {
+    final value = json[key];
+    if (value is num) return value.toDouble();
+    if (value is String) return double.tryParse(value) ?? fallback;
+    return fallback;
+  }
+
+  static bool _readWaterFlag(Map<String, dynamic> json, String key) {
+    final value = json[key];
+    if (value is bool) return value;
+    if (value is num) return value != 0;
+    if (value is String) return value.toLowerCase() == 'full' || value == '1' || value.toLowerCase() == 'on';
+    return false;
+  }
+
+  static bool _readBoolLike(Map<String, dynamic> map, List<String> keys, {bool fallback = false}) {
+    for (final key in keys) {
+      final value = map[key];
+      if (value is bool) return value;
+      if (value is num) return value != 0;
+      if (value is String) {
+        final normalized = value.toLowerCase();
+        if (normalized == 'true' || normalized == 'on' || normalized == '1') return true;
+        if (normalized == 'false' || normalized == 'off' || normalized == '0') return false;
+      }
+    }
+    return fallback;
+  }
+
+  factory HydrodeckTelemetry.fromJson(Map<String, dynamic> json) {
+    final wireMap = Map<String, dynamic>.from(json);
+
+    final bed1Map = {
+      'temp': wireMap['temp1'] ?? wireMap['bed1']?['temp'] ?? wireMap['set1']?['temp'] ?? 25.0,
+      'ph': wireMap['ph1'] ?? wireMap['bed1']?['ph'] ?? wireMap['set1']?['ph'] ?? 7.0,
+      'tds': wireMap['tds1'] ?? wireMap['bed1']?['tds'] ?? wireMap['set1']?['tds'] ?? 0.0,
+      'water': wireMap['water1'] ?? wireMap['bed1']?['water'] ?? wireMap['set1']?['water'] ?? 'low',
+    };
+
+    final bed2Map = {
+      'temp': wireMap['temp2'] ?? wireMap['bed2']?['temp'] ?? wireMap['set2']?['temp'] ?? 25.0,
+      'ph': wireMap['ph2'] ?? wireMap['bed2']?['ph'] ?? wireMap['set2']?['ph'] ?? 7.0,
+      'tds': wireMap['tds2'] ?? wireMap['bed2']?['tds'] ?? wireMap['set2']?['tds'] ?? 0.0,
+      'water': wireMap['water2'] ?? wireMap['bed2']?['water'] ?? wireMap['set2']?['water'] ?? 'low',
+    };
+
+    final bed1 = GrowBedReading(
+      temperature: _readDouble(bed1Map, 'temp', fallback: 25.0),
+      ph: _readDouble(bed1Map, 'ph', fallback: 7.0),
+      tds: _readDouble(bed1Map, 'tds', fallback: 0.0),
+      waterFull: _readWaterFlag(bed1Map, 'water'),
+    );
+
+    final bed2 = GrowBedReading(
+      temperature: _readDouble(bed2Map, 'temp', fallback: 25.0),
+      ph: _readDouble(bed2Map, 'ph', fallback: 7.0),
+      tds: _readDouble(bed2Map, 'tds', fallback: 0.0),
+      waterFull: _readWaterFlag(bed2Map, 'water'),
+    );
+
+    final actuatorMap = Map<String, dynamic>.from(wireMap['actuators'] is Map ? wireMap['actuators'] : {});
+    final allMap = <String, dynamic>{
+      ...Map<String, dynamic>.from(wireMap),
+      ...Map<String, dynamic>.from(actuatorMap),
+    };
+
+    final growLightOn = _readBoolLike(
+      allMap,
+      const [
+        'growLight', 'grow_light', 'growLightBoth', 'growLight1', 'growLight2',
+        'growLight1_2', 'growLightAll', 'grow_light_all',
+      ],
+      fallback: false,
+    );
+
+    final waterPump1State = _readBoolLike(allMap, const ['waterPump1']);
+    final waterPump2State = _readBoolLike(allMap, const ['waterPump2']);
+    final phUp1State = _readBoolLike(allMap, const ['phUp1']);
+    final phDown1State = _readBoolLike(allMap, const ['phDown1']);
+    final nutrient1State = _readBoolLike(allMap, const ['nutrient1']);
+    final phUp2State = _readBoolLike(allMap, const ['phUp2']);
+    final phDown2State = _readBoolLike(allMap, const ['phDown2']);
+    final nutrient2State = _readBoolLike(allMap, const ['nutrient2']);
+
+    if (waterPump1State || waterPump2State || phUp1State || phDown1State || nutrient1State || phUp2State || phDown2State || nutrient2State) {
+      // no-op: these values are parsed for future UI use; the main display runs from the bed sensor payload.
+    }
+
+    return HydrodeckTelemetry(
+      bed1: bed1,
+      bed2: bed2,
+      growLightOn: growLightOn,
+    );
+  }
+}
+
 // --- BACKGROUND SERVICE MANAGEMENT ---
 Future<void> initializeBackgroundService() async {
   if (kIsWeb) return;
@@ -485,30 +646,52 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       ).timeout(timeout);
 
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        return {'host': host, 'data': data};
+        final decoded = jsonDecode(res.body);
+        if (decoded is Map<String, dynamic>) {
+          return {'host': host, 'data': decoded};
+        }
+        if (decoded is Map) {
+          return {'host': host, 'data': Map<String, dynamic>.from(decoded)};
+        }
       }
     } catch (_) {}
     return null;
   }
 
+  Map<String, dynamic> normalizeStatusPayload(Map<String, dynamic> data) {
+    final bed1 = {
+      'temp': data['temp1'] ?? data['bed1']?['temp'] ?? 25.0,
+      'ph': data['ph1'] ?? data['bed1']?['ph'] ?? 7.0,
+      'tds': data['tds1'] ?? data['bed1']?['tds'] ?? 0.0,
+      'water': data['water1'] ?? data['bed1']?['water'] ?? 'low',
+    };
+    final bed2 = {
+      'temp': data['temp2'] ?? data['bed2']?['temp'] ?? 25.0,
+      'ph': data['ph2'] ?? data['bed2']?['ph'] ?? 7.0,
+      'tds': data['tds2'] ?? data['bed2']?['tds'] ?? 0.0,
+      'water': data['water2'] ?? data['bed2']?['water'] ?? 'low',
+    };
+
+    final bed2Ph = bed2['ph'] is num ? (bed2['ph'] as num).toDouble() : 7.0;
+    final bed2Temp = bed2['temp'] is num ? (bed2['temp'] as num).toDouble() : 25.0;
+    final bed2Tds = bed2['tds'] is num ? (bed2['tds'] as num).toDouble() : 0.0;
+    final bed2Water = bed2['water'] is String ? bed2['water'] as String : 'low';
+    final growLightFlag = data['grow_light'] ?? data['growLight'] ?? false;
+
+    return {
+      'bed1': bed1,
+      'bed2': bed2,
+      'growLight': growLightFlag,
+      'ph': bed2Ph,
+      'temp': '${bed2Temp.toStringAsFixed(1)}°C',
+      'water': bed2Water,
+      'tds': bed2Tds,
+    };
+  }
+
   Timer.periodic(const Duration(seconds: 3), (timer) async {
     if (isPolling) return; // Skip if previous poll hasn't resolved
     isPolling = true;
-
-    // Only connect and poll ESP32 if planting has been started
-    if (!isPlantingActive) {
-      service.invoke('telemetryUpdate', {
-        'isConnected': false,
-        'ip': targetIp,
-        'ph': lastPh,
-        'temp': lastTemp,
-        'water': lastWater,
-        'tds': lastTds,
-      });
-      isPolling = false;
-      return;
-    }
 
     bool found = false;
     String cleanTargetIp = sanitizeHost(targetIp);
@@ -517,18 +700,33 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     final primaryResult = await fetchStatus(cleanTargetIp, const Duration(milliseconds: 1200));
 
     if (primaryResult != null) {
-      final data = primaryResult['data'];
-      if (data['ph'] != null) {
-        lastPh = (data['ph'] is num) ? (data['ph'] as num).toDouble() : lastPh;
+      final normalized = normalizeStatusPayload(Map<String, dynamic>.from(primaryResult['data'] as Map));
+      final bed1 = normalized['bed1'] as Map<String, dynamic>;
+      final bed2 = normalized['bed2'] as Map<String, dynamic>;
+
+      if (bed2['ph'] != null) {
+        lastPh = (bed2['ph'] is num) ? (bed2['ph'] as num).toDouble() : lastPh;
       }
-      if (data['temp'] != null && data['temp'] != 0.0) {
-        lastTemp = "${data['temp']}°C";
+      if (bed2['temp'] != null && bed2['temp'] != 0.0) {
+        lastTemp = "${(bed2['temp'] is num ? (bed2['temp'] as num).toDouble() : double.tryParse(bed2['temp'].toString()) ?? 25.0).toStringAsFixed(1)}°C";
       }
-      if (data['tds'] != null) {
-        lastTds = (data['tds'] is num) ? (data['tds'] as num).toDouble() : lastTds;
+      if (bed2['tds'] != null) {
+        lastTds = (bed2['tds'] is num) ? (bed2['tds'] as num).toDouble() : lastTds;
       }
-      lastWater = data['water'] ?? lastWater;
-      
+      lastWater = (bed2['water'] ?? lastWater).toString();
+
+      service.invoke('telemetryUpdate', {
+        'isConnected': true,
+        'ip': cleanTargetIp,
+        'ph': lastPh,
+        'temp': lastTemp,
+        'water': lastWater,
+        'tds': lastTds,
+        'bed1': bed1,
+        'bed2': bed2,
+        'growLight': normalized['growLight'] ?? false,
+      });
+
       targetIp = cleanTargetIp;
       isConnected = true;
       found = true;
@@ -550,19 +748,33 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       for (final res in results) {
         if (res != null) {
           final host = res['host'] as String;
-          final data = res['data'];
+          final normalized = normalizeStatusPayload(Map<String, dynamic>.from(res['data'] as Map));
+          final bed1 = normalized['bed1'] as Map<String, dynamic>;
+          final bed2 = normalized['bed2'] as Map<String, dynamic>;
 
-          if (data['ph'] != null) {
-            lastPh = (data['ph'] is num) ? (data['ph'] as num).toDouble() : lastPh;
+          if (bed2['ph'] != null) {
+            lastPh = (bed2['ph'] is num) ? (bed2['ph'] as num).toDouble() : lastPh;
           }
-          if (data['temp'] != null && data['temp'] != 0.0) {
-            lastTemp = "${data['temp']}°C";
+          if (bed2['temp'] != null && bed2['temp'] != 0.0) {
+            lastTemp = "${(bed2['temp'] is num ? (bed2['temp'] as num).toDouble() : double.tryParse(bed2['temp'].toString()) ?? 25.0).toStringAsFixed(1)}°C";
           }
-          if (data['tds'] != null) {
-            lastTds = (data['tds'] is num) ? (data['tds'] as num).toDouble() : lastTds;
+          if (bed2['tds'] != null) {
+            lastTds = (bed2['tds'] is num) ? (bed2['tds'] as num).toDouble() : lastTds;
           }
-          lastWater = data['water'] ?? lastWater;
-          
+          lastWater = (bed2['water'] ?? lastWater).toString();
+
+          service.invoke('telemetryUpdate', {
+            'isConnected': true,
+            'ip': host,
+            'ph': lastPh,
+            'temp': lastTemp,
+            'water': lastWater,
+            'tds': lastTds,
+            'bed1': bed1,
+            'bed2': bed2,
+            'growLight': normalized['growLight'] ?? false,
+          });
+
           targetIp = host;
           DatabaseHelper.instance.saveActiveIp(targetIp);
           isConnected = true;
@@ -636,6 +848,19 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       'temp': lastTemp,
       'water': lastWater,
       'tds': lastTds,
+      'bed1': {
+        'temp': 25.0,
+        'ph': lastPh,
+        'tds': lastTds,
+        'water': lastWater,
+      },
+      'bed2': {
+        'temp': double.tryParse(lastTemp.replaceAll('°C', '')) ?? 25.0,
+        'ph': lastPh,
+        'tds': lastTds,
+        'water': lastWater,
+      },
+      'growLight': false,
     });
 
     isPolling = false;
@@ -1636,19 +1861,31 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   late TextEditingController _ipController;
   
   String _connectionStatus = "Fetching...";
-  
+
+  GrowBedReading _bed1 = GrowBedReading.empty();
+  GrowBedReading _bed2 = GrowBedReading.empty();
+  bool _growLightOn = false;
+  bool _isGrowLightToggling = false;
+  final Map<String, bool> _controlStates = {
+    'bed1_water': false,
+    'bed1_ph_up': false,
+    'bed1_ph_down': false,
+    'bed1_nutrient': false,
+    'bed2_water': false,
+    'bed2_ph_up': false,
+    'bed2_ph_down': false,
+    'bed2_nutrient': false,
+  };
+
   String _lastValidWaterStatus = "low";
-  String _lastValidWaterTemp = "25.0°C";
-  double _lastValidPhValue = 7.00; 
-  double _lastValidTdsValue = 0.0;
 
   StreamSubscription? _telemetrySub;
   StreamSubscription? _snapshotSub;
+  StreamSubscription? _firebaseSub;
 
   List<HistoricalData> _historyLogs = [];
   DateTime? _selectedFilterDate;
 
-  final Map<String, bool> _hardwareStates = {};
   late TextEditingController _wifiSsidController;
   late TextEditingController _wifiPasswordController;
   bool _isBleConnecting = false;
@@ -1665,6 +1902,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _wifiSsidController = TextEditingController();
     _wifiPasswordController = TextEditingController();
     _loadStoredLogsAndSettings();
+    _subscribeToFirebase();
     _subscribeToBackgroundUpdates();
   }
 
@@ -1672,10 +1910,40 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   void dispose() {
     _telemetrySub?.cancel();
     _snapshotSub?.cancel();
+    _firebaseSub?.cancel();
     _ipController.dispose();
     _wifiSsidController.dispose();
     _wifiPasswordController.dispose();
     super.dispose();
+  }
+
+  void _subscribeToFirebase() {
+    if (kIsWeb) return;
+
+    try {
+      final ref = FirebaseDatabase.instance.ref('hydrodeck');
+      _firebaseSub = ref.onValue.listen((event) {
+        final value = event.snapshot.value;
+        if (value is! Map) return;
+
+        final payload = Map<String, dynamic>.from(value);
+        final telemetry = HydrodeckTelemetry.fromJson(payload);
+
+        if (!mounted) return;
+        setState(() {
+          _bed1 = telemetry.bed1;
+          _bed2 = telemetry.bed2;
+          _growLightOn = telemetry.growLightOn;
+          _connectionStatus = 'Connected';
+          if (payload['ip'] != null) {
+            _esp32Ip = payload['ip'].toString();
+            _ipController.text = _esp32Ip;
+          }
+        });
+      });
+    } catch (_) {
+      // Firebase is unavailable; telemetry will fall back to manual polling.
+    }
   }
 
   Future<void> _loadStoredLogsAndSettings() async {
@@ -1691,54 +1959,67 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         _maxPhThreshold = config['maxPh'] ?? 7.0;
         
         if (storedLogs.isNotEmpty) {
-          _lastValidPhValue = storedLogs.first.pH;
-          _lastValidWaterTemp = storedLogs.first.temperature;
           _lastValidWaterStatus = storedLogs.first.waterLevel == "Water full" ? "full" : "low";
-          _lastValidTdsValue = storedLogs.first.tds;
+          _bed2 = GrowBedReading(
+            temperature: double.tryParse(storedLogs.first.temperature.replaceAll(RegExp(r'[^0-9.\-]'), '')) ?? 25.0,
+            ph: storedLogs.first.pH,
+            tds: storedLogs.first.tds,
+            waterFull: _lastValidWaterStatus == 'full',
+          );
         }
       });
     }
   }
 
   void _subscribeToBackgroundUpdates() {
-    if (kIsWeb) return;
-    _telemetrySub = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
-      if (event != null && mounted) {
-        setState(() {
-          _connectionStatus = (event['isConnected'] == true) ? "Connected" : "Disconnected";
-          if (event['ph'] != null) {
-            _lastValidPhValue = (event['ph'] as num).toDouble();
-          }
-          if (event['temp'] != null) {
-            _lastValidWaterTemp = event['temp'];
-          }
-          if (event['water'] != null) {
-            _lastValidWaterStatus = event['water'];
-          }
-          if (event['tds'] != null) {
-            _lastValidTdsValue = (event['tds'] as num).toDouble();
-          }
-          if (event['ip'] != null) {
-            _esp32Ip = event['ip'];
-          }
-        });
-      }
-    });
+    if (kIsWeb || !_supportsBackgroundService) return;
 
-    _snapshotSub = FlutterBackgroundService().on('newSnapshotLogged').listen((event) {
-      if (event != null && mounted) {
-        final newLog = HistoricalData(
-          timestamp: DateTime.parse(event['timestamp']),
-          pH: (event['pH'] as num).toDouble(),
-          temperature: event['temperature'],
-          waterLevel: event['waterLevel'],
-          tds: (event['tds'] as num?)?.toDouble() ?? 0.0,
-        );
-        setState(() {
-          _historyLogs.insert(0, newLog);
-        });
-      }
-    });
+    try {
+      _telemetrySub = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
+        if (event != null && mounted) {
+          setState(() {
+            _connectionStatus = (event['isConnected'] == true) ? "Connected" : "Disconnected";
+            if (event['bed1'] != null) {
+              _bed1 = GrowBedReading.fromMap(Map<String, dynamic>.from(event['bed1'] as Map));
+            }
+            if (event['bed2'] != null) {
+              _bed2 = GrowBedReading.fromMap(Map<String, dynamic>.from(event['bed2'] as Map));
+            }
+            if (event['growLight'] != null) {
+              _growLightOn = event['growLight'] is bool
+                  ? event['growLight'] as bool
+                  : (event['growLight'].toString() == '1' || event['growLight'].toString().toLowerCase() == 'true');
+            }
+            if (event['water'] != null) {
+              _lastValidWaterStatus = event['water'];
+            }
+            if (event['ip'] != null) {
+              _esp32Ip = event['ip'];
+            }
+            _lastValidWaterStatus = _bed2.waterFull ? 'full' : 'low';
+          });
+        }
+      });
+
+      _snapshotSub = FlutterBackgroundService().on('newSnapshotLogged').listen((event) {
+        if (event != null && mounted) {
+          final newLog = HistoricalData(
+            timestamp: DateTime.parse(event['timestamp']),
+            pH: (event['pH'] as num).toDouble(),
+            temperature: event['temperature'],
+            waterLevel: event['waterLevel'],
+            tds: (event['tds'] as num?)?.toDouble() ?? 0.0,
+          );
+          setState(() {
+            _historyLogs.insert(0, newLog);
+          });
+        }
+      });
+    } catch (_) {
+      // The background service is not supported in widget tests and desktop runners.
+      _telemetrySub = null;
+      _snapshotSub = null;
+    }
   }
 
   int _getElapsedPlantingDay(DateTime timestamp) {
@@ -1774,40 +2055,64 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     return "Pre-cycle Preparation";
   }
 
-  void _toggleHardwareControl(String control) {
+  Future<void> _toggleGrowLight() async {
+    final target = _esp32Ip.trim().isEmpty ? 'hydrodeck.local' : _esp32Ip.trim();
+    final nextState = !_growLightOn ? 1 : 0;
+    final uri = Uri.parse('http://$target/control?light=1&state=$nextState');
+
     setState(() {
-      _hardwareStates[control] = !(_hardwareStates[control] ?? false);
+      _growLightOn = !_growLightOn;
+      _isGrowLightToggling = true;
     });
+
+    try {
+      final response = await http.get(uri, headers: {'Connection': 'close'}).timeout(const Duration(seconds: 6));
+      if (response.statusCode != 200 && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('ESP32 acknowledged the command, but the response was unexpected.')),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Grow light control could not reach the ESP32.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isGrowLightToggling = false);
+    }
   }
 
-  Widget _buildHardwareButton(String key, String label, IconData icon) {
-    final isOn = _hardwareStates[key] ?? false;
-    return Row(
-      children: [
-        Expanded(
-          child: Row(
-            children: [
-              Icon(icon, size: 18, color: const Color(0xFF2DC867)),
-              const SizedBox(width: 8),
-              Expanded(child: Text(label, style: const TextStyle(fontWeight: FontWeight.w600))),
-            ],
-          ),
-        ),
-        SizedBox(
-          width: 82,
-          child: ElevatedButton(
-            onPressed: () => _toggleHardwareControl(key),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: isOn ? const Color(0xFF2DC867) : Colors.grey.shade500,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(vertical: 11),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            ),
-            child: Text(isOn ? 'ON' : 'OFF'),
-          ),
-        ),
-      ],
-    );
+  Future<void> _toggleActuator(String key, int pumpNumber, {bool allowHardware = true}) async {
+    if (!allowHardware) {
+      setState(() {
+        _controlStates[key] = !(_controlStates[key] ?? false);
+      });
+      return;
+    }
+
+    final target = _esp32Ip.trim().isEmpty ? 'hydrodeck.local' : _esp32Ip.trim();
+    final nextValue = !(_controlStates[key] ?? false) ? 1 : 0;
+    final uri = Uri.parse('http://$target/control?pump=$pumpNumber&state=$nextValue');
+
+    setState(() {
+      _controlStates[key] = !(_controlStates[key] ?? false);
+    });
+
+    try {
+      final response = await http.get(uri, headers: {'Connection': 'close'}).timeout(const Duration(seconds: 6));
+      if (response.statusCode != 200 && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Actuator command was not acknowledged by the ESP32.')),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Pump control could not reach the ESP32.')),
+        );
+      }
+    }
   }
 
   Future<void> _connectAndProvisionWifi() async {
@@ -1829,30 +2134,46 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         final permissions = await [
           Permission.bluetoothScan,
           Permission.bluetoothConnect,
+          Permission.locationWhenInUse,
         ].request();
-        if (permissions.values.any((status) => !status.isGranted)) {
-          throw Exception('Bluetooth permissions are required');
+        final missingRequiredPermissions = permissions.values.any(
+          (status) => status != PermissionStatus.granted && status != PermissionStatus.limited,
+        );
+        if (missingRequiredPermissions) {
+          throw Exception('Bluetooth and location permissions are required');
         }
       }
       final adapterState = await FlutterBluePlus.adapterState.first;
       if (adapterState != BluetoothAdapterState.on) {
         await FlutterBluePlus.turnOn();
-        setState(() => _bleStatus = 'Turn Bluetooth on, then tap Connect again');
-        return;
+        await FlutterBluePlus.adapterState.firstWhere((state) => state == BluetoothAdapterState.on);
       }
 
       await FlutterBluePlus.stopScan();
       await FlutterBluePlus.startScan(
         withServices: [_bleServiceUuid],
         timeout: const Duration(seconds: 10),
+        androidUsesFineLocation: true,
       );
       final results = await FlutterBluePlus.scanResults.firstWhere((scanResults) {
-        return scanResults.any((result) =>
-            result.device.platformName == _bleDeviceName ||
-            result.advertisementData.advName == _bleDeviceName);
-      }).timeout(const Duration(seconds: 12));
+        return scanResults.any((result) {
+          final names = [result.device.platformName, result.advertisementData.advName];
+          final matchesName = names.any((name) =>
+              name == _bleDeviceName || name.toLowerCase().contains('esp32'));
+          final matchesService = result.advertisementData.serviceUuids.any(
+            (uuid) => uuid == _bleServiceUuid,
+          );
+          return matchesName || matchesService;
+        });
+      }).timeout(const Duration(seconds: 15));
       for (final result in results) {
-        if (result.device.platformName == _bleDeviceName || result.advertisementData.advName == _bleDeviceName) {
+        final names = [result.device.platformName, result.advertisementData.advName];
+        final matchesName = names.any((name) =>
+            name == _bleDeviceName || name.toLowerCase().contains('esp32'));
+        final matchesService = result.advertisementData.serviceUuids.any(
+          (uuid) => uuid == _bleServiceUuid,
+        );
+        if (matchesName || matchesService) {
           device = result.device;
           break;
         }
@@ -1860,7 +2181,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
       await FlutterBluePlus.stopScan();
       if (device == null) throw Exception('ESP32-HYDRODECK was not found');
 
-      await device.connect(timeout: const Duration(seconds: 15), license: License.free);
+      await device.connect(timeout: const Duration(seconds: 15), license: License.nonprofit);
       final services = await device.discoverServices();
       BluetoothCharacteristic? wifiCharacteristic;
       BluetoothCharacteristic? statusCharacteristic;
@@ -1944,14 +2265,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   }
 
   Widget _buildHomeScreen(String waterLabel) {
-    bool isWaterFull = _lastValidWaterStatus == "full";
-    Color statusColor = _connectionStatus == "Connected" ? Colors.green : Colors.orange;
-    String statusText = _connectionStatus == "Connected" 
-        ? "System Online" 
-        : "Connecting....";
-
-    bool isPhWarningActive = (_lastValidPhValue < _minPhThreshold || _lastValidPhValue > _maxPhThreshold);
-    int currentDayCount = _getElapsedPlantingDay(DateTime.now());
+    final statusColor = _connectionStatus == "Connected" ? Colors.green : Colors.orange;
+    final statusText = _connectionStatus == "Connected" ? "System Online" : "Connecting....";
+    final isBed2Warning = _bed2.ph < _minPhThreshold || _bed2.ph > _maxPhThreshold;
+    final currentDayCount = _getElapsedPlantingDay(DateTime.now());
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24.0),
@@ -1980,87 +2297,86 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             ],
           ),
           const SizedBox(height: 20),
-          
-          isPhWarningActive 
-            ? Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  color: Colors.red[400], 
-                  borderRadius: BorderRadius.circular(24),
-                  boxShadow: [BoxShadow(color: Colors.red.withAlpha(50), blurRadius: 10, offset: const Offset(0, 4))]
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: const [
-                        Text('SYSTEM CRITICAL WARNING', style: TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.1)),
-                        Icon(Icons.warning_amber_rounded, color: Colors.white, size: 26),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    const Text('PH LEVEL', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 8),
-                    Text(
-                      'The system detected an unstable acid level of ${_lastValidPhValue.toStringAsFixed(2)} pH. Target range is ${_minPhThreshold.toStringAsFixed(1)} - ${_maxPhThreshold.toStringAsFixed(1)} pH.', 
-                      style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4)
-                    ),
-                  ],
-                ),
-              )
-            : Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF2DC867), 
-                  borderRadius: BorderRadius.circular(24),
-                  boxShadow: [BoxShadow(color: const Color(0xFF2DC867).withAlpha(50), blurRadius: 10, offset: const Offset(0, 4))]
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('Current Status', style: TextStyle(color: Colors.white70, fontSize: 14)),
-                        Icon(Icons.wb_sunny_outlined, color: Colors.white.withAlpha(230), size: 24),
-                      ],
-                    ),
-                    const SizedBox(height: 4),
-                    const Text('Optimal Growth', style: TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 16),
-                    Row(
-                      children: [
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                          decoration: BoxDecoration(color: Colors.white.withAlpha(45), borderRadius: BorderRadius.circular(30)),
-                          child: Text('Day $currentDayCount', style: const TextStyle(color: Colors.white, fontSize: 13)),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-          const SizedBox(height: 24),
 
+          isBed2Warning
+              ? Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: Colors.red[400],
+                    borderRadius: BorderRadius.circular(24),
+                    boxShadow: [BoxShadow(color: Colors.red.withAlpha(50), blurRadius: 10, offset: const Offset(0, 4))],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: const [
+                          Text('GROW BED 2 pH WARNING', style: TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.1)),
+                          Icon(Icons.warning_amber_rounded, color: Colors.white, size: 26),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      const Text('pH ALERT', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Grow bed 2 is outside the target range at ${_bed2.ph.toStringAsFixed(2)} pH. Target range is ${_minPhThreshold.toStringAsFixed(1)} - ${_maxPhThreshold.toStringAsFixed(1)} pH.',
+                        style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4),
+                      ),
+                    ],
+                  ),
+                )
+              : Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF2DC867),
+                    borderRadius: BorderRadius.circular(24),
+                    boxShadow: [BoxShadow(color: const Color(0xFF2DC867).withAlpha(50), blurRadius: 10, offset: const Offset(0, 4))],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('Current Status', style: TextStyle(color: Colors.white70, fontSize: 14)),
+                          Icon(Icons.wb_sunny_outlined, color: Colors.white.withAlpha(230), size: 24),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      const Text('Optimal Growth', style: TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 16),
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                            decoration: BoxDecoration(color: Colors.white.withAlpha(45), borderRadius: BorderRadius.circular(30)),
+                            child: Text('Day $currentDayCount', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+          const SizedBox(height: 24),
           const Text('Grow Bed 1 Metrics', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
           const SizedBox(height: 12),
-          _buildMetricGrid(waterLabel, isWaterFull),
-          
+          _buildGrowBedMetrics('Grow Bed 1', _bed1),
           const SizedBox(height: 24),
           const Text('Grow Bed 2 Metrics', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
           const SizedBox(height: 12),
-          _buildMetricGrid(waterLabel, isWaterFull),
+          _buildGrowBedMetrics('Grow Bed 2', _bed2),
         ],
       ),
     );
   }
 
-  Widget _buildMetricGrid(String waterLabel, bool isWaterFull) {
-    bool isPhOptimal = _lastValidPhValue >= _minPhThreshold && _lastValidPhValue <= _maxPhThreshold;
-    bool isTdsOptimal = _lastValidTdsValue >= 400 && _lastValidTdsValue <= 900;
+  Widget _buildGrowBedMetrics(String title, GrowBedReading data) {
+    final isPhOptimal = data.ph >= _minPhThreshold && data.ph <= _maxPhThreshold;
+    final isTdsOptimal = data.tds >= 400 && data.tds <= 900;
+    final waterLabel = data.waterFull ? 'Water full' : 'Needs water';
 
     return Column(
       children: [
@@ -2068,37 +2384,21 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           children: [
             Expanded(
               child: _buildCleanCard(
-                'ACIDITY (PH)', 
-                _lastValidPhValue.toStringAsFixed(2), 
-                isPhOptimal ? 'Normal' : 'Unstable', 
-                isPhOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0), 
-                isPhOptimal ? Colors.green : Colors.orange
-              )
+                'ACIDITY (PH)',
+                data.ph.toStringAsFixed(2),
+                isPhOptimal ? 'Normal' : 'Unstable',
+                isPhOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
+                isPhOptimal ? Colors.green : Colors.orange,
+              ),
             ),
             const SizedBox(width: 16),
             Expanded(
               child: _buildCleanCard(
-                'TDS', 
-                '${_lastValidTdsValue.toStringAsFixed(0)} PPM', 
-                isTdsOptimal ? 'Optimal' : 'Warning', 
-                isTdsOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0), 
-                isTdsOptimal ? Colors.green : Colors.orange
-              )
-            ),
-          ],
-        ),
-        const SizedBox(height: 16),
-        Row(
-          children: [
-            Expanded(child: _buildCleanCard('WATER TEMP', _lastValidWaterTemp, 'Live', const Color(0xFFE8F7ED), Colors.green)),
-            const SizedBox(width: 16),
-            Expanded(
-              child: _buildCleanCard(
-                'BED WATER LEVEL',
-                waterLabel,
-                isWaterFull ? 'Optimal' : 'Warning',
-                isWaterFull ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
-                isWaterFull ? Colors.green : Colors.orange,
+                'TDS',
+                '${data.tds.toStringAsFixed(0)} PPM',
+                isTdsOptimal ? 'Optimal' : 'Warning',
+                isTdsOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
+                isTdsOptimal ? Colors.green : Colors.orange,
               ),
             ),
           ],
@@ -2108,11 +2408,21 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           children: [
             Expanded(
               child: _buildCleanCard(
-                'RESERVOIR WATER LEVEL', 
-                '85%', 
-                'Sensor Placeholder (Pending Hardware)', 
-                const Color(0xFFE3F2FD), 
-                Colors.blueAccent
+                'WATER TEMP',
+                '${data.temperature.toStringAsFixed(1)}°C',
+                'Live',
+                const Color(0xFFE8F7ED),
+                Colors.green,
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: _buildCleanCard(
+                'BED WATER LEVEL',
+                waterLabel,
+                data.waterFull ? 'Optimal' : 'Warning',
+                data.waterFull ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
+                data.waterFull ? Colors.green : Colors.orange,
               ),
             ),
           ],
@@ -2121,21 +2431,35 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     );
   }
 
-  Widget _buildControlScreen() {
-    return Padding(
-      padding: const EdgeInsets.all(24.0),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+  Widget _buildControlToggle(String label, String key, {int pumpNumber = 0, bool allowHardware = true}) {
+    final isOn = _controlStates[key] ?? false;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.grey.shade200),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          const Text('Hardware Controls', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 20),
           Expanded(
-            child: ListView(
-              children: [
-                _buildGrowBedControls('Grow Bed 1'),
-                const SizedBox(height: 20),
-                _buildGrowBedControls('Grow Bed 2'),
-              ],
+            child: Text(
+              label,
+              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.black87),
+            ),
+          ),
+          SizedBox(
+            width: 82,
+            child: ElevatedButton(
+              onPressed: () => _toggleActuator(key, pumpNumber, allowHardware: allowHardware),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: isOn ? const Color(0xFF2DC867) : Colors.grey.shade500,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+              child: Text(isOn ? 'ON' : 'OFF'),
             ),
           ),
         ],
@@ -2143,34 +2467,103 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     );
   }
 
-  Widget _buildGrowBedControls(String bed) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+  Widget _buildControlScreen() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24.0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(bed, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 12),
-          Row(children: [
-            Expanded(child: _buildHardwareButton('$bed Lights', 'Lights', Icons.lightbulb_outline)),
-            const SizedBox(width: 10),
-            Expanded(child: _buildHardwareButton('$bed Water Pump', 'Water Pump', Icons.water_drop_outlined)),
-          ]),
-          const Divider(height: 20, color: Color(0xFFE5E5E5)),
-          const SizedBox(height: 10),
-          Row(children: [
-            Expanded(child: _buildHardwareButton('$bed pH Up', 'pH Up', Icons.arrow_upward)),
-            const SizedBox(width: 10),
-            Expanded(child: _buildHardwareButton('$bed pH Down', 'pH Down', Icons.arrow_downward)),
-          ]),
-          const Divider(height: 20, color: Color(0xFFE5E5E5)),
-          const SizedBox(height: 10),
-          Row(children: [
-            Expanded(child: _buildHardwareButton('$bed Nutrient Solution', 'Nutrient Solution', Icons.science_outlined)),
-            const SizedBox(width: 10),
-            const Expanded(child: SizedBox()),
-          ]),
+          const Text('Hardware Controls', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 20),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  children: [
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF2DC867).withValues(alpha: 20),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('Grow Bed 1', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 12),
+                          _buildControlToggle('Water Pump', 'bed1_water', pumpNumber: 1),
+                          const SizedBox(height: 10),
+                          _buildControlToggle('pH Up', 'bed1_ph_up', pumpNumber: 3, allowHardware: false),
+                          const SizedBox(height: 10),
+                          _buildControlToggle('pH Down', 'bed1_ph_down', pumpNumber: 4, allowHardware: false),
+                          const SizedBox(height: 10),
+                          _buildControlToggle('Nutrient', 'bed1_nutrient', pumpNumber: 5, allowHardware: false),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  children: [
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF2DC867).withValues(alpha: 20),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('Grow Bed 2', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 12),
+                          _buildControlToggle('Water Pump', 'bed2_water', pumpNumber: 2),
+                          const SizedBox(height: 10),
+                          _buildControlToggle('pH Up', 'bed2_ph_up', pumpNumber: 6, allowHardware: false),
+                          const SizedBox(height: 10),
+                          _buildControlToggle('pH Down', 'bed2_ph_down', pumpNumber: 6, allowHardware: false),
+                          const SizedBox(height: 10),
+                          _buildControlToggle('Nutrient', 'bed2_nutrient', pumpNumber: 5, allowHardware: false),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+            child: Row(
+              children: [
+                const Icon(Icons.lightbulb_outline, size: 24, color: Color(0xFF2DC867)),
+                const SizedBox(width: 12),
+                const Expanded(child: Text('Grow Lights', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
+                const SizedBox(width: 12),
+                SizedBox(
+                  width: 110,
+                  child: ElevatedButton(
+                    key: const ValueKey('grow-light-button'),
+                    onPressed: _isGrowLightToggling ? null : _toggleGrowLight,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _growLightOn ? const Color(0xFF2DC867) : Colors.grey.shade500,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 11),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                    child: Text(_isGrowLightToggling ? '...' : (_growLightOn ? 'ON' : 'OFF')),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ],
       ),
     );

@@ -13,8 +13,6 @@
 #include <Preferences.h>
 #include <NimBLEDevice.h>
 
-// Install "FirebaseClient" by Mobizt in Arduino IDE.
-// Do not use a conflicting Firebase-ESP-Client FirebaseClient.h.
 char ssid[65] = "TEST";
 char password[65] = "12345678";
 
@@ -23,22 +21,48 @@ char password[65] = "12345678";
 #define USER_PASSWORD "asdqwe123"
 #define DATABASE_URL "https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/"
 
+// Relay / Actuator Logic (Set to LOW if active-low module is used)
+#define PUMP_ON LOW
+#define PUMP_OFF HIGH
+#define LIGHT_ON LOW
+#define LIGHT_OFF HIGH
+
+// --- PIN DEFINITIONS ---
+// Sensors Set 1
+const int WATER_SENSOR_PIN1 = 21;
+#define DS18B20_PIN1 4
+const int PH_PIN1 = 34;
+const int TDS_PIN1 = 35;
+
+// Sensors Set 2
+const int WATER_SENSOR_PIN2 = 22;
+#define DS18B20_PIN2 13
+const int PH_PIN2 = 32;
+const int TDS_PIN2 = 33;
+
+// Actuators (6 Pumps + 1 Grow Light)
+const int PUMP1_PIN = 25;
+const int PUMP2_PIN = 26;
+const int PUMP3_PIN = 27;
+const int PUMP4_PIN = 14;
+const int PUMP5_PIN = 12;
+const int PUMP6_PIN = 19;
+const int GROW_LIGHT_PIN = 18;
+
+// Calibration & ADC parameters
+#define SCOUNT 30
+#define VREF 3.3
+const float v_ref = 3.3;
+const float tdsCalibrationFactor = 1.0;
+float slope1 = 0.18;
+float slope2 = 0.18;
+
 WiFiClientSecure ssl_client;
 using AsyncClient = AsyncClientClass;
 AsyncClient aClient(ssl_client);
 UserAuth user_auth(API_KEY, USER_EMAIL, USER_PASSWORD);
 FirebaseApp app;
 RealtimeDatabase Database;
-
-const int WATER_SENSOR_PIN = 21;
-#define DS18B20PIN 4
-const int pH_Pin = 34;
-const int TdsSensorPin = 35;
-#define SCOUNT 30
-#define VREF 3.3
-const float v_ref = 3.3;
-const float tdsCalibrationFactor = 1.0;
-float slope = 0.18;
 
 WebServer server(80);
 Preferences wifiPreferences;
@@ -108,14 +132,28 @@ void setupBleProvisioning() {
   advertising->addServiceUUID(BLE_SERVICE_UUID);
   NimBLEDevice::startAdvertising();
 }
-OneWire oneWire(DS18B20PIN);
-DallasTemperature sensors(&oneWire);
-int analogBuffer[SCOUNT];
-int analogBufferTemp[SCOUNT];
-int analogBufferIndex = 0;
-float currentTemperature = 0.0;
-float currentPhValue = 7.0;
-float currentTdsValue = 0.0;
+OneWire oneWire1(DS18B20_PIN1);
+DallasTemperature sensors1(&oneWire1);
+
+OneWire oneWire2(DS18B20_PIN2);
+DallasTemperature sensors2(&oneWire2);
+
+int analogBuffer1[SCOUNT];
+int analogBufferTemp1[SCOUNT];
+int analogBufferIndex1 = 0;
+
+int analogBuffer2[SCOUNT];
+int analogBufferTemp2[SCOUNT];
+int analogBufferIndex2 = 0;
+
+float currentTemperature1 = 0.0;
+float currentPhValue1 = 7.0;
+float currentTdsValue1 = 0.0;
+
+float currentTemperature2 = 0.0;
+float currentPhValue2 = 7.0;
+float currentTdsValue2 = 0.0;
+
 unsigned long lastTempCheck = 0;
 unsigned long lastPhCheck = 0;
 unsigned long lastFirebasePush = 0;
@@ -146,18 +184,38 @@ int getMedianNum(int values[], int length) {
   return bTemp;
 }
 
-float readPhSensor() {
+float readPhSensor(int pin, float sensorSlope) {
   int measurings = 0;
   int samples = 10;
   for (int i = 0; i < samples; i++) {
-    measurings += analogRead(pH_Pin);
+    measurings += analogRead(pin);
     delay(10);
   }
   float voltage = (v_ref / 4095.0f) * (float)measurings / (float)samples;
-  float ph = 7.0 + ((2.5 - voltage) / slope);
+  float ph = 7.0 + ((2.5 - voltage) / sensorSlope);
   if (ph < 0.0) ph = 0.0;
   if (ph > 14.0) ph = 14.0;
   return ph;
+}
+
+// Actuator control functions
+void setPump(int pumpNum, bool turnOn) {
+  int pin = -1;
+  switch (pumpNum) {
+    case 1: pin = PUMP1_PIN; break;
+    case 2: pin = PUMP2_PIN; break;
+    case 3: pin = PUMP3_PIN; break;
+    case 4: pin = PUMP4_PIN; break;
+    case 5: pin = PUMP5_PIN; break;
+    case 6: pin = PUMP6_PIN; break;
+  }
+  if (pin != -1) {
+    digitalWrite(pin, turnOn ? PUMP_ON : PUMP_OFF);
+  }
+}
+
+void setGrowLight(bool turnOn) {
+  digitalWrite(GROW_LIGHT_PIN, turnOn ? LIGHT_ON : LIGHT_OFF);
 }
 
 void handleRootIdent() {
@@ -165,11 +223,44 @@ void handleRootIdent() {
 }
 
 void handleCombinedStatus() {
-  String json = "{\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN) == HIGH ? "full" : "low") +
-                "\",\"temp\":" + String(currentTemperature, 1) +
-                ",\"ph\":" + String(currentPhValue, 2) +
-                ",\"tds\":" + String(currentTdsValue, 0) + "}";
+  String json = "{";
+  json += "\"water1\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\",";
+  json += "\"temp1\":" + String(currentTemperature1, 1) + ",";
+  json += "\"ph1\":" + String(currentPhValue1, 2) + ",";
+  json += "\"tds1\":" + String(currentTdsValue1, 0) + ",";
+  json += "\"water2\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\",";
+  json += "\"temp2\":" + String(currentTemperature2, 1) + ",";
+  json += "\"ph2\":" + String(currentPhValue2, 2) + ",";
+  json += "\"tds2\":" + String(currentTdsValue2, 0) + ",";
+  json += "\"pumps\":[";
+  json += String(digitalRead(PUMP1_PIN) == PUMP_ON ? 1 : 0) + ",";
+  json += String(digitalRead(PUMP2_PIN) == PUMP_ON ? 1 : 0) + ",";
+  json += String(digitalRead(PUMP3_PIN) == PUMP_ON ? 1 : 0) + ",";
+  json += String(digitalRead(PUMP4_PIN) == PUMP_ON ? 1 : 0) + ",";
+  json += String(digitalRead(PUMP5_PIN) == PUMP_ON ? 1 : 0) + ",";
+  json += String(digitalRead(PUMP6_PIN) == PUMP_ON ? 1 : 0) + "],";
+  json += "\"grow_light\":" + String(digitalRead(GROW_LIGHT_PIN) == LIGHT_ON ? 1 : 0);
+  json += "}";
   server.send(200, "application/json", json);
+}
+
+// HTTP API Control Handlers
+void handleControl() {
+  if (server.hasArg("pump") && server.hasArg("state")) {
+    int p = server.arg("pump").toInt();
+    bool state = (server.arg("state") == "1" || server.arg("state") == "on");
+    if (p >= 1 && p <= 6) {
+      setPump(p, state);
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  } else if (server.hasArg("light") && server.hasArg("state")) {
+    bool state = (server.arg("state") == "1" || server.arg("state") == "on");
+    setGrowLight(state);
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+  server.send(400, "text/plain", "Bad Request");
 }
 
 void processFirebaseResult(AsyncResult& firebaseResult) {
@@ -206,26 +297,55 @@ void initializeFirebase() {
 
 void setup() {
   Serial.begin(115200);
+
+  // Initialize Actuators (Default OFF)
+  pinMode(PUMP1_PIN, OUTPUT); digitalWrite(PUMP1_PIN, PUMP_OFF);
+  pinMode(PUMP2_PIN, OUTPUT); digitalWrite(PUMP2_PIN, PUMP_OFF);
+  pinMode(PUMP3_PIN, OUTPUT); digitalWrite(PUMP3_PIN, PUMP_OFF);
+  pinMode(PUMP4_PIN, OUTPUT); digitalWrite(PUMP4_PIN, PUMP_OFF);
+  pinMode(PUMP5_PIN, OUTPUT); digitalWrite(PUMP5_PIN, PUMP_OFF);
+  pinMode(PUMP6_PIN, OUTPUT); digitalWrite(PUMP6_PIN, PUMP_OFF);
+  pinMode(GROW_LIGHT_PIN, OUTPUT); digitalWrite(GROW_LIGHT_PIN, LIGHT_OFF);
+
+  // Initialize Sensors
+  pinMode(WATER_SENSOR_PIN1, INPUT_PULLUP);
+  pinMode(WATER_SENSOR_PIN2, INPUT_PULLUP);
+  pinMode(PH_PIN1, INPUT);
+  pinMode(PH_PIN2, INPUT);
+  pinMode(TDS_PIN1, INPUT);
+  pinMode(TDS_PIN2, INPUT);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PH_PIN1, ADC_11db);
+  analogSetPinAttenuation(PH_PIN2, ADC_11db);
+  analogSetPinAttenuation(TDS_PIN1, ADC_11db);
+  analogSetPinAttenuation(TDS_PIN2, ADC_11db);
+
+  // Temperature Sensors Setup
+  sensors1.begin();
+  sensors1.requestTemperatures();
+  sensors2.begin();
+  sensors2.requestTemperatures();
+  delay(750);
+
+  float tempReading1 = sensors1.getTempCByIndex(0);
+  if (tempReading1 != DEVICE_DISCONNECTED_C && tempReading1 > -50.0) {
+    currentTemperature1 = tempReading1;
+  }
+  float tempReading2 = sensors2.getTempCByIndex(0);
+  if (tempReading2 != DEVICE_DISCONNECTED_C && tempReading2 > -50.0) {
+    currentTemperature2 = tempReading2;
+  }
+  sensors1.setWaitForConversion(false);
+  sensors2.setWaitForConversion(false);
+
+  // Wi-Fi and BLE Setup
   wifiPreferences.begin("wifi", false);
   String savedSsid = wifiPreferences.getString("ssid", ssid);
   String savedPassword = wifiPreferences.getString("password", password);
   savedSsid.toCharArray(ssid, sizeof(ssid));
   savedPassword.toCharArray(password, sizeof(password));
   setupBleProvisioning();
-  pinMode(WATER_SENSOR_PIN, INPUT_PULLUP);
-  pinMode(pH_Pin, INPUT);
-  pinMode(TdsSensorPin, INPUT);
-  analogReadResolution(12);
-  analogSetPinAttenuation(pH_Pin, ADC_11db);
-  analogSetPinAttenuation(TdsSensorPin, ADC_11db);
-  sensors.begin();
-  sensors.requestTemperatures();
-  delay(750);
-  float tempReading = sensors.getTempCByIndex(0);
-  if (tempReading != DEVICE_DISCONNECTED_C && tempReading > -50.0) {
-    currentTemperature = tempReading;
-  }
-  sensors.setWaitForConversion(false);
 
   WiFi.begin(ssid, password);
   Serial.print("Connecting to Wi-Fi");
@@ -245,6 +365,7 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRootIdent);
   server.on("/status", HTTP_GET, handleCombinedStatus);
+  server.on("/control", HTTP_GET, handleControl); // Control via URL e.g. /control?pump=1&state=1
   server.begin();
 }
 
@@ -253,6 +374,7 @@ void loop() {
   server.handleClient();
   unsigned long now = millis();
 
+  // Wi-Fi Management
   if (WiFi.status() != WL_CONNECTED && !provisioningPending && now - lastWifiRetry >= wifiRetryInterval) {
     lastWifiRetry = now;
     if (firebaseInitialized) {
@@ -267,6 +389,7 @@ void loop() {
     initializeFirebase();
   }
 
+  // BLE Provisioning Handler
   if (provisioningPending) {
     if (provisioningStartedAt == 0) {
       WiFi.disconnect(false, false);
@@ -297,54 +420,91 @@ void loop() {
     ESP.restart();
   }
 
+  // Sampling TDS Sensor 1 & Sensor 2
   static unsigned long sampleTime = 0;
   if (now - sampleTime > 40U) {
     sampleTime = now;
-    analogBuffer[analogBufferIndex] = analogRead(TdsSensorPin);
-    analogBufferIndex++;
-    if (analogBufferIndex == SCOUNT) analogBufferIndex = 0;
+    analogBuffer1[analogBufferIndex1] = analogRead(TDS_PIN1);
+    analogBufferIndex1 = (analogBufferIndex1 + 1) % SCOUNT;
+
+    analogBuffer2[analogBufferIndex2] = analogRead(TDS_PIN2);
+    analogBufferIndex2 = (analogBufferIndex2 + 1) % SCOUNT;
   }
 
+  // Calculate TDS Values
   static unsigned long tdsTime = 0;
   if (now - tdsTime > 800U) {
     tdsTime = now;
-    for (int i = 0; i < SCOUNT; i++) {
-      analogBufferTemp[i] = analogBuffer[i];
-    }
-    float averageVoltage = getMedianNum(analogBufferTemp, SCOUNT) * (float)VREF / 4096.0;
-    averageVoltage = constrain(averageVoltage, 0.0f, (float)VREF);
-    float compensationCoefficient = 1.0 + 0.02 * (currentTemperature - 25.0);
-    float compensationVoltage = averageVoltage / compensationCoefficient;
-    float tdsValue = (133.42 * compensationVoltage * compensationVoltage * compensationVoltage -
-      255.86 * compensationVoltage * compensationVoltage + 857.39 * compensationVoltage) * 0.5;
-    if (tdsValue < 0) tdsValue = 0;
-    currentTdsValue = tdsValue * tdsCalibrationFactor;
+
+    // Buffer 1
+    for (int i = 0; i < SCOUNT; i++) analogBufferTemp1[i] = analogBuffer1[i];
+    float avgV1 = getMedianNum(analogBufferTemp1, SCOUNT) * (float)VREF / 4096.0;
+    avgV1 = constrain(avgV1, 0.0f, (float)VREF);
+    float compCoeff1 = 1.0 + 0.02 * (currentTemperature1 - 25.0);
+    float compV1 = avgV1 / compCoeff1;
+    float tdsVal1 = (133.42 * compV1 * compV1 * compV1 - 255.86 * compV1 * compV1 + 857.39 * compV1) * 0.5;
+    currentTdsValue1 = max(0.0f, tdsVal1) * tdsCalibrationFactor;
+
+    // Buffer 2
+    for (int i = 0; i < SCOUNT; i++) analogBufferTemp2[i] = analogBuffer2[i];
+    float avgV2 = getMedianNum(analogBufferTemp2, SCOUNT) * (float)VREF / 4096.0;
+    avgV2 = constrain(avgV2, 0.0f, (float)VREF);
+    float compCoeff2 = 1.0 + 0.02 * (currentTemperature2 - 25.0);
+    float compV2 = avgV2 / compCoeff2;
+    float tdsVal2 = (133.42 * compV2 * compV2 * compV2 - 255.86 * compV2 * compV2 + 857.39 * compV2) * 0.5;
+    currentTdsValue2 = max(0.0f, tdsVal2) * tdsCalibrationFactor;
   }
 
+  // Reading pH Sensors
   if (now - lastPhCheck >= phInterval) {
     lastPhCheck = now;
-    currentPhValue = readPhSensor();
+    currentPhValue1 = readPhSensor(PH_PIN1, slope1);
+    currentPhValue2 = readPhSensor(PH_PIN2, slope2);
   }
 
+  // Reading Temperature Sensors
   if (now - lastTempCheck >= tempInterval) {
     lastTempCheck = now;
-    float reading = sensors.getTempCByIndex(0);
-    if (reading != DEVICE_DISCONNECTED_C && reading > -50.0) currentTemperature = reading;
-    sensors.requestTemperatures();
+    
+    float reading1 = sensors1.getTempCByIndex(0);
+    if (reading1 != DEVICE_DISCONNECTED_C && reading1 > -50.0) currentTemperature1 = reading1;
+    sensors1.requestTemperatures();
+
+    float reading2 = sensors2.getTempCByIndex(0);
+    if (reading2 != DEVICE_DISCONNECTED_C && reading2 > -50.0) currentTemperature2 = reading2;
+    sensors2.requestTemperatures();
   }
 
+  // Syncing with Firebase Realtime Database
   if (firebaseInitialized && app.ready() && now - lastFirebasePush >= firebaseInterval) {
     lastFirebasePush = now;
-    Database.set<float>(aClient, "/hydrodeck/temp", currentTemperature);
-    Database.set<float>(aClient, "/hydrodeck/ph", currentPhValue);
-    Database.set<float>(aClient, "/hydrodeck/tds", currentTdsValue);
-    Database.set<String>(aClient, "/hydrodeck/water",
-      digitalRead(WATER_SENSOR_PIN) == HIGH ? "full" : "low");
+
+    // Set 1 Data
+    Database.set<float>(aClient, "/hydrodeck/set1/temp", currentTemperature1);
+    Database.set<float>(aClient, "/hydrodeck/set1/ph", currentPhValue1);
+    Database.set<float>(aClient, "/hydrodeck/set1/tds", currentTdsValue1);
+    Database.set<String>(aClient, "/hydrodeck/set1/water", digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low");
+
+    // Set 2 Data
+    Database.set<float>(aClient, "/hydrodeck/set2/temp", currentTemperature2);
+    Database.set<float>(aClient, "/hydrodeck/set2/ph", currentPhValue2);
+    Database.set<float>(aClient, "/hydrodeck/set2/tds", currentTdsValue2);
+    Database.set<String>(aClient, "/hydrodeck/set2/water", digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low");
+
+    // Actuators Data Status Sync
+    Database.set<bool>(aClient, "/hydrodeck/actuators/pump1", digitalRead(PUMP1_PIN) == PUMP_ON);
+    Database.set<bool>(aClient, "/hydrodeck/actuators/pump2", digitalRead(PUMP2_PIN) == PUMP_ON);
+    Database.set<bool>(aClient, "/hydrodeck/actuators/pump3", digitalRead(PUMP3_PIN) == PUMP_ON);
+    Database.set<bool>(aClient, "/hydrodeck/actuators/pump4", digitalRead(PUMP4_PIN) == PUMP_ON);
+    Database.set<bool>(aClient, "/hydrodeck/actuators/pump5", digitalRead(PUMP5_PIN) == PUMP_ON);
+    Database.set<bool>(aClient, "/hydrodeck/actuators/pump6", digitalRead(PUMP6_PIN) == PUMP_ON);
+    Database.set<bool>(aClient, "/hydrodeck/actuators/grow_light", digitalRead(GROW_LIGHT_PIN) == LIGHT_ON);
+
     if (aClient.lastError().code() != 0) {
       Serial.print("Firebase update failed, code: ");
       Serial.println(aClient.lastError().code());
     } else {
-      Serial.println("Firebase update sent");
+      Serial.println("Firebase update sent for dual sensor sets and actuators.");
     }
   }
 }
