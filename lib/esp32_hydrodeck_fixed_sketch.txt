@@ -21,11 +21,12 @@ char password[65] = "12345678";
 #define USER_PASSWORD "asdqwe123"
 #define DATABASE_URL "https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/"
 
-// Relay module logic: LOW energizes the normally-open relay contact.
-#define PUMP_ON LOW
-#define PUMP_OFF HIGH
-#define LIGHT_ON LOW
-#define LIGHT_OFF HIGH
+// Relay module logic for a normally-closed relay contact:
+// HIGH drives the relay input, and the relay output is interpreted as ON.
+#define PUMP_ON HIGH
+#define PUMP_OFF LOW
+#define LIGHT_ON HIGH
+#define LIGHT_OFF LOW
 
 // --- PIN DEFINITIONS ---
 // Sensors Set 1
@@ -87,7 +88,8 @@ const char* remoteActuatorNames[] = {
   "waterPump1", "phUp1", "phDown1", "nutrient1",
   "waterPump2", "phUp2", "phDown2", "nutrient2", "growLight"
 };
-const unsigned long remoteCommandInterval = 100;
+// Poll the 9 actuator nodes quickly enough that button presses are reflected on the ESP32 promptly.
+const unsigned long remoteCommandInterval = 50;
 unsigned long lastRemoteCommandPoll = 0;
 int remoteCommandIndex = 0;
 bool remoteCommandPending = false;
@@ -172,16 +174,12 @@ void setPump(int pumpNum, bool turnOn) {
     case 8: pin = nutrientPump2Pin; break;
   }
   if (pin != -1) {
-    if (turnOn) {
-      digitalWrite(pin, LOW);
-    } else {
-      digitalWrite(pin, HIGH);
-    }
+    digitalWrite(pin, turnOn ? PUMP_ON : PUMP_OFF);
   }
 }
 
 void setGrowLight(bool turnOn) {
-  digitalWrite(growLightPin, turnOn ? LOW : HIGH);
+  digitalWrite(growLightPin, turnOn ? LIGHT_ON : LIGHT_OFF);
 }
 
 void applyRemoteActuatorCommand(const String& actuator, bool state) {
