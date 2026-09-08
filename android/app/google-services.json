@@ -1,6 +1,7 @@
 {
   "project_info": {
     "project_number": "129047565304",
+    "firebase_url": "https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app",
     "project_id": "hydrodeck-e6fea",
     "storage_bucket": "hydrodeck-e6fea.firebasestorage.app"
   },

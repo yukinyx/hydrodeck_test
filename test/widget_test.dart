@@ -23,12 +23,13 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Hardware Controls'), findsOneWidget);
-    expect(find.text('Grow Lights'), findsOneWidget);
+    expect(find.text('Grow Light'), findsOneWidget);
 
     final growLightButton = find.byKey(const ValueKey('grow-light-button'));
     expect(growLightButton, findsOneWidget);
     expect(find.text('OFF'), findsWidgets);
 
+    await tester.ensureVisible(growLightButton);
     await tester.tap(growLightButton);
     await tester.pump();
 
