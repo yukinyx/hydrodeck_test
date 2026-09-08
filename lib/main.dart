@@ -2352,6 +2352,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
       ).ref('hydrodeck/$actuatorName');
       await actuatorRef.set(nextValue == 1);
+      unawaited(_sendLocalActuatorCommand(targets, actuatorName, nextValue));
       await Future<void>.delayed(const Duration(milliseconds: 800));
       _actuatorBusy[key] = false;
       if (mounted) setState(() {});
@@ -2388,6 +2389,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     }
     _actuatorBusy[key] = false;
     if (mounted) setState(() {});
+  }
+
+  Future<void> _sendLocalActuatorCommand(
+    Iterable<String> targets,
+    String actuatorName,
+    int state,
+  ) async {
+    for (final target in targets) {
+      try {
+        final response = await http.get(
+          Uri.parse('http://$target/control?actuator=$actuatorName&state=$state'),
+          headers: {'Connection': 'close'},
+        ).timeout(const Duration(seconds: 2));
+        if (response.statusCode == 200) return;
+      } catch (_) {}
+    }
   }
 
   Future<void> _connectAndProvisionWifi() async {
