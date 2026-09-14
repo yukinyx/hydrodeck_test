@@ -42,6 +42,7 @@ dependencies:
   firebase_auth: ^6.2.0
   firebase_database: ^12.4.7
   wifi_iot: ^0.3.19
+  email_otp: ^3.2.0
 dev_dependencies:
   flutter_test:
     sdk: flutter

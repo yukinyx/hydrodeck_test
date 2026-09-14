@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ui';
+import 'package:email_otp/email_otp.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -20,6 +21,20 @@ bool get _supportsBackgroundService =>
   !const bool.fromEnvironment('FLUTTER_TEST') &&
   (defaultTargetPlatform == TargetPlatform.android ||
     defaultTargetPlatform == TargetPlatform.iOS);
+
+Future<DateTime> getServerNow() async {
+  try {
+    final snapshot = await FirebaseDatabase.instance
+        .ref('.info/serverTimeOffset')
+        .get()
+        .timeout(const Duration(seconds: 2));
+    final offset = snapshot.value is num ? (snapshot.value as num).toInt() : 0;
+    final nowUtc = DateTime.now().toUtc().add(Duration(milliseconds: offset));
+    return nowUtc.add(const Duration(hours: 8));
+  } catch (_) {
+    return DateTime.now();
+  }
+}
 
 // --- LOCAL DATABASE SERVICE ---
 class DatabaseHelper {
@@ -45,7 +60,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 5,
+      version: 6,
       onCreate: _createDB,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -75,6 +90,10 @@ class DatabaseHelper {
           await db.execute('ALTER TABLE historical_logs ADD COLUMN batchNumber INTEGER');
           await db.execute('ALTER TABLE active_session ADD COLUMN batchNumber INTEGER NOT NULL DEFAULT 1');
         }
+        if (oldVersion < 6) {
+          await db.execute('ALTER TABLE historical_logs ADD COLUMN bed1 TEXT');
+          await db.execute('ALTER TABLE historical_logs ADD COLUMN bed2 TEXT');
+        }
       },
     );
   }
@@ -88,7 +107,9 @@ class DatabaseHelper {
         temperature TEXT NOT NULL,
         waterLevel TEXT NOT NULL,
         tds REAL NOT NULL DEFAULT 0.0,
-        batchNumber INTEGER
+        batchNumber INTEGER,
+        bed1 TEXT,
+        bed2 TEXT
       )
     ''');
 
@@ -172,6 +193,8 @@ class DatabaseHelper {
       'waterLevel': log.waterLevel,
       'tds': log.tds,
       'batchNumber': log.batchNumber,
+      'bed1': log.bed1 != null ? jsonEncode(log.bed1!.toMap()) : null,
+      'bed2': log.bed2 != null ? jsonEncode(log.bed2!.toMap()) : null,
     });
   }
 
@@ -186,6 +209,8 @@ class DatabaseHelper {
       waterLevel: json['waterLevel'] as String,
       tds: (json['tds'] as num?)?.toDouble() ?? 0.0,
       batchNumber: json['batchNumber'] as int?,
+      bed1: _decodeBedData(json['bed1'] as String?),
+      bed2: _decodeBedData(json['bed2'] as String?),
     )).toList();
   }
 
@@ -200,6 +225,8 @@ class DatabaseHelper {
       waterLevel: json['waterLevel'] as String,
       tds: (json['tds'] as num?)?.toDouble() ?? 0.0,
       batchNumber: json['batchNumber'] as int?,
+      bed1: _decodeBedData(json['bed1'] as String?),
+      bed2: _decodeBedData(json['bed2'] as String?),
     )).toList();
   }
 
@@ -873,13 +900,16 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   Timer.periodic(const Duration(seconds: 60), (timer) async {
     if (!backgroundActive || !isPlantingActive) return;
 
+    final serverNow = await getServerNow();
     final snapshot = HistoricalData(
-      timestamp: DateTime.now(),
+      timestamp: serverNow,
       pH: lastPh,
       temperature: lastTemp,
       waterLevel: lastWater == "full" ? "Water full" : "Needs water",
       tds: lastTds,
       batchNumber: activeBatchNumber,
+      bed1: lastBed1,
+      bed2: lastBed2,
     );
 
     try {
@@ -891,6 +921,8 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         'temperature': snapshot.temperature,
         'waterLevel': snapshot.waterLevel,
         'tds': snapshot.tds,
+        'bed1': snapshot.bed1?.toMap(),
+        'bed2': snapshot.bed2?.toMap(),
       });
     } catch (_) {}
   });
@@ -905,6 +937,21 @@ void main() async {
       );
     }
   } catch (_) {}
+
+  EmailOTP.config(
+    appName: 'Hydrodeck',
+    appEmail: 'hydrodecknt@gmail.com',
+    otpLength: 6,
+    otpType: OTPType.numeric,
+    expiry: 10 * 60 * 1000,
+  );
+  EmailOTP.setSMTP(
+    emailPort: EmailPort.port587,
+    secureType: SecureType.tls,
+    host: 'smtp.gmail.com',
+    username: 'hydrodecknt@gmail.com',
+    password: 'bctm hpcn krjt ffgy',
+  );
 
   if (_supportsBackgroundService) await NotificationHelper.init();
   runApp(const HydrodeckApp());
@@ -1031,14 +1078,33 @@ class _SignupScreenState extends State<SignupScreen> {
     if (_password.text.length < 6) { setState(() => _error = 'Password must be at least 6 characters.'); return; }
     if (_password.text != _confirm.text) { setState(() => _error = 'Passwords do not match.'); return; }
     if (_pin.text != '6967') { setState(() => _error = 'The access PIN is incorrect.'); _pin.clear(); return; }
+
     setState(() { _busy = true; _error = null; });
     try {
-      final credential = await FirebaseAuth.instance.createUserWithEmailAndPassword(email: email, password: _password.text);
-      await FirebaseDatabase.instance.ref('users/${credential.user!.uid}').set({'email': email, 'phone': phone, 'createdAt': ServerValue.timestamp});
-      await FirebaseAuth.instance.signOut();
-      if (mounted) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Account created. Please log in.'))); widget.onLogin(); }
-    } on FirebaseAuthException catch (e) { setState(() => _error = e.message ?? 'Could not create the account.'); }
-    finally { if (mounted) setState(() => _busy = false); }
+      final sent = await EmailOTP.sendOTP(email: email);
+      if (!sent) {
+        setState(() => _error = EmailOTP.lastError ?? 'Could not send the OTP.');
+        return;
+      }
+
+      if (mounted) {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => OtpVerificationScreen(
+              email: email,
+              flow: 'signup',
+              phone: phone,
+              password: _password.text,
+              pin: _pin.text,
+              onLogin: widget.onLogin,
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   @override
@@ -1066,7 +1132,10 @@ class _LoginScreenState extends State<LoginScreen> {
   final _password = TextEditingController();
   bool _busy = false;
   String? _error;
-  @override void dispose() { _email.dispose(); _password.dispose(); super.dispose(); }
+
+  @override
+  void dispose() { _email.dispose(); _password.dispose(); super.dispose(); }
+
   Future<void> _login() async {
     setState(() { _busy = true; _error = null; });
     try {
@@ -1075,12 +1144,424 @@ class _LoginScreenState extends State<LoginScreen> {
     } on FirebaseAuthException catch (e) { setState(() => _error = e.message ?? 'Could not log in.'); }
     finally { if (mounted) setState(() => _busy = false); }
   }
+
   @override
   Widget build(BuildContext context) => _AuthFormScaffold(
     title: 'Welcome back', subtitle: 'Log in to continue to Hydrodeck', error: _error, busy: _busy,
     fields: [_field(_email, 'Email', Icons.email_outlined, keyboard: TextInputType.emailAddress), _field(_password, 'Password', Icons.lock_outline, obscure: true)],
-    actionLabel: 'Log in', onAction: _login, footer: TextButton(onPressed: widget.onSignup, child: const Text('Create a new account')),
+    actionLabel: 'Log in', onAction: _login,
+    footer: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        TextButton(onPressed: widget.onSignup, child: const Text('Create a new account')),
+        TextButton(
+          onPressed: _busy ? null : () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(builder: (context) => const ForgotPasswordScreen()),
+            );
+          },
+          child: const Text('Forgot password?'),
+        ),
+      ],
+    ),
   );
+}
+
+class ForgotPasswordScreen extends StatefulWidget {
+  const ForgotPasswordScreen({super.key});
+
+  @override
+  State<ForgotPasswordScreen> createState() => _ForgotPasswordScreenState();
+}
+
+class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
+  final _emailController = TextEditingController();
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _sendOtp() async {
+    final email = _emailController.text.trim();
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      setState(() => _error = 'Enter a valid email address.');
+      return;
+    }
+
+    setState(() { _busy = true; _error = null; });
+    try {
+      final sent = await EmailOTP.sendOTP(email: email);
+      if (!sent) {
+        setState(() => _error = EmailOTP.lastError ?? 'Could not send the OTP.');
+        return;
+      }
+      if (mounted) {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => OtpVerificationScreen(
+              email: email,
+              flow: 'forgot',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Forgot Password'),
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black,
+        elevation: 0,
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'Enter your email address',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'We will send a 6-digit OTP to confirm the account before starting the password reset process.',
+                style: TextStyle(color: Colors.grey),
+              ),
+              const SizedBox(height: 24),
+              TextField(
+                controller: _emailController,
+                keyboardType: TextInputType.emailAddress,
+                decoration: const InputDecoration(
+                  labelText: 'Email',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.email_outlined),
+                ),
+              ),
+              const SizedBox(height: 18),
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Text(
+                    _error!,
+                    style: const TextStyle(color: Colors.red, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ElevatedButton(
+                onPressed: _busy ? null : _sendOtp,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2DC867),
+                  foregroundColor: Colors.white,
+                  minimumSize: const Size.fromHeight(52),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                child: Text(_busy ? 'Sending OTP...' : 'Send OTP'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class OtpVerificationScreen extends StatefulWidget {
+  final String email;
+  final String flow;
+  final String? phone;
+  final String? password;
+  final String? pin;
+  final VoidCallback? onLogin;
+  final VoidCallback? onDeleteConfirmed;
+
+  const OtpVerificationScreen({
+    super.key,
+    required this.email,
+    required this.flow,
+    this.phone,
+    this.password,
+    this.pin,
+    this.onLogin,
+    this.onDeleteConfirmed,
+  });
+
+  @override
+  State<OtpVerificationScreen> createState() => _OtpVerificationScreenState();
+}
+
+class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
+  final _otpController = TextEditingController();
+  bool _busy = false;
+  String? _error;
+  DateTime? _resendAvailableAt;
+
+  @override
+  void initState() {
+    super.initState();
+    _resendAvailableAt = DateTime.now().add(const Duration(minutes: 3));
+  }
+
+  @override
+  void dispose() {
+    _otpController.dispose();
+    super.dispose();
+  }
+
+  bool get _canResend => _resendAvailableAt == null || DateTime.now().isAfter(_resendAvailableAt!);
+
+  String get _resendLabel {
+    if (_canResend) return 'Send another code';
+    final remaining = _resendAvailableAt!.difference(DateTime.now());
+    final seconds = remaining.inSeconds.remainder(60).toString().padLeft(2, '0');
+    final minutes = remaining.inMinutes.toString().padLeft(2, '0');
+    return 'Send another code in $minutes:$seconds';
+  }
+
+  Future<void> _resendCode() async {
+    if (!_canResend) return;
+    setState(() { _busy = true; _error = null; });
+    try {
+      final sent = widget.flow == 'forgot'
+          ? await EmailOTP.resendOTP(email: widget.email)
+          : await EmailOTP.resendOTP(email: widget.email);
+      if (!sent) {
+        setState(() => _error = EmailOTP.lastError ?? 'Could not send another code.');
+        return;
+      }
+      _resendAvailableAt = DateTime.now().add(const Duration(minutes: 3));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('A new OTP has been sent.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _verifyAndContinue() async {
+    final otp = _otpController.text.trim();
+    if (otp.length != 6 || !RegExp(r'^\d{6}$').hasMatch(otp)) {
+      setState(() => _error = 'Enter the 6-digit OTP sent to your email.');
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+
+    try {
+      final isValid = EmailOTP.verifyOTP(otp: otp);
+      if (!isValid) {
+        setState(() => _error = EmailOTP.isOtpExpired() ? 'The OTP has expired. Please request a new one.' : 'Invalid OTP. Please try again.');
+        return;
+      }
+
+      if (widget.flow == 'signup') {
+        final password = widget.password ?? '';
+        final phone = widget.phone ?? '';
+        if (password.isEmpty || phone.isEmpty) {
+          setState(() => _error = 'Signup data is missing. Please try again.');
+          return;
+        }
+
+        final credential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+          email: widget.email,
+          password: password,
+        );
+
+        await FirebaseDatabase.instance.ref('users/${credential.user!.uid}').set({
+          'email': widget.email,
+          'phone': phone,
+          'createdAt': ServerValue.timestamp,
+        });
+
+        await FirebaseAuth.instance.signOut();
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Account created successfully. Please log in.')),
+          );
+          Navigator.of(context).popUntil((route) => route.isFirst);
+          if (widget.onLogin != null) widget.onLogin!();
+        }
+        return;
+      }
+
+      if (widget.flow == 'delete') {
+        final user = FirebaseAuth.instance.currentUser;
+        if (user == null) {
+          setState(() => _error = 'You need to be signed in to delete your account.');
+          return;
+        }
+
+        final scheduledAt = (await getServerNow()).add(const Duration(days: 7));
+        await FirebaseDatabase.instance.ref('users/${user.uid}').update({
+          'deleteRequestedAt': ServerValue.timestamp,
+          'deleteScheduledAt': scheduledAt.toUtc().toIso8601String(),
+          'accountStatus': 'pending_delete',
+        });
+
+        if (mounted) {
+          if (widget.onDeleteConfirmed != null) widget.onDeleteConfirmed!();
+          Navigator.of(context).popUntil((route) => route.isFirst);
+        }
+        return;
+      }
+
+      await FirebaseAuth.instance.sendPasswordResetEmail(email: widget.email);
+
+      if (mounted) {
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(
+            builder: (context) => PasswordResetInstructionsScreen(
+              email: widget.email,
+            ),
+          ),
+        );
+      }
+    } on FirebaseAuthException catch (e) {
+      setState(() => _error = e.message ?? 'Could not complete the request.');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.flow == 'signup' ? 'Verify Email' : 'Verify Reset OTP'),
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black,
+        elevation: 0,
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                widget.flow == 'signup'
+                    ? 'Enter the 6-digit code sent to your email'
+                    : 'Enter the OTP sent to your email to continue the reset flow',
+                style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                widget.email,
+                style: const TextStyle(color: Colors.grey),
+              ),
+              const SizedBox(height: 24),
+              TextField(
+                controller: _otpController,
+                keyboardType: TextInputType.number,
+                maxLength: 6,
+                decoration: const InputDecoration(
+                  labelText: 'OTP code',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.pin_outlined),
+                ),
+              ),
+              const SizedBox(height: 18),
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Text(
+                    _error!,
+                    style: const TextStyle(color: Colors.red, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ElevatedButton(
+                onPressed: _busy ? null : _verifyAndContinue,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2DC867),
+                  foregroundColor: Colors.white,
+                  minimumSize: const Size.fromHeight(52),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                child: Text(_busy ? 'Verifying...' : widget.flow == 'signup' ? 'Verify & Create Account' : 'Verify OTP'),
+              ),
+              const SizedBox(height: 12),
+              TextButton(
+                onPressed: (_busy || !_canResend) ? null : _resendCode,
+                child: Text(_resendLabel),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class PasswordResetInstructionsScreen extends StatelessWidget {
+  final String email;
+
+  const PasswordResetInstructionsScreen({super.key, required this.email});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Icon(Icons.mark_email_unread_outlined, size: 72, color: Color(0xFF2DC867)),
+              const SizedBox(height: 20),
+              const Text(
+                'Password reset link sent',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'A secure password reset email has been sent to $email. Open it and follow the instructions to create a new password.',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.grey),
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton(
+                onPressed: () {
+                  Navigator.of(context).popUntil((route) => route.isFirst);
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2DC867),
+                  foregroundColor: Colors.white,
+                  minimumSize: const Size.fromHeight(52),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                child: const Text('Back to login'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 TextField _field(TextEditingController controller, String label, IconData icon, {bool obscure = false, TextInputType? keyboard, int? maxLength}) => TextField(
@@ -1096,6 +1577,326 @@ class _AuthFormScaffold extends StatelessWidget {
   ]))))));
 }
 
+class ProfileScreen extends StatefulWidget {
+  const ProfileScreen({super.key});
+
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> {
+  final _emailController = TextEditingController();
+  final _phoneController = TextEditingController();
+  final _currentPasswordController = TextEditingController();
+  final _newPasswordController = TextEditingController();
+  final _confirmPasswordController = TextEditingController();
+  bool _busy = false;
+  String? _message;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadUserProfile();
+  }
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _phoneController.dispose();
+    _currentPasswordController.dispose();
+    _newPasswordController.dispose();
+    _confirmPasswordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadUserProfile() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    _emailController.text = user.email ?? '';
+    final phoneValue = await FirebaseDatabase.instance
+        .ref('users/${user.uid}/phone')
+        .get();
+    if (mounted) {
+      _phoneController.text = phoneValue.value?.toString() ?? '';
+    }
+  }
+
+  Future<void> _saveProfile() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      setState(() => _message = 'You need to be signed in to update your profile.');
+      return;
+    }
+
+    final email = _emailController.text.trim();
+    final phone = _phoneController.text.trim();
+    final newPassword = _newPasswordController.text;
+    final confirmPassword = _confirmPasswordController.text;
+
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      setState(() => _message = 'Enter a valid email address.');
+      return;
+    }
+
+    if (!RegExp(r'^09\d{9}$').hasMatch(phone)) {
+      setState(() => _message = 'Phone number must be 11 digits and start with 09.');
+      return;
+    }
+
+    if ((newPassword.isNotEmpty || confirmPassword.isNotEmpty) && newPassword.length < 6) {
+      setState(() => _message = 'New password must be at least 6 characters.');
+      return;
+    }
+
+    if (newPassword != confirmPassword) {
+      setState(() => _message = 'New password and confirm password must match.');
+      return;
+    }
+
+    if ((email != user.email || newPassword.isNotEmpty) && _currentPasswordController.text.trim().isEmpty) {
+      setState(() => _message = 'Enter your current password to update email or password.');
+      return;
+    }
+
+    setState(() { _busy = true; _message = null; });
+    try {
+      if (email != user.email || newPassword.isNotEmpty) {
+        final credential = EmailAuthProvider.credential(
+          email: user.email ?? email,
+          password: _currentPasswordController.text.trim(),
+        );
+        await user.reauthenticateWithCredential(credential);
+      }
+
+      if (email != user.email) {
+        await user.verifyBeforeUpdateEmail(email);
+      }
+
+      if (newPassword.isNotEmpty) {
+        await user.updatePassword(newPassword);
+      }
+
+      await FirebaseDatabase.instance.ref('users/${user.uid}').update({
+        'email': email,
+        'phone': phone,
+      });
+
+      await user.reload();
+
+      if (mounted) {
+        setState(() {
+          _message = 'Profile updated successfully.';
+          _currentPasswordController.clear();
+          _newPasswordController.clear();
+          _confirmPasswordController.clear();
+        });
+      }
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        setState(() => _message = e.message ?? 'Could not update your profile.');
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => _message = 'Could not update your profile.');
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _signOut() async {
+    await FirebaseAuth.instance.signOut();
+    if (mounted) Navigator.of(context).pop();
+  }
+
+  Future<void> _requestDeleteAccount() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || user.email == null || user.email!.isEmpty) {
+      setState(() => _message = 'You need to be signed in to delete your account.');
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete account?'),
+        content: const Text(
+          'This will schedule account deletion in 7 days. A confirmation email will be sent to your registered email address.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Continue', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    setState(() { _busy = true; _message = null; });
+    try {
+      final sent = await EmailOTP.sendOTP(email: user.email!);
+      if (!sent) {
+        throw Exception(EmailOTP.lastError ?? 'Could not send the confirmation email.');
+      }
+      if (mounted) {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => OtpVerificationScreen(
+              email: user.email!,
+              flow: 'delete',
+              onDeleteConfirmed: () {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Account deletion scheduled. You can still use the app until the 7-day period ends.')),
+                );
+              },
+            ),
+          ),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => _message = 'Could not send the confirmation email. Please try again.');
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Profile'),
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black,
+        elevation: 0,
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'Edit your account details',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Changing the email address sends a verification email to the new address before it becomes active.',
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+              const SizedBox(height: 24),
+              TextField(
+                controller: _emailController,
+                keyboardType: TextInputType.emailAddress,
+                decoration: const InputDecoration(
+                  labelText: 'Email',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.email_outlined),
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _phoneController,
+                keyboardType: TextInputType.phone,
+                maxLength: 11,
+                decoration: const InputDecoration(
+                  labelText: 'Phone number',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.phone_outlined),
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _currentPasswordController,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Current password',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.lock_outline),
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _newPasswordController,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'New password',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.lock_reset_outlined),
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _confirmPasswordController,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Confirm new password',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.lock_reset_outlined),
+                ),
+              ),
+              const SizedBox(height: 24),
+              if (_message != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Text(
+                    _message!,
+                    style: TextStyle(
+                      color: _message!.contains('success') ? Colors.green : Colors.red,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ElevatedButton(
+                onPressed: _busy ? null : _saveProfile,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2DC867),
+                  foregroundColor: Colors.white,
+                  minimumSize: const Size.fromHeight(52),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                child: Text(_busy ? 'Saving...' : 'Save Changes'),
+              ),
+              const SizedBox(height: 16),
+              OutlinedButton.icon(
+                onPressed: _signOut,
+                icon: const Icon(Icons.logout_outlined),
+                label: const Text('Sign out'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.black87,
+                  minimumSize: const Size.fromHeight(52),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                ),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: _busy ? null : _requestDeleteAccount,
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('Delete account'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.red,
+                  side: const BorderSide(color: Colors.red),
+                  minimumSize: const Size.fromHeight(52),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class HistoricalData {
   final DateTime timestamp;
   final double pH;
@@ -1103,6 +1904,8 @@ class HistoricalData {
   final String waterLevel;
   final double tds;
   final int? batchNumber;
+  final GrowBedReading? bed1;
+  final GrowBedReading? bed2;
 
   HistoricalData({
     required this.timestamp,
@@ -1111,6 +1914,8 @@ class HistoricalData {
     required this.waterLevel,
     required this.tds,
     this.batchNumber,
+    this.bed1,
+    this.bed2,
   });
 }
 
@@ -1135,6 +1940,35 @@ class CloudHistory {
   const CloudHistory({required this.runs, required this.logs});
 }
 
+DateTime? _parseFirebaseTimestamp(dynamic value) {
+  if (value is num) {
+    return DateTime.fromMillisecondsSinceEpoch(value.toInt(), isUtc: true);
+  }
+  if (value is String) {
+    return DateTime.tryParse(value)?.toUtc();
+  }
+  return null;
+}
+
+GrowBedReading? _decodeBedData(dynamic value) {
+  if (value == null) return null;
+  if (value is GrowBedReading) return value;
+  if (value is Map) {
+    return GrowBedReading.fromMap(Map<String, dynamic>.from(value));
+  }
+  if (value is String) {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(trimmed);
+      if (decoded is Map) {
+        return GrowBedReading.fromMap(Map<String, dynamic>.from(decoded));
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
 Future<CloudHistory> downloadCloudHistory() async {
   final user = FirebaseAuth.instance.currentUser;
   if (user == null) return const CloudHistory(runs: [], logs: []);
@@ -1154,8 +1988,8 @@ Future<CloudHistory> downloadCloudHistory() async {
     for (final raw in runsValue.values) {
       if (raw is! Map) continue;
       final map = Map<String, dynamic>.from(raw);
-      final start = DateTime.tryParse('${map['startDate'] ?? ''}');
-      final end = DateTime.tryParse('${map['endDate'] ?? ''}');
+      final start = _parseFirebaseTimestamp(map['startDate']);
+      final end = _parseFirebaseTimestamp(map['endDate']);
       final batch = int.tryParse('${map['batchNumber'] ?? ''}');
       final days = int.tryParse('${map['totalDays'] ?? ''}');
       if (start != null && end != null && batch != null && days != null) {
@@ -1173,7 +2007,7 @@ Future<CloudHistory> downloadCloudHistory() async {
       for (final raw in batchLogs.values) {
         if (raw is! Map) continue;
         final map = Map<String, dynamic>.from(raw);
-        final timestamp = DateTime.tryParse('${map['timestamp'] ?? ''}');
+        final timestamp = _parseFirebaseTimestamp(map['timestamp']);
         if (timestamp == null) continue;
         logs.add(HistoricalData(
           timestamp: timestamp,
@@ -1182,6 +2016,8 @@ Future<CloudHistory> downloadCloudHistory() async {
           waterLevel: '${map['waterLevel'] ?? 'Needs water'}',
           tds: double.tryParse('${map['tds'] ?? 0}') ?? 0,
           batchNumber: int.tryParse('${map['batchNumber'] ?? batch ?? 0}'),
+          bed1: _decodeBedData(map['bed1']),
+          bed2: _decodeBedData(map['bed2']),
         ));
       }
     }
@@ -1198,12 +2034,14 @@ Future<void> uploadHistoricalLog(HistoricalData snapshot) async {
   final batch = snapshot.batchNumber ?? 0;
   final key = snapshot.timestamp.toUtc().toIso8601String().replaceAll(RegExp(r'[^0-9A-Za-z]'), '_');
   await FirebaseDatabase.instance.ref('users/${user.uid}/plantingLogs/$batch/$key').set({
-    'timestamp': snapshot.timestamp.toUtc().toIso8601String(),
+    'timestamp': ServerValue.timestamp,
     'pH': snapshot.pH,
     'temperature': snapshot.temperature,
     'waterLevel': snapshot.waterLevel,
     'tds': snapshot.tds,
     'batchNumber': snapshot.batchNumber,
+    'bed1': snapshot.bed1?.toMap(),
+    'bed2': snapshot.bed2?.toMap(),
   });
 }
 
@@ -1212,8 +2050,8 @@ Future<void> uploadPlantingRecord(PlantingRecord record, List<HistoricalData> lo
   if (user == null) return;
   await FirebaseDatabase.instance.ref('users/${user.uid}/plantingRuns/${record.batchNumber}').set({
     'batchNumber': record.batchNumber,
-    'startDate': record.startDate.toUtc().toIso8601String(),
-    'endDate': record.endDate.toUtc().toIso8601String(),
+    'startDate': ServerValue.timestamp,
+    'endDate': ServerValue.timestamp,
     'totalDays': record.totalDays,
   });
   for (final log in logs) {
@@ -1792,7 +2630,7 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
   }
 
   void _startPlanting() async {
-    final now = DateTime.now();
+    final now = await getServerNow();
     final batchNumber = _pastPlantingRuns.length + 1;
     await DatabaseHelper.instance.saveActiveSession(now, batchNumber);
 
@@ -1813,7 +2651,7 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
       FlutterBackgroundService().invoke('stopService');
     }
     
-    final now = DateTime.now();
+    final now = await getServerNow();
     int totalDays = (now.difference(_plantingStartDate!).inDays + 1).clamp(1, 999999);
 
     final newRecord = PlantingRecord(
@@ -1947,6 +2785,22 @@ class StartPlantingScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black,
+        elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.person_outline),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const ProfileScreen()),
+              );
+            },
+          ),
+        ],
+      ),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 32.0),
@@ -2080,11 +2934,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   };
 
   String _lastValidWaterStatus = "low";
+  DateTime? _serverNow;
 
   StreamSubscription? _telemetrySub;
   StreamSubscription? _snapshotSub;
   StreamSubscription? _firebaseSub;
   Timer? _connectionTimer;
+  Timer? _offlinePromptTimer;
+  bool _wifiPromptShown = false;
   DateTime? _lastDeviceHeartbeat;
   final Map<String, bool> _actuatorBusy = {};
   final Map<String, bool> _pendingActuatorStates = {};
@@ -2110,8 +2967,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _loadStoredLogsAndSettings();
     _subscribeToFirebase();
     _subscribeToBackgroundUpdates();
+    unawaited(_refreshServerTime());
     _connectionTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (mounted) setState(_updateConnectionStatus);
+      if (mounted) {
+        setState(_updateConnectionStatus);
+        if (!_wifiPromptShown && _connectionStatus != 'Connected') {
+          _offlinePromptTimer ??= Timer(const Duration(seconds: 0), () {
+            if (mounted) _showWifiSetupDialog();
+          });
+        }
+      }
     });
   }
 
@@ -2121,6 +2986,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _snapshotSub?.cancel();
     _firebaseSub?.cancel();
     _connectionTimer?.cancel();
+    _offlinePromptTimer?.cancel();
     _ipController.dispose();
     _wifiSsidController.dispose();
     _wifiPasswordController.dispose();
@@ -2211,6 +3077,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     }
   }
 
+  Future<void> _refreshServerTime() async {
+    final now = await getServerNow();
+    if (mounted) {
+      setState(() => _serverNow = now);
+    }
+  }
+
   void _updateConnectionStatus() {
     _esp32Connected = _esp32Connected && _hasFreshDeviceHeartbeat;
     _connectionStatus = _firebaseConnected && _esp32Connected
@@ -2288,6 +3161,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             temperature: event['temperature'],
             waterLevel: event['waterLevel'],
             tds: (event['tds'] as num?)?.toDouble() ?? 0.0,
+            bed1: _decodeBedData(event['bed1']),
+            bed2: _decodeBedData(event['bed2']),
           );
           setState(() {
             _historyLogs.insert(0, newLog);
@@ -2407,6 +3282,48 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     }
   }
 
+  void _showWifiSetupDialog() {
+    if (_wifiPromptShown || !mounted) return;
+    _wifiPromptShown = true;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Connect the ESP32 to Wi-Fi'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('The ESP32 is offline. Set up the Wi-Fi details below to reconnect it.'),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _wifiSsidController,
+              decoration: const InputDecoration(labelText: 'Wi-Fi SSID', border: OutlineInputBorder()),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _wifiPasswordController,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'Wi-Fi Password', border: OutlineInputBorder()),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Later'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _connectAndProvisionWifi();
+            },
+            child: const Text('Connect'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _connectAndProvisionWifi() async {
     final ssid = _wifiSsidController.text.trim();
     final password = _wifiPasswordController.text;
@@ -2444,6 +3361,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     ];
 
     return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black,
+        elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.person_outline),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const ProfileScreen()),
+              );
+            },
+          ),
+        ],
+      ),
       body: SafeArea(child: screens[_currentIndex]),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _currentIndex,
@@ -2473,7 +3406,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     final isBed1Warning = _bed1.ph < _minPhThreshold || _bed1.ph > _maxPhThreshold;
     final isBed2Warning = _bed2.ph < _minPhThreshold || _bed2.ph > _maxPhThreshold;
     final hasPhWarning = isBed1Warning || isBed2Warning;
-    final currentDayCount = _getElapsedPlantingDay(DateTime.now());
+    final currentDayCount = _getElapsedPlantingDay(_serverNow ?? DateTime.now());
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24.0),
@@ -3202,8 +4135,12 @@ class SnapshotDetailScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    bool isWaterFull = data.waterLevel == "Water full";
-    bool isPhOptimal = data.pH >= minPh && data.pH <= maxPh;
+    final bed1 = data.bed1 ?? GrowBedReading.empty();
+    final bed2 = data.bed2 ?? GrowBedReading.empty();
+    final bed1WaterFull = bed1.waterFull;
+    final bed2WaterFull = bed2.waterFull;
+    final bed1PhOptimal = bed1.ph >= minPh && bed1.ph <= maxPh;
+    final bed2PhOptimal = bed2.ph >= minPh && bed2.ph <= maxPh;
 
     return Scaffold(
       appBar: AppBar(
@@ -3230,20 +4167,20 @@ class SnapshotDetailScreen extends StatelessWidget {
 
             const Text('Grow Bed 1 (Historical Metrics)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
             const SizedBox(height: 12),
-            _buildStaticGrid(isWaterFull, isPhOptimal),
+            _buildStaticGrid(bed1, bed1WaterFull, bed1PhOptimal),
             
             const SizedBox(height: 24),
             const Text('Grow Bed 2 (Historical Metrics)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
             const SizedBox(height: 12),
-            _buildStaticGrid(isWaterFull, isPhOptimal),
+            _buildStaticGrid(bed2, bed2WaterFull, bed2PhOptimal),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildStaticGrid(bool isWaterFull, bool isPhOptimal) {
-    bool isTdsOptimal = data.tds < 900;
+  Widget _buildStaticGrid(GrowBedReading bed, bool isWaterFull, bool isPhOptimal) {
+    final isTdsOptimal = bed.tds < 900;
 
     return Column(
       children: [
@@ -3252,7 +4189,7 @@ class SnapshotDetailScreen extends StatelessWidget {
             Expanded(
               child: _buildStaticCard(
                 'ACIDITY (PH)', 
-                '${data.pH.toStringAsFixed(2)} pH', 
+                '${bed.ph.toStringAsFixed(2)} pH', 
                 isPhOptimal ? 'Normal' : 'Unstable',
                 bgOverride: isPhOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
                 textOverride: isPhOptimal ? Colors.green : Colors.orange,
@@ -3262,7 +4199,7 @@ class SnapshotDetailScreen extends StatelessWidget {
             Expanded(
               child: _buildStaticCard(
                 'TDS', 
-                '${data.tds.toStringAsFixed(0)} PPM', 
+                '${bed.tds.toStringAsFixed(0)} PPM', 
                 isTdsOptimal ? 'Optimal' : 'Warning',
                 bgOverride: isTdsOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
                 textOverride: isTdsOptimal ? Colors.green : Colors.orange,
@@ -3273,12 +4210,12 @@ class SnapshotDetailScreen extends StatelessWidget {
         const SizedBox(height: 16),
         Row(
           children: [
-            Expanded(child: _buildStaticCard('WATER TEMP', data.temperature, 'Log Data')),
+            Expanded(child: _buildStaticCard('WATER TEMP', '${bed.temperature.toStringAsFixed(1)}°C', 'Log Data')),
             const SizedBox(width: 16),
             Expanded(
               child: _buildStaticCard(
                 'GROW BED WATER LEVEL',
-                data.waterLevel,
+                isWaterFull ? 'Water Full' : 'Needs Water',
                 isWaterFull ? 'Optimal' : 'Warning',
                 bgOverride: isWaterFull ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
                 textOverride: isWaterFull ? Colors.green : Colors.orange,
