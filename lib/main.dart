@@ -11,10 +11,13 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:wifi_iot/wifi_iot.dart';
+import 'package:wifi_scan/wifi_scan.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firebase_options.dart';
+import 'package:flutter/services.dart';
 
 bool get _supportsBackgroundService =>
   !kIsWeb &&
@@ -22,18 +25,37 @@ bool get _supportsBackgroundService =>
   (defaultTargetPlatform == TargetPlatform.android ||
     defaultTargetPlatform == TargetPlatform.iOS);
 
+int? _cachedServerTimeOffsetMs;
+DateTime? _serverClockAnchorUtc;
+Stopwatch? _serverClockStopwatch;
+
+DateTime _philippineTime(DateTime timestamp) =>
+    timestamp.toUtc().add(const Duration(hours: 8));
+
 Future<DateTime> getServerNow() async {
   try {
     final snapshot = await FirebaseDatabase.instance
         .ref('.info/serverTimeOffset')
         .get()
         .timeout(const Duration(seconds: 2));
-    final offset = snapshot.value is num ? (snapshot.value as num).toInt() : 0;
-    final nowUtc = DateTime.now().toUtc().add(Duration(milliseconds: offset));
-    return nowUtc.add(const Duration(hours: 8));
+    if (snapshot.value is num) {
+      _cachedServerTimeOffsetMs = (snapshot.value as num).round();
+      _serverClockAnchorUtc = DateTime.now()
+          .toUtc()
+          .add(Duration(milliseconds: _cachedServerTimeOffsetMs!));
+      _serverClockStopwatch = Stopwatch()..start();
+      return _serverClockAnchorUtc!;
+    }
   } catch (_) {
-    return DateTime.now();
+    // Continue from the monotonic server-time anchor when offline.
   }
+
+  if (_serverClockAnchorUtc != null && _serverClockStopwatch != null) {
+    return _serverClockAnchorUtc!.add(_serverClockStopwatch!.elapsed);
+  }
+  return DateTime.now().toUtc().add(
+    Duration(milliseconds: _cachedServerTimeOffsetMs ?? 0),
+  );
 }
 
 // --- LOCAL DATABASE SERVICE ---
@@ -60,7 +82,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 6,
+      version: 8,
       onCreate: _createDB,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -94,6 +116,12 @@ class DatabaseHelper {
           await db.execute('ALTER TABLE historical_logs ADD COLUMN bed1 TEXT');
           await db.execute('ALTER TABLE historical_logs ADD COLUMN bed2 TEXT');
         }
+        if (oldVersion < 7) {
+          await db.execute('ALTER TABLE historical_logs ADD COLUMN cloudSynced INTEGER NOT NULL DEFAULT 0');
+        }
+        if (oldVersion < 8) {
+          await db.execute('ALTER TABLE planting_history ADD COLUMN cloudSynced INTEGER NOT NULL DEFAULT 0');
+        }
       },
     );
   }
@@ -109,7 +137,8 @@ class DatabaseHelper {
         tds REAL NOT NULL DEFAULT 0.0,
         batchNumber INTEGER,
         bed1 TEXT,
-        bed2 TEXT
+        bed2 TEXT,
+        cloudSynced INTEGER NOT NULL DEFAULT 0
       )
     ''');
 
@@ -118,7 +147,8 @@ class DatabaseHelper {
         batchNumber INTEGER PRIMARY KEY,
         startDate TEXT NOT NULL,
         endDate TEXT NOT NULL,
-        totalDays INTEGER NOT NULL
+        totalDays INTEGER NOT NULL,
+        cloudSynced INTEGER NOT NULL DEFAULT 0
       )
     ''');
 
@@ -183,7 +213,7 @@ class DatabaseHelper {
   }
 
   // Historical Logs Queries
-  Future<void> insertLog(HistoricalData log) async {
+  Future<void> insertLog(HistoricalData log, {bool cloudSynced = false}) async {
     final db = await instance.database;
     if (db == null) return;
     await db.insert('historical_logs', {
@@ -195,43 +225,60 @@ class DatabaseHelper {
       'batchNumber': log.batchNumber,
       'bed1': log.bed1 != null ? jsonEncode(log.bed1!.toMap()) : null,
       'bed2': log.bed2 != null ? jsonEncode(log.bed2!.toMap()) : null,
+      'cloudSynced': cloudSynced ? 1 : 0,
     });
+  }
+
+  HistoricalData _logFromRow(Map<String, Object?> row) => HistoricalData(
+        timestamp: DateTime.parse(row['timestamp'] as String),
+        pH: (row['pH'] as num).toDouble(),
+        temperature: row['temperature'] as String,
+        waterLevel: row['waterLevel'] as String,
+        tds: (row['tds'] as num?)?.toDouble() ?? 0.0,
+        batchNumber: row['batchNumber'] as int?,
+        bed1: _decodeBedData(row['bed1'] as String?),
+        bed2: _decodeBedData(row['bed2'] as String?),
+      );
+
+  Future<HistoricalData?> getNextUnsyncedLog() async {
+    final db = await instance.database;
+    if (db == null) return null;
+    final result = await db.query(
+      'historical_logs',
+      where: 'cloudSynced = 0',
+      orderBy: 'timestamp ASC',
+      limit: 1,
+    );
+    return result.isEmpty ? null : _logFromRow(result.first);
+  }
+
+  Future<void> markLogCloudSynced(DateTime timestamp) async {
+    final db = await instance.database;
+    if (db == null) return;
+    await db.update(
+      'historical_logs',
+      {'cloudSynced': 1},
+      where: 'timestamp = ?',
+      whereArgs: [timestamp.toIso8601String()],
+    );
   }
 
   Future<List<HistoricalData>> getLogs() async {
     final db = await instance.database;
     if (db == null) return [];
     final result = await db.query('historical_logs', orderBy: 'timestamp DESC');
-    return result.map((json) => HistoricalData(
-      timestamp: DateTime.parse(json['timestamp'] as String),
-      pH: (json['pH'] as num).toDouble(),
-      temperature: json['temperature'] as String,
-      waterLevel: json['waterLevel'] as String,
-      tds: (json['tds'] as num?)?.toDouble() ?? 0.0,
-      batchNumber: json['batchNumber'] as int?,
-      bed1: _decodeBedData(json['bed1'] as String?),
-      bed2: _decodeBedData(json['bed2'] as String?),
-    )).toList();
+    return result.map(_logFromRow).toList();
   }
 
   Future<List<HistoricalData>> getLogsForBatch(int batchNumber) async {
     final db = await instance.database;
     if (db == null) return [];
     final result = await db.query('historical_logs', where: 'batchNumber = ?', whereArgs: [batchNumber], orderBy: 'timestamp DESC');
-    return result.map((json) => HistoricalData(
-      timestamp: DateTime.parse(json['timestamp'] as String),
-      pH: (json['pH'] as num).toDouble(),
-      temperature: json['temperature'] as String,
-      waterLevel: json['waterLevel'] as String,
-      tds: (json['tds'] as num?)?.toDouble() ?? 0.0,
-      batchNumber: json['batchNumber'] as int?,
-      bed1: _decodeBedData(json['bed1'] as String?),
-      bed2: _decodeBedData(json['bed2'] as String?),
-    )).toList();
+    return result.map(_logFromRow).toList();
   }
 
   // Planting Runs History Queries
-  Future<void> insertPlantingRecord(PlantingRecord record) async {
+  Future<void> insertPlantingRecord(PlantingRecord record, {bool cloudSynced = false}) async {
     final db = await instance.database;
     if (db == null) return;
     await db.insert('planting_history', {
@@ -239,7 +286,38 @@ class DatabaseHelper {
       'startDate': record.startDate.toIso8601String(),
       'endDate': record.endDate.toIso8601String(),
       'totalDays': record.totalDays,
+      'cloudSynced': cloudSynced ? 1 : 0,
     });
+  }
+
+  Future<PlantingRecord?> getNextUnsyncedPlantingRecord() async {
+    final db = await instance.database;
+    if (db == null) return null;
+    final result = await db.query(
+      'planting_history',
+      where: 'cloudSynced = 0',
+      orderBy: 'batchNumber ASC',
+      limit: 1,
+    );
+    if (result.isEmpty) return null;
+    final row = result.first;
+    return PlantingRecord(
+      batchNumber: row['batchNumber'] as int,
+      startDate: DateTime.parse(row['startDate'] as String),
+      endDate: DateTime.parse(row['endDate'] as String),
+      totalDays: row['totalDays'] as int,
+    );
+  }
+
+  Future<void> markPlantingRecordCloudSynced(int batchNumber) async {
+    final db = await instance.database;
+    if (db == null) return;
+    await db.update(
+      'planting_history',
+      {'cloudSynced': 1},
+      where: 'batchNumber = ?',
+      whereArgs: [batchNumber],
+    );
   }
 
   Future<List<PlantingRecord>> getPlantingHistory() async {
@@ -594,6 +672,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   bool isConnected = false;
   bool firebaseConnected = false;
   bool backgroundActive = false;
+  bool lastGrowLight = false;
   GrowBedReading lastBed1 = GrowBedReading.empty();
   GrowBedReading lastBed2 = GrowBedReading.empty();
 
@@ -618,6 +697,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     final activeSession = await DatabaseHelper.instance.getActiveSession();
     activeBatchNumber = await DatabaseHelper.instance.getActiveBatchNumber();
     isPlantingActive = activeSession != null;
+    backgroundActive = isPlantingActive;
 
     final logs = await DatabaseHelper.instance.getLogs();
     if (logs.isNotEmpty) {
@@ -634,10 +714,11 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     }
   } catch (_) {}
 
-  service.on('setPlantingState').listen((event) {
+  service.on('setPlantingState').listen((event) async {
     if (event != null && event['active'] != null) {
       isPlantingActive = event['active'] as bool;
-      backgroundActive = isPlantingActive;
+        backgroundActive = isPlantingActive || await hasPendingCloudRecords();
+      if (!backgroundActive) service.stopSelf();
       if (isPlantingActive) {
         DatabaseHelper.instance.getActiveBatchNumber().then((batchNumber) {
           activeBatchNumber = batchNumber;
@@ -716,12 +797,17 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     final bed2Temp = bed2['temp'] is num ? (bed2['temp'] as num).toDouble() : 25.0;
     final bed2Tds = bed2['tds'] is num ? (bed2['tds'] as num).toDouble() : 0.0;
     final bed2Water = bed2['water'] is String ? bed2['water'] as String : 'low';
-    final growLightFlag = data['grow_light'] ?? data['growLight'] ?? false;
+    final actuators = Map<String, dynamic>.from(data['actuators'] is Map ? data['actuators'] as Map : data);
+    final growLightFlag = actuators['growLight'] ?? data['grow_light'] ?? data['growLight'] ?? false;
 
     return {
       'bed1': bed1,
       'bed2': bed2,
       'growLight': growLightFlag,
+      'actuators': {
+        for (final name in const ['waterPump1', 'phUp1', 'phDown1', 'nutrient1', 'waterPump2', 'phUp2', 'phDown2', 'nutrient2'])
+          name: actuators[name] ?? false,
+      },
       'ph': bed2Ph,
       'temp': '${bed2Temp.toStringAsFixed(1)}°C',
       'water': bed2Water,
@@ -735,6 +821,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     isPolling = true;
 
     bool found = false;
+    String telemetrySource = 'offline';
     String cleanTargetIp = sanitizeHost(targetIp);
 
     // 1. Fast attempt to primary target IP
@@ -747,6 +834,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
       lastBed1 = bed1;
       lastBed2 = bed2;
+      lastGrowLight = HydrodeckTelemetry._readBoolLike({'growLight': normalized['growLight']}, const ['growLight']);
       lastPh = bed2.ph;
       lastTemp = '${bed2.temperature.toStringAsFixed(1)}°C';
       lastTds = bed2.tds;
@@ -762,17 +850,21 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         'bed1': bed1.toMap(),
         'bed2': bed2.toMap(),
         'growLight': normalized['growLight'] ?? false,
+        'actuators': normalized['actuators'],
+        'source': 'local',
       });
 
       targetIp = cleanTargetIp;
       isConnected = true;
       found = true;
+      telemetrySource = 'local';
     }
 
     // 2. Concurrently probe fallback local hosts if primary target failed
     if (!found) {
       final List<String> fallbackHosts = [
         "hydrodeck.local",
+        "192.168.4.1",
         "192.168.1.100",
         "192.168.0.100",
         "10.0.2.2"
@@ -791,6 +883,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
           lastBed1 = bed1;
           lastBed2 = bed2;
+          lastGrowLight = HydrodeckTelemetry._readBoolLike({'growLight': normalized['growLight']}, const ['growLight']);
           lastPh = bed2.ph;
           lastTemp = '${bed2.temperature.toStringAsFixed(1)}°C';
           lastTds = bed2.tds;
@@ -806,12 +899,15 @@ void onBackgroundServiceStart(ServiceInstance service) async {
             'bed1': bed1.toMap(),
             'bed2': bed2.toMap(),
             'growLight': normalized['growLight'] ?? false,
+            'actuators': normalized['actuators'],
+            'source': 'local',
           });
 
           targetIp = host;
           DatabaseHelper.instance.saveActiveIp(targetIp);
           isConnected = true;
           found = true;
+          telemetrySource = 'local';
           break;
         }
       }
@@ -832,6 +928,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
           final telemetry = HydrodeckTelemetry.fromJson(data);
           lastBed1 = telemetry.bed1;
           lastBed2 = telemetry.bed2;
+          lastGrowLight = telemetry.growLightOn;
           lastPh = lastBed2.ph;
           lastTemp = '${lastBed2.temperature.toStringAsFixed(1)}°C';
           lastTds = lastBed2.tds;
@@ -849,12 +946,14 @@ void onBackgroundServiceStart(ServiceInstance service) async {
               data['firebaseReady'] == true &&
               heartbeatFresh;
           found = true;
+            telemetrySource = 'firebase';
         }
       } catch (_) {}
     }
 
     if (!found) {
       isConnected = false;
+      telemetrySource = 'offline';
     }
 
     bool isCritical = (lastPh < minPhThreshold || lastPh > maxPhThreshold);
@@ -884,6 +983,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     service.invoke('telemetryUpdate', {
       'isConnected': isConnected,
       'firebaseConnected': firebaseConnected,
+      'source': telemetrySource,
       'ip': targetIp,
       'ph': lastPh,
       'temp': lastTemp,
@@ -891,41 +991,78 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       'tds': lastTds,
       'bed1': lastBed1.toMap(),
       'bed2': lastBed2.toMap(),
-      'growLight': false,
+      'growLight': lastGrowLight,
     });
 
     isPolling = false;
   });
 
-  Timer.periodic(const Duration(seconds: 60), (timer) async {
-    if (!backgroundActive || !isPlantingActive) return;
+  String? lastSnapshotMinute;
+  var minuteTaskScheduled = false;
 
-    final serverNow = await getServerNow();
-    final snapshot = HistoricalData(
-      timestamp: serverNow,
-      pH: lastPh,
-      temperature: lastTemp,
-      waterLevel: lastWater == "full" ? "Water full" : "Needs water",
-      tds: lastTds,
-      batchNumber: activeBatchNumber,
-      bed1: lastBed1,
-      bed2: lastBed2,
-    );
-
+  Future<void> scheduleNextMinuteTask() async {
+    if (minuteTaskScheduled || !backgroundActive) return;
+    minuteTaskScheduled = true;
     try {
-      await DatabaseHelper.instance.insertLog(snapshot);
-      await uploadHistoricalLog(snapshot);
-      service.invoke('newSnapshotLogged', {
-        'timestamp': snapshot.timestamp.toIso8601String(),
-        'pH': snapshot.pH,
-        'temperature': snapshot.temperature,
-        'waterLevel': snapshot.waterLevel,
-        'tds': snapshot.tds,
-        'bed1': snapshot.bed1?.toMap(),
-        'bed2': snapshot.bed2?.toMap(),
+      final now = await getServerNow();
+        final philippinesNow = _philippineTime(now);
+        final nextBoundary = DateTime.utc(
+          philippinesNow.year,
+          philippinesNow.month,
+          philippinesNow.day,
+          philippinesNow.hour,
+          philippinesNow.minute,
+        )
+          .add(const Duration(minutes: 1));
+        final wait = nextBoundary.difference(philippinesNow);
+      Timer(wait.isNegative ? Duration.zero : wait, () async {
+        try {
+          if (!backgroundActive) return;
+          final serverNow = await getServerNow();
+          final minuteKey = _minuteBucketKey(serverNow);
+          if (isPlantingActive && minuteKey != lastSnapshotMinute) {
+            lastSnapshotMinute = minuteKey;
+            final snapshot = HistoricalData(
+              timestamp: serverNow,
+              pH: lastPh,
+              temperature: lastTemp,
+              waterLevel: lastWater == 'full' ? 'Water full' : 'Needs water',
+              tds: lastTds,
+              batchNumber: activeBatchNumber,
+              bed1: lastBed1,
+              bed2: lastBed2,
+            );
+            await DatabaseHelper.instance.insertLog(snapshot);
+            service.invoke('newSnapshotLogged', {
+              'timestamp': snapshot.timestamp.toIso8601String(),
+              'pH': snapshot.pH,
+              'temperature': snapshot.temperature,
+              'waterLevel': snapshot.waterLevel,
+              'tds': snapshot.tds,
+              'batchNumber': snapshot.batchNumber,
+              'bed1': snapshot.bed1?.toMap(),
+              'bed2': snapshot.bed2?.toMap(),
+            });
+          }
+            await uploadNextUnsyncedRecord();
+            if (!isPlantingActive && !await hasPendingCloudRecords()) {
+            backgroundActive = false;
+            service.stopSelf();
+          }
+        } catch (_) {
+          // Local logs remain queued if the network or Firestore is unavailable.
+        } finally {
+          minuteTaskScheduled = false;
+          if (backgroundActive) unawaited(scheduleNextMinuteTask());
+        }
       });
-    } catch (_) {}
-  });
+    } catch (_) {
+      minuteTaskScheduled = false;
+      Timer(const Duration(seconds: 5), () => unawaited(scheduleNextMinuteTask()));
+    }
+  }
+
+  unawaited(scheduleNextMinuteTask());
 }
 
 void main() async {
@@ -936,6 +1073,7 @@ void main() async {
         options: DefaultFirebaseOptions.currentPlatform,
       );
     }
+    FirebaseFirestore.instance.settings = const Settings(persistenceEnabled: true);
   } catch (_) {}
 
   EmailOTP.config(
@@ -945,6 +1083,26 @@ void main() async {
     otpType: OTPType.numeric,
     expiry: 10 * 60 * 1000,
   );
+  EmailOTP.setTemplate(
+    template: '''
+<!doctype html>
+<html lang="en">
+  <body style="margin:0;background:#f5f8f5;font-family:Arial,sans-serif;color:#232323;">
+    <div style="max-width:520px;margin:32px auto;background:#ffffff;border-radius:12px;overflow:hidden;">
+      <div style="padding:24px;background:#2dc867;color:#ffffff;font-size:22px;font-weight:700;">{{appName}}</div>
+      <div style="padding:28px 24px;">
+        <p style="margin:0 0 16px;font-size:16px;">Dear user,</p>
+        <p style="margin:0 0 16px;font-size:16px;">Your One-Time Password (OTP) is:</p>
+        <div style="padding:18px;background:#e8f7ed;border-radius:8px;color:#16783a;text-align:center;font-size:32px;font-weight:700;letter-spacing:6px;">{{otp}}</div>
+        <p style="margin:20px 0 0;color:#666;font-size:13px;">Thank you for using Hydrodeck!</p>
+        <p style="margin:20px 0 0;color:#666;font-size:12px;">This code expires in 10 minutes. If you did not request it, you can ignore this email.</p>
+      </div>
+      <div style="padding:16px 24px;border-top:1px solid #e7ece8;color:#7a7a7a;font-size:12px;">Hydrodeck · {{year}}</div>
+    </div>
+  </body>
+</html>
+''',
+  );
   EmailOTP.setSMTP(
     emailPort: EmailPort.port587,
     secureType: SecureType.tls,
@@ -952,7 +1110,6 @@ void main() async {
     username: 'hydrodecknt@gmail.com',
     password: 'bctm hpcn krjt ffgy',
   );
-
   if (_supportsBackgroundService) await NotificationHelper.init();
   runApp(const HydrodeckApp());
 }
@@ -1018,21 +1175,32 @@ class _AuthGatekeeperState extends State<AuthGatekeeper> {
   bool _loading = true;
   bool _showSignup = true;
   User? _user;
+  StreamSubscription<User?>? _authSubscription;
 
   @override
   void initState() {
     super.initState();
-    _checkSession();
+    _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
+      final lastSignIn = user?.metadata.lastSignInTime;
+      final sessionValid = user != null &&
+          lastSignIn != null &&
+          DateTime.now().difference(lastSignIn).inDays < 30;
+      if (!sessionValid && user != null) {
+        unawaited(FirebaseAuth.instance.signOut());
+      }
+      if (mounted) {
+        setState(() {
+          _user = sessionValid ? user : null;
+          _loading = false;
+        });
+      }
+    });
   }
 
-  Future<void> _checkSession() async {
-    final user = FirebaseAuth.instance.currentUser;
-    final lastSignIn = user?.metadata.lastSignInTime;
-    final sessionValid = user != null &&
-        lastSignIn != null &&
-        DateTime.now().difference(lastSignIn).inDays < 30;
-    if (!sessionValid && user != null) await FirebaseAuth.instance.signOut();
-    if (mounted) setState(() { _user = sessionValid ? user : null; _loading = false; });
+  @override
+  void dispose() {
+    _authSubscription?.cancel();
+    super.dispose();
   }
 
   void _authenticated(User user) {
@@ -1072,12 +1240,28 @@ class _SignupScreenState extends State<SignupScreen> {
 
   Future<void> _signup() async {
     final email = _email.text.trim();
-    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) { setState(() => _error = 'Enter a valid email address.'); return; }
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      setState(() => _error = 'Enter a valid email address.');
+      return;
+    }
     final phone = _phone.text.trim();
-    if (!RegExp(r'^09\d{9}$').hasMatch(phone)) { setState(() => _error = 'Phone number must be 11 digits and start with 09.'); return; }
-    if (_password.text.length < 6) { setState(() => _error = 'Password must be at least 6 characters.'); return; }
-    if (_password.text != _confirm.text) { setState(() => _error = 'Passwords do not match.'); return; }
-    if (_pin.text != '6967') { setState(() => _error = 'The access PIN is incorrect.'); _pin.clear(); return; }
+    if (!RegExp(r'^09\d{9}$').hasMatch(phone)) {
+      setState(() => _error = 'Phone number must be 11 digits and start with 09.');
+      return;
+    }
+    if (_password.text.length < 6) {
+      setState(() => _error = 'Password must be at least 6 characters.');
+      return;
+    }
+    if (_password.text != _confirm.text) {
+      setState(() => _error = 'Passwords do not match.');
+      return;
+    }
+    if (_pin.text != '6967') {
+      setState(() => _error = 'The access PIN is incorrect.');
+      _pin.clear();
+      return;
+    }
 
     setState(() { _busy = true; _error = null; });
     try {
@@ -1410,12 +1594,21 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
           return;
         }
 
-        final scheduledAt = (await getServerNow()).add(const Duration(days: 7));
+        DateTime scheduledAt;
+        try {
+          scheduledAt = (await getServerNow()).add(const Duration(days: 7));
+        } catch (e) {
+          if (mounted) {
+            setState(() => _error = 'Failed to schedule account deletion. Please try again later.');
+          }
+          return;
+        }
         await FirebaseDatabase.instance.ref('users/${user.uid}').update({
           'deleteRequestedAt': ServerValue.timestamp,
           'deleteScheduledAt': scheduledAt.toUtc().toIso8601String(),
           'accountStatus': 'pending_delete',
         });
+        await FirebaseAuth.instance.signOut();
 
         if (mounted) {
           if (widget.onDeleteConfirmed != null) widget.onDeleteConfirmed!();
@@ -1447,7 +1640,7 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.flow == 'signup' ? 'Verify Email' : 'Verify Reset OTP'),
-        backgroundColor: Colors.white,
+        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
         foregroundColor: Colors.black,
         elevation: 0,
       ),
@@ -1491,7 +1684,7 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
               ElevatedButton(
                 onPressed: _busy ? null : _verifyAndContinue,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2DC867),
+                  backgroundColor: Theme.of(context).primaryColor,
                   foregroundColor: Colors.white,
                   minimumSize: const Size.fromHeight(52),
                   shape: RoundedRectangleBorder(
@@ -1564,9 +1757,56 @@ class PasswordResetInstructionsScreen extends StatelessWidget {
   }
 }
 
-TextField _field(TextEditingController controller, String label, IconData icon, {bool obscure = false, TextInputType? keyboard, int? maxLength}) => TextField(
-  controller: controller, obscureText: obscure, keyboardType: keyboard, maxLength: maxLength, decoration: InputDecoration(labelText: label, prefixIcon: Icon(icon), border: OutlineInputBorder(borderRadius: BorderRadius.circular(14))),
-);
+Widget _field(TextEditingController controller, String label, IconData icon, {bool obscure = false, TextInputType? keyboard, int? maxLength}) {
+  if (obscure) {
+    return _PasswordVisibilityField(controller: controller, label: label, icon: icon);
+  }
+  return TextField(
+    controller: controller,
+    keyboardType: keyboard,
+    maxLength: maxLength,
+    decoration: InputDecoration(
+      labelText: label,
+      prefixIcon: Icon(icon),
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+    ),
+  );
+}
+
+class _PasswordVisibilityField extends StatefulWidget {
+  final TextEditingController controller;
+  final String label;
+  final IconData icon;
+
+  const _PasswordVisibilityField({
+    required this.controller,
+    required this.label,
+    required this.icon,
+  });
+
+  @override
+  State<_PasswordVisibilityField> createState() => _PasswordVisibilityFieldState();
+}
+
+class _PasswordVisibilityFieldState extends State<_PasswordVisibilityField> {
+  bool _obscure = true;
+
+  @override
+  Widget build(BuildContext context) => TextField(
+        controller: widget.controller,
+        obscureText: _obscure,
+        decoration: InputDecoration(
+          labelText: widget.label,
+          prefixIcon: Icon(widget.icon),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+          suffixIcon: IconButton(
+            tooltip: _obscure ? 'Show password' : 'Hide password',
+            icon: Icon(_obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+            onPressed: () => setState(() => _obscure = !_obscure),
+          ),
+        ),
+      );
+}
 
 class _AuthFormScaffold extends StatelessWidget {
   final String title, subtitle, actionLabel; final String? error; final bool busy; final List<Widget> fields; final VoidCallback onAction; final Widget footer;
@@ -1706,8 +1946,23 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _signOut() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Sign out?'),
+        content: const Text('Are you sure you want to sign out?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Sign out', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
     await FirebaseAuth.instance.signOut();
-    if (mounted) Navigator.of(context).pop();
+    if (mounted) Navigator.of(context).popUntil((route) => route.isFirst);
   }
 
   Future<void> _requestDeleteAccount() async {
@@ -1813,35 +2068,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 ),
               ),
               const SizedBox(height: 16),
-              TextField(
-                controller: _currentPasswordController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'Current password',
-                  border: OutlineInputBorder(),
-                  prefixIcon: Icon(Icons.lock_outline),
-                ),
-              ),
+              _PasswordVisibilityField(controller: _currentPasswordController, label: 'Current password', icon: Icons.lock_outline),
               const SizedBox(height: 16),
-              TextField(
-                controller: _newPasswordController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'New password',
-                  border: OutlineInputBorder(),
-                  prefixIcon: Icon(Icons.lock_reset_outlined),
-                ),
-              ),
+              _PasswordVisibilityField(controller: _newPasswordController, label: 'New password', icon: Icons.lock_reset_outlined),
               const SizedBox(height: 16),
-              TextField(
-                controller: _confirmPasswordController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'Confirm new password',
-                  border: OutlineInputBorder(),
-                  prefixIcon: Icon(Icons.lock_reset_outlined),
-                ),
-              ),
+              _PasswordVisibilityField(controller: _confirmPasswordController, label: 'Confirm new password', icon: Icons.lock_reset_outlined),
               const SizedBox(height: 24),
               if (_message != null)
                 Padding(
@@ -1941,6 +2172,7 @@ class CloudHistory {
 }
 
 DateTime? _parseFirebaseTimestamp(dynamic value) {
+  if (value is Timestamp) return value.toDate().toUtc();
   if (value is num) {
     return DateTime.fromMillisecondsSinceEpoch(value.toInt(), isUtc: true);
   }
@@ -1948,6 +2180,14 @@ DateTime? _parseFirebaseTimestamp(dynamic value) {
     return DateTime.tryParse(value)?.toUtc();
   }
   return null;
+}
+
+const String _sharedHydrodeckSystemId = 'hydrodeck';
+
+String _minuteBucketKey(DateTime timestamp) {
+  final time = _philippineTime(timestamp);
+  return '${time.year}${time.month.toString().padLeft(2, '0')}${time.day.toString().padLeft(2, '0')}_'
+      '${time.hour.toString().padLeft(2, '0')}${time.minute.toString().padLeft(2, '0')}';
 }
 
 GrowBedReading? _decodeBedData(dynamic value) {
@@ -1970,56 +2210,114 @@ GrowBedReading? _decodeBedData(dynamic value) {
 }
 
 Future<CloudHistory> downloadCloudHistory() async {
-  final user = FirebaseAuth.instance.currentUser;
-  if (user == null) return const CloudHistory(runs: [], logs: []);
-
-  final root = FirebaseDatabase.instance.ref('users/${user.uid}');
-  final snapshots = await Future.wait([
-    root.child('plantingRuns').get(),
-    root.child('plantingLogs').get(),
-  ]).timeout(const Duration(seconds: 4));
-  final runsSnapshot = snapshots[0];
-  final logsSnapshot = snapshots[1];
   final runs = <PlantingRecord>[];
   final logs = <HistoricalData>[];
+  final seenRuns = <int>{};
+  final seenLogs = <String>{};
 
-  final runsValue = runsSnapshot.value;
-  if (runsValue is Map) {
-    for (final raw in runsValue.values) {
-      if (raw is! Map) continue;
-      final map = Map<String, dynamic>.from(raw);
-      final start = _parseFirebaseTimestamp(map['startDate']);
-      final end = _parseFirebaseTimestamp(map['endDate']);
-      final batch = int.tryParse('${map['batchNumber'] ?? ''}');
-      final days = int.tryParse('${map['totalDays'] ?? ''}');
-      if (start != null && end != null && batch != null && days != null) {
-        runs.add(PlantingRecord(batchNumber: batch, startDate: start, endDate: end, totalDays: days));
+  if (FirebaseAuth.instance.currentUser != null) {
+    try {
+      final system = FirebaseFirestore.instance
+          .collection('hydrodeckSystems')
+          .doc(_sharedHydrodeckSystemId);
+      final snapshots = await Future.wait([
+        system.collection('plantingRuns').get(),
+        system.collection('minuteLogs').get(),
+      ]).timeout(const Duration(seconds: 6));
+
+      for (final document in snapshots[0].docs) {
+        final map = document.data();
+        final batch = (map['batchNumber'] as num?)?.toInt() ?? int.tryParse(document.id);
+        final start = _parseFirebaseTimestamp(map['startedAt'] ?? map['startDate']);
+        final end = _parseFirebaseTimestamp(map['endedAt'] ?? map['endDate']);
+        final days = (map['totalDays'] as num?)?.toInt() ?? 1;
+        if (batch != null && start != null && end != null && seenRuns.add(batch)) {
+          runs.add(PlantingRecord(
+            batchNumber: batch,
+            startDate: start,
+            endDate: end,
+            totalDays: days,
+          ));
+        }
       }
-    }
-  }
 
-  final logsValue = logsSnapshot.value;
-  if (logsValue is Map) {
-    for (final batchEntry in logsValue.entries) {
-      final batch = int.tryParse('${batchEntry.key}');
-      final batchLogs = batchEntry.value;
-      if (batchLogs is! Map) continue;
-      for (final raw in batchLogs.values) {
-        if (raw is! Map) continue;
-        final map = Map<String, dynamic>.from(raw);
+      for (final document in snapshots[1].docs) {
+        final map = document.data();
         final timestamp = _parseFirebaseTimestamp(map['timestamp']);
         if (timestamp == null) continue;
+        final batch = (map['batchNumber'] as num?)?.toInt();
+        final dedupeKey = '${batch ?? 0}|${document.id}';
+        if (!seenLogs.add(dedupeKey)) continue;
         logs.add(HistoricalData(
           timestamp: timestamp,
-          pH: double.tryParse('${map['pH'] ?? 0}') ?? 0,
-          temperature: '${map['temperature'] ?? ''}',
-          waterLevel: '${map['waterLevel'] ?? 'Needs water'}',
-          tds: double.tryParse('${map['tds'] ?? 0}') ?? 0,
-          batchNumber: int.tryParse('${map['batchNumber'] ?? batch ?? 0}'),
+          pH: (map['pH'] as num?)?.toDouble() ?? 0,
+          temperature: map['temperature']?.toString() ?? '',
+          waterLevel: map['waterLevel']?.toString() ?? 'Needs water',
+          tds: (map['tds'] as num?)?.toDouble() ?? 0,
+          batchNumber: batch,
           bed1: _decodeBedData(map['bed1']),
           bed2: _decodeBedData(map['bed2']),
         ));
       }
+    } catch (_) {
+      // Keep local history usable while Firestore is unavailable.
+    }
+  }
+
+  final user = FirebaseAuth.instance.currentUser;
+  if (user != null) {
+    try {
+      final legacyRoot = FirebaseDatabase.instance.ref('users/${user.uid}');
+      final snapshots = await Future.wait([
+        legacyRoot.child('plantingRuns').get(),
+        legacyRoot.child('plantingLogs').get(),
+      ]).timeout(const Duration(seconds: 4));
+
+      final runsValue = snapshots[0].value;
+      if (runsValue is Map) {
+        for (final raw in runsValue.values) {
+          if (raw is! Map) continue;
+          final map = Map<String, dynamic>.from(raw);
+          final start = _parseFirebaseTimestamp(map['startDate']);
+          final end = _parseFirebaseTimestamp(map['endDate']);
+          final batch = int.tryParse('${map['batchNumber'] ?? ''}');
+          final days = int.tryParse('${map['totalDays'] ?? ''}');
+          if (start != null && end != null && batch != null && days != null && seenRuns.add(batch)) {
+            runs.add(PlantingRecord(batchNumber: batch, startDate: start, endDate: end, totalDays: days));
+          }
+        }
+      }
+
+      final logsValue = snapshots[1].value;
+      if (logsValue is Map) {
+        for (final batchEntry in logsValue.entries) {
+          final batch = int.tryParse('${batchEntry.key}');
+          final batchLogs = batchEntry.value;
+          if (batchLogs is! Map) continue;
+          for (final logEntry in batchLogs.entries) {
+            final raw = logEntry.value;
+            if (raw is! Map) continue;
+            final map = Map<String, dynamic>.from(raw);
+            final timestamp = _parseFirebaseTimestamp(map['timestamp']);
+            if (timestamp == null) continue;
+            final logBatch = int.tryParse('${map['batchNumber'] ?? batch ?? 0}');
+            final dedupeKey = '${logBatch ?? 0}|${timestamp.toIso8601String()}';
+            if (!seenLogs.add(dedupeKey)) continue;
+            logs.add(HistoricalData(
+              timestamp: timestamp,
+              pH: double.tryParse('${map['pH'] ?? 0}') ?? 0,
+              temperature: '${map['temperature'] ?? ''}',
+              waterLevel: '${map['waterLevel'] ?? 'Needs water'}',
+              tds: double.tryParse('${map['tds'] ?? 0}') ?? 0,
+              batchNumber: logBatch,
+              bed1: _decodeBedData(map['bed1']),
+              bed2: _decodeBedData(map['bed2']),
+            ));
+          }
+        }
+      }
+    } catch (_) {
+      // Older per-user Realtime Database records remain a read fallback.
     }
   }
 
@@ -2029,34 +2327,97 @@ Future<CloudHistory> downloadCloudHistory() async {
 }
 
 Future<void> uploadHistoricalLog(HistoricalData snapshot) async {
-  final user = FirebaseAuth.instance.currentUser;
-  if (user == null) return;
-  final batch = snapshot.batchNumber ?? 0;
-  final key = snapshot.timestamp.toUtc().toIso8601String().replaceAll(RegExp(r'[^0-9A-Za-z]'), '_');
-  await FirebaseDatabase.instance.ref('users/${user.uid}/plantingLogs/$batch/$key').set({
-    'timestamp': ServerValue.timestamp,
-    'pH': snapshot.pH,
-    'temperature': snapshot.temperature,
-    'waterLevel': snapshot.waterLevel,
-    'tds': snapshot.tds,
-    'batchNumber': snapshot.batchNumber,
-    'bed1': snapshot.bed1?.toMap(),
-    'bed2': snapshot.bed2?.toMap(),
+  if (FirebaseAuth.instance.currentUser == null) return;
+  final serverNow = await getServerNow();
+  final minuteKey = _minuteBucketKey(serverNow);
+  final minuteDoc = FirebaseFirestore.instance
+      .collection('hydrodeckSystems')
+      .doc(_sharedHydrodeckSystemId)
+      .collection('minuteLogs')
+      .doc(minuteKey);
+  await FirebaseFirestore.instance.runTransaction((transaction) async {
+    final existing = await transaction.get(minuteDoc);
+    if (existing.exists) return;
+    transaction.set(minuteDoc, {
+      'systemId': _sharedHydrodeckSystemId,
+      'minuteKey': minuteKey,
+      'sampleTime': Timestamp.fromDate(snapshot.timestamp.toUtc()),
+      'batchNumber': snapshot.batchNumber,
+      'timestamp': FieldValue.serverTimestamp(),
+      'pH': snapshot.pH,
+      'temperature': snapshot.temperature,
+      'waterLevel': snapshot.waterLevel,
+      'tds': snapshot.tds,
+      'bed1': snapshot.bed1?.toMap(),
+      'bed2': snapshot.bed2?.toMap(),
+    });
   });
 }
 
-Future<void> uploadPlantingRecord(PlantingRecord record, List<HistoricalData> logs) async {
-  final user = FirebaseAuth.instance.currentUser;
-  if (user == null) return;
-  await FirebaseDatabase.instance.ref('users/${user.uid}/plantingRuns/${record.batchNumber}').set({
-    'batchNumber': record.batchNumber,
-    'startDate': ServerValue.timestamp,
-    'endDate': ServerValue.timestamp,
-    'totalDays': record.totalDays,
-  });
-  for (final log in logs) {
-    await uploadHistoricalLog(log);
+Future<void> uploadNextUnsyncedRecord() async {
+  final run = await DatabaseHelper.instance.getNextUnsyncedPlantingRecord();
+  if (run != null) {
+    if (await uploadPlantingRecord(run)) {
+      await DatabaseHelper.instance.markPlantingRecordCloudSynced(run.batchNumber);
+    }
+    return;
   }
+
+  final log = await DatabaseHelper.instance.getNextUnsyncedLog();
+  if (log == null) return;
+  await uploadHistoricalLog(log);
+  await DatabaseHelper.instance.markLogCloudSynced(log.timestamp);
+}
+
+Future<bool> hasPendingCloudRecords() async {
+  if (await DatabaseHelper.instance.getNextUnsyncedPlantingRecord() != null) return true;
+  return await DatabaseHelper.instance.getNextUnsyncedLog() != null;
+}
+
+Future<int> reservePlantingBatchNumber(int fallbackNumber) async {
+  if (FirebaseAuth.instance.currentUser == null) return fallbackNumber;
+  final counter = FirebaseFirestore.instance
+      .collection('hydrodeckSystems')
+      .doc(_sharedHydrodeckSystemId)
+      .collection('metadata')
+      .doc('counters');
+  try {
+    return await FirebaseFirestore.instance.runTransaction<int>((transaction) async {
+      final snapshot = await transaction.get(counter);
+      final stored = (snapshot.data()?['lastBatchNumber'] as num?)?.toInt() ?? 0;
+      final next = stored >= fallbackNumber ? stored + 1 : fallbackNumber;
+      transaction.set(counter, {
+        'lastBatchNumber': next,
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+      return next;
+    });
+  } catch (_) {
+    return fallbackNumber;
+  }
+}
+
+Future<bool> uploadPlantingRecord(PlantingRecord record) async {
+  if (FirebaseAuth.instance.currentUser == null) return false;
+  final runRef = FirebaseFirestore.instance
+      .collection('hydrodeckSystems')
+      .doc(_sharedHydrodeckSystemId)
+      .collection('plantingRuns')
+      .doc(record.batchNumber.toString());
+  return FirebaseFirestore.instance.runTransaction<bool>((transaction) async {
+    final existing = await transaction.get(runRef);
+    if (existing.exists) return true;
+    transaction.set(runRef, {
+      'systemId': _sharedHydrodeckSystemId,
+      'batchNumber': record.batchNumber,
+      'startedAt': Timestamp.fromDate(record.startDate.toUtc()),
+      'endedAt': Timestamp.fromDate(record.endDate.toUtc()),
+      'uploadedAt': FieldValue.serverTimestamp(),
+      'totalDays': record.totalDays,
+      'status': 'completed',
+    });
+    return true;
+  });
 }
 
 // --- INITIAL APP GATEKEEPER & AUTHENTICATION SCREEN ---
@@ -2256,6 +2617,7 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                         controller: _pinController,
                         enabled: _lockoutTimeRemaining == 0,
                         keyboardType: TextInputType.number,
+                        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                         maxLength: 4,
                         obscureText: true,
                         textAlign: TextAlign.center,
@@ -2344,6 +2706,7 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                       TextField(
                         controller: _customPinController,
                         keyboardType: TextInputType.number,
+                        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                         maxLength: 4,
                         obscureText: true,
                         textAlign: TextAlign.center,
@@ -2587,7 +2950,7 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     for (final run in cloudHistory.runs) {
       if (knownBatches.add(run.batchNumber)) {
         pastRuns.add(run);
-        await DatabaseHelper.instance.insertPlantingRecord(run);
+        await DatabaseHelper.instance.insertPlantingRecord(run, cloudSynced: true);
       }
     }
     final localLogs = await DatabaseHelper.instance.getLogs();
@@ -2596,7 +2959,9 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
         .toSet();
     for (final log in cloudHistory.logs) {
       final key = '${log.batchNumber}|${log.timestamp.toIso8601String()}';
-      if (knownLogKeys.add(key)) await DatabaseHelper.instance.insertLog(log);
+      if (knownLogKeys.add(key)) {
+        await DatabaseHelper.instance.insertLog(log, cloudSynced: true);
+      }
     }
     final savedIp = await DatabaseHelper.instance.getActiveIp();
     if (mounted) {
@@ -2611,8 +2976,10 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
         _isLoading = false;
       });
     }
-    if (activeDate != null && _supportsBackgroundService) {
+    final hasPendingRecords = await hasPendingCloudRecords();
+    if ((activeDate != null || hasPendingRecords) && _supportsBackgroundService) {
       await initializeBackgroundService();
+      FlutterBackgroundService().invoke('setPlantingState', {'active': activeDate != null});
     }
   }
 
@@ -2631,7 +2998,12 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
 
   void _startPlanting() async {
     final now = await getServerNow();
-    final batchNumber = _pastPlantingRuns.length + 1;
+    final localCandidate = _pastPlantingRuns.fold<int>(
+          0,
+          (maximum, run) => run.batchNumber > maximum ? run.batchNumber : maximum,
+        ) +
+        1;
+    final batchNumber = await reservePlantingBatchNumber(localCandidate);
     await DatabaseHelper.instance.saveActiveSession(now, batchNumber);
 
     if (_supportsBackgroundService) {
@@ -2647,24 +3019,30 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
 
   void _endPlanting() async {
     if (_plantingStartDate == null) return;
-    if (_supportsBackgroundService) {
-      FlutterBackgroundService().invoke('stopService');
-    }
-    
+
     final now = await getServerNow();
     int totalDays = (now.difference(_plantingStartDate!).inDays + 1).clamp(1, 999999);
 
+    final batchNumber = await DatabaseHelper.instance.getActiveBatchNumber() ??
+        (_pastPlantingRuns.isEmpty ? 1 : _pastPlantingRuns.last.batchNumber + 1);
     final newRecord = PlantingRecord(
-      batchNumber: _pastPlantingRuns.length + 1,
+      batchNumber: batchNumber,
       startDate: _plantingStartDate!,
       endDate: now,
       totalDays: totalDays,
     );
 
     await DatabaseHelper.instance.insertPlantingRecord(newRecord);
-    final batchLogs = await DatabaseHelper.instance.getLogsForBatch(newRecord.batchNumber);
-    await uploadPlantingRecord(newRecord, batchLogs);
     await DatabaseHelper.instance.clearActiveSession();
+    if (_supportsBackgroundService) {
+      FlutterBackgroundService().invoke('setPlantingState', {'active': false});
+    } else {
+      try {
+        if (await uploadPlantingRecord(newRecord)) {
+          await DatabaseHelper.instance.markPlantingRecordCloudSynced(newRecord.batchNumber);
+        }
+      } catch (_) {}
+    }
 
     setState(() {
       _pastPlantingRuns.add(newRecord);
@@ -2752,7 +3130,7 @@ class StartPlantingScreen extends StatelessWidget {
                                 style: const TextStyle(fontWeight: FontWeight.bold),
                               ),
                               subtitle: Text(
-                                '${run.startDate.year}-${run.startDate.month}-${run.startDate.day} to ${run.endDate.year}-${run.endDate.month}-${run.endDate.day}',
+                                '${_philippineTime(run.startDate).year}-${_philippineTime(run.startDate).month}-${_philippineTime(run.startDate).day} to ${_philippineTime(run.endDate).year}-${_philippineTime(run.endDate).month}-${_philippineTime(run.endDate).day}',
                                 style: const TextStyle(fontSize: 11),
                               ),
                               trailing: Text(
@@ -2834,6 +3212,7 @@ class StartPlantingScreen extends StatelessWidget {
                     ],
                   ),
                   child: const Center(
+                    // Replace this Text with Image.asset(...) or any icon you prefer.
                     child: Text(
                       '🥬',
                       style: TextStyle(fontSize: 70),
@@ -2918,8 +3297,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   
   String _connectionStatus = "Fetching...";
   bool _firebaseConnected = false;
-  bool _esp32Connected = false;
-
+  
   GrowBedReading _bed1 = GrowBedReading.empty();
   GrowBedReading _bed2 = GrowBedReading.empty();
   final Map<String, bool> _controlStates = {
@@ -2939,12 +3317,23 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   StreamSubscription? _telemetrySub;
   StreamSubscription? _snapshotSub;
   StreamSubscription? _firebaseSub;
+  StreamSubscription? _firebaseConnectionSub;
+  StreamSubscription? _firebaseCommandsSub; // Subscription for command status updates
   Timer? _connectionTimer;
-  Timer? _offlinePromptTimer;
   bool _wifiPromptShown = false;
-  DateTime? _lastDeviceHeartbeat;
+  bool _isRefreshingConnectivity = false;
+  bool _connectivityProbeInProgress = false;
+  DateTime? _lastLocalTelemetryAt;
+  DateTime? _lastFirebaseTelemetryAt;
+  Timer? _thresholdPublishTimer;
+  DateTime? _offlineSince;
+  List<String> _discoveredHotspots = [];
   final Map<String, bool> _actuatorBusy = {};
   final Map<String, bool> _pendingActuatorStates = {};
+  // Track pending command requests to prevent duplicates and enable acknowledgment
+  final Map<String, String> _pendingCommandIds = {}; // actuatorName -> commandId
+  final Map<String, Timer> _commandTimeouts = {};
+  final Set<String> _actuatorsSeenRunning = {};
 
   List<HistoricalData> _historyLogs = [];
   DateTime? _selectedFilterDate;
@@ -2966,15 +3355,31 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _wifiPasswordController = TextEditingController();
     _loadStoredLogsAndSettings();
     _subscribeToFirebase();
+    _subscribeToFirebaseConnection();
     _subscribeToBackgroundUpdates();
+    _subscribeToFirebaseCommands();
     unawaited(_refreshServerTime());
-    _connectionTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+
+    _offlineSince = DateTime.now();
+    unawaited(_refreshConnectivity(showLoading: false));
+
+    _connectionTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       if (mounted) {
+        unawaited(_refreshConnectivity(showLoading: false));
         setState(_updateConnectionStatus);
-        if (!_wifiPromptShown && _connectionStatus != 'Connected') {
-          _offlinePromptTimer ??= Timer(const Duration(seconds: 0), () {
-            if (mounted) _showWifiSetupDialog();
-          });
+        // Only prompt to provision the ESP32 when the user is on the Home screen
+        // and the device has been offline for a while. This prevents intrusive
+        // popups while navigating other screens.
+        if (_connectionStatus.startsWith('Connected')) {
+          _offlineSince = null;
+          _wifiPromptShown = false;
+        } else {
+          _offlineSince ??= DateTime.now();
+          if (!_wifiPromptShown &&
+              _currentIndex == 0 &&
+              DateTime.now().difference(_offlineSince!).inSeconds >= 3) {
+            _showWifiSetupDialog();
+          }
         }
       }
     });
@@ -2985,8 +3390,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _telemetrySub?.cancel();
     _snapshotSub?.cancel();
     _firebaseSub?.cancel();
+    _firebaseConnectionSub?.cancel();
+    _firebaseCommandsSub?.cancel();
     _connectionTimer?.cancel();
-    _offlinePromptTimer?.cancel();
+    _thresholdPublishTimer?.cancel();
     _ipController.dispose();
     _wifiSsidController.dispose();
     _wifiPasswordController.dispose();
@@ -3001,38 +3408,40 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         app: Firebase.app(),
         databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
       ).ref('hydrodeck');
-      _firebaseSub = ref.onValue.listen((event) {
+      _firebaseSub = ref.onValue.listen((event) async {
         final value = event.snapshot.value;
         if (mounted) {
-          setState(() {
-            _firebaseConnected = true;
-            _updateConnectionStatus();
-          });
+          setState(_updateConnectionStatus);
         }
         if (value is! Map) return;
 
         final payload = Map<String, dynamic>.from(value);
+        final lastSeen = payload['lastSeen'];
+        final heartbeatMillis = lastSeen is num
+            ? lastSeen.toInt()
+            : int.tryParse(lastSeen?.toString() ?? '');
+        final heartbeatFresh = heartbeatMillis != null &&
+            DateTime.now()
+                    .difference(DateTime.fromMillisecondsSinceEpoch(heartbeatMillis))
+                    .inSeconds <=
+                30;
         final telemetry = HydrodeckTelemetry.fromJson(payload);
 
         if (!mounted) return;
         setState(() {
-          _firebaseConnected = true;
-          final lastSeen = payload['lastSeen'];
-          final heartbeatMillis = lastSeen is num
-              ? lastSeen.toInt()
-              : int.tryParse(lastSeen?.toString() ?? '');
-          if (heartbeatMillis != null) {
-            _lastDeviceHeartbeat = DateTime.fromMillisecondsSinceEpoch(heartbeatMillis);
+          if (heartbeatFresh) {
+            _lastFirebaseTelemetryAt = DateTime.now();
+            _firebaseConnected = true;
+          } else {
+            _lastFirebaseTelemetryAt = null;
           }
-          _esp32Connected = payload['wifiConnected'] == true &&
-              payload['firebaseReady'] == true &&
-              _hasFreshDeviceHeartbeat;
-          if (payload.containsKey('temp1') || payload.containsKey('ph1') || payload.containsKey('tds1') || payload.containsKey('water1') || payload['bed1'] is Map) {
+                                        if (payload.containsKey('temp1') || payload.containsKey('ph1') || payload.containsKey('tds1') || payload.containsKey('water1') || payload['bed1'] is Map) {
             _bed1 = telemetry.bed1;
           }
           if (payload.containsKey('temp2') || payload.containsKey('ph2') || payload.containsKey('tds2') || payload.containsKey('water2') || payload['bed2'] is Map) {
             _bed2 = telemetry.bed2;
           }
+
           final actuators = payload['actuators'] is Map
               ? Map<String, dynamic>.from(payload['actuators'] as Map)
               : payload;
@@ -3054,48 +3463,227 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             _esp32Ip = payload['ip'].toString();
             _ipController.text = _esp32Ip;
           }
+
         });
       }, onError: (_) {
-        if (!mounted) return;
-        setState(() {
-          _firebaseConnected = false;
-          _esp32Connected = false;
-          _updateConnectionStatus();
-        });
+        if (mounted) setState(_updateConnectionStatus);
       });
     } catch (_) {
       // Firebase is unavailable; telemetry will fall back to manual polling.
     }
   }
 
+  void _subscribeToFirebaseConnection() {
+    if (kIsWeb) return;
+    try {
+      final connectionRef = FirebaseDatabase.instanceFor(
+        app: Firebase.app(),
+        databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
+      ).ref('.info/connected');
+      _firebaseConnectionSub = connectionRef.onValue.listen((event) {
+        if (!mounted) return;
+        setState(() {
+          _firebaseConnected = event.snapshot.value == true || _hasFreshFirebaseTelemetry;
+          _updateConnectionStatus();
+        });
+      }, onError: (_) {
+        if (!mounted) return;
+        setState(() {
+          _firebaseConnected = _hasFreshFirebaseTelemetry;
+          _updateConnectionStatus();
+        });
+      });
+    } catch (_) {
+      _firebaseConnected = false;
+    }
+  }
+
+  void _subscribeToFirebaseCommands() {
+    if (kIsWeb) return;
+    try {
+      final acknowledgmentsRef = FirebaseDatabase.instanceFor(
+        app: Firebase.app(),
+        databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
+      ).ref('hydrodeck/commandAcks');
+      _firebaseCommandsSub = acknowledgmentsRef.onValue.listen((event) {
+        if (!mounted) return;
+        final value = event.snapshot.value;
+        if (value is! Map) return;
+        final acknowledgments = Map<String, dynamic>.from(value);
+        var changed = false;
+        for (final pending in _pendingCommandIds.entries.toList()) {
+          final status = acknowledgments[pending.value]?.toString();
+          if (status != 'completed' && status != 'failed') continue;
+          _pendingCommandIds.remove(pending.key);
+          _commandTimeouts.remove(pending.value)?.cancel();
+          final busyKey = _getActuatorBusyKey(pending.key);
+          if (busyKey != null) {
+            _actuatorBusy[busyKey] = false;
+            _pendingActuatorStates.remove(busyKey);
+          }
+          changed = true;
+        }
+        if (changed && mounted) setState(() {});
+      });
+    } catch (_) {
+      // Firebase commands subscription failed - commands will rely on telemetry feedback
+    }
+  }
+
+  String? _getActuatorBusyKey(String actuatorName) {
+    switch (actuatorName) {
+      case 'waterPump1': return 'bed1_water';
+      case 'phUp1': return 'bed1_ph_up';
+      case 'phDown1': return 'bed1_ph_down';
+      case 'nutrientPump1': return 'bed1_nutrient';
+      case 'waterPump2': return 'bed2_water';
+      case 'phUp2': return 'bed2_ph_up';
+      case 'phDown2': return 'bed2_ph_down';
+      case 'nutrientPump2': return 'bed2_nutrient';
+      case 'growLight': return 'grow_light';
+      default: return null;
+    }
+  }
+
   void _updateActuatorFromFirebase(String key, String actuatorName, Map<String, dynamic> actuators) {
+    if (!actuators.containsKey(actuatorName)) return;
     final value = HydrodeckTelemetry._readBoolLike(actuators, [actuatorName]);
-    final pending = _pendingActuatorStates[key];
-    if (pending == null || pending == value) {
-      _controlStates[key] = value;
-      if (pending == value) _pendingActuatorStates.remove(key);
+    _controlStates[key] = value;
+    _actuatorBusy[key] = value;
+    if (value) {
+      _actuatorsSeenRunning.add(key);
+    } else if (_actuatorsSeenRunning.remove(key)) {
+      final pendingId = _pendingCommandIds.remove(actuatorName);
+      if (pendingId != null) _commandTimeouts.remove(pendingId)?.cancel();
+      _pendingActuatorStates.remove(key);
     }
   }
 
   Future<void> _refreshServerTime() async {
-    final now = await getServerNow();
+    DateTime now;
+    try {
+      now = await getServerNow();
+    } catch (e) {
+      // Failed to get server time, do not update _serverNow
+      return;
+    }
     if (mounted) {
       setState(() => _serverNow = now);
     }
   }
 
-  void _updateConnectionStatus() {
-    _esp32Connected = _esp32Connected && _hasFreshDeviceHeartbeat;
-    _connectionStatus = _firebaseConnected && _esp32Connected
-      ? 'Connected'
-      : _firebaseConnected
-        ? 'ESP32 Offline'
-        : 'Firebase Offline';
+  Future<void> _refreshConnectivity({bool showLoading = true}) async {
+    if (_connectivityProbeInProgress) return;
+    _connectivityProbeInProgress = true;
+    if (showLoading && mounted) setState(() => _isRefreshingConnectivity = true);
+    var localConnected = false;
+    try {
+      try {
+        await WiFiForIoTPlugin.forceWifiUsage(true);
+      } catch (_) {}
+      final targets = <String>{_esp32Ip.trim(), '192.168.4.1', 'hydrodeck.local'}
+        ..remove('');
+      Future<MapEntry<String, HydrodeckTelemetry>?> probe(String target) async {
+        try {
+          final response = await http.get(
+            Uri.parse('http://$target/status'),
+            headers: {'Connection': 'close'},
+          ).timeout(const Duration(milliseconds: 900));
+          if (response.statusCode != 200) return null;
+          final decoded = jsonDecode(response.body);
+          if (decoded is! Map) return null;
+          final telemetry = HydrodeckTelemetry.fromJson(
+            Map<String, dynamic>.from(decoded),
+          );
+          return MapEntry(target, telemetry);
+        } catch (_) {
+          return null;
+        }
+      }
+
+      final localResults = await Future.wait(targets.map(probe));
+      for (final result in localResults.whereType<MapEntry<String, HydrodeckTelemetry>>()) {
+        if (!mounted) return;
+        setState(() {
+          _bed1 = result.value.bed1;
+          _bed2 = result.value.bed2;
+          _controlStates['grow_light'] = result.value.growLightOn;
+          _esp32Ip = result.key;
+          _ipController.text = result.key;
+          _lastLocalTelemetryAt = DateTime.now();
+        });
+        localConnected = true;
+        if (_currentIndex == 0) break;
+      }
+
+      if (!localConnected) {
+        try {
+          await WiFiForIoTPlugin.forceWifiUsage(false);
+        } catch (_) {}
+        var firebaseReachable = false;
+        var freshDeviceHeartbeat = false;
+        try {
+          final database = FirebaseDatabase.instanceFor(
+            app: Firebase.app(),
+            databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
+          );
+          final connection = await database.ref('.info/connected')
+              .get()
+              .timeout(const Duration(seconds: 2));
+          firebaseReachable = connection.value == true || _firebaseConnected;
+          final snapshot = await database.ref('hydrodeck/lastSeen')
+              .get()
+              .timeout(const Duration(seconds: 2));
+          final heartbeatMillis = snapshot.value is num
+              ? (snapshot.value as num).toInt()
+              : int.tryParse(snapshot.value?.toString() ?? '');
+          freshDeviceHeartbeat = heartbeatMillis != null &&
+              DateTime.now()
+                      .difference(DateTime.fromMillisecondsSinceEpoch(heartbeatMillis))
+                      .inSeconds <=
+                  30;
+          if (freshDeviceHeartbeat) {
+            _lastFirebaseTelemetryAt = DateTime.now();
+          }
+        } catch (_) {}
+        if (mounted) {
+          setState(() {
+            _firebaseConnected = firebaseReachable || freshDeviceHeartbeat;
+            _lastLocalTelemetryAt = null;
+            if (!freshDeviceHeartbeat) _lastFirebaseTelemetryAt = null;
+          });
+        }
+      }
+    } finally {
+      _connectivityProbeInProgress = false;
+      if (mounted) {
+        setState(() {
+          if (showLoading) _isRefreshingConnectivity = false;
+          _updateConnectionStatus();
+        });
+      }
+    }
   }
 
-  bool get _hasFreshDeviceHeartbeat => _lastDeviceHeartbeat != null &&
-      DateTime.now().difference(_lastDeviceHeartbeat!).inSeconds <= 15;
+  void _updateConnectionStatus() {
+    final localTelemetryFresh = _lastLocalTelemetryAt != null &&
+        DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <= 10;
 
+    if (localTelemetryFresh) {
+      _connectionStatus = 'Connected locally';
+    } else if (_hasFreshFirebaseTelemetry) {
+      _connectionStatus = 'Connected';
+    } else if (_firebaseConnected) {
+      _connectionStatus = 'ESP32 Offline';
+    } else {
+      _connectionStatus = 'Firebase Offline';
+    }
+  }
+
+  bool get _hasFreshFirebaseTelemetry => _lastFirebaseTelemetryAt != null &&
+      DateTime.now().difference(_lastFirebaseTelemetryAt!).inSeconds <= 15;
+
+  
   Future<void> _loadStoredLogsAndSettings() async {
     final activeBatchNumber = await DatabaseHelper.instance.getActiveBatchNumber();
     final storedLogs = activeBatchNumber == null
@@ -3121,6 +3709,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     }
   }
 
+  
   void _subscribeToBackgroundUpdates() {
     if (kIsWeb || !_supportsBackgroundService) return;
 
@@ -3128,8 +3717,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
       _telemetrySub = FlutterBackgroundService().on('telemetryUpdate').listen((event) {
         if (event != null && mounted) {
           setState(() {
-            _esp32Connected = event['isConnected'] == true;
-            _firebaseConnected = event['firebaseConnected'] == true;
+                        if (event['source'] == 'local') {
+              _lastLocalTelemetryAt = DateTime.now();
+            } else if (event['source'] == 'offline') {
+              _lastLocalTelemetryAt = null;
+            } else if (event['source'] == 'firebase') {
+              if (event['isConnected'] == true) {
+                _lastFirebaseTelemetryAt = DateTime.now();
+              }
+                          _firebaseConnected = true;
+            }
             _updateConnectionStatus();
             if (event['bed1'] != null) {
               _bed1 = GrowBedReading.fromMap(Map<String, dynamic>.from(event['bed1'] as Map));
@@ -3142,6 +3739,17 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                   ? event['growLight'] as bool
                   : (event['growLight'].toString() == '1' || event['growLight'].toString().toLowerCase() == 'true');
             }
+            if (event['actuators'] is Map) {
+              final actuatorMap = Map<String, dynamic>.from(event['actuators'] as Map);
+              _updateActuatorFromFirebase('bed1_water', 'waterPump1', actuatorMap);
+              _updateActuatorFromFirebase('bed1_ph_up', 'phUp1', actuatorMap);
+              _updateActuatorFromFirebase('bed1_ph_down', 'phDown1', actuatorMap);
+              _updateActuatorFromFirebase('bed1_nutrient', 'nutrient1', actuatorMap);
+              _updateActuatorFromFirebase('bed2_water', 'waterPump2', actuatorMap);
+              _updateActuatorFromFirebase('bed2_ph_up', 'phUp2', actuatorMap);
+              _updateActuatorFromFirebase('bed2_ph_down', 'phDown2', actuatorMap);
+              _updateActuatorFromFirebase('bed2_nutrient', 'nutrient2', actuatorMap);
+            }
             if (event['water'] != null) {
               _lastValidWaterStatus = event['water'];
             }
@@ -3150,6 +3758,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             }
             _lastValidWaterStatus = _bed2.waterFull ? 'full' : 'low';
           });
+
         }
       });
 
@@ -3177,8 +3786,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   }
 
   int _getElapsedPlantingDay(DateTime timestamp) {
-    final startDay = DateTime(widget.startDate.year, widget.startDate.month, widget.startDate.day);
-    final currentDay = DateTime(timestamp.year, timestamp.month, timestamp.day);
+    final start = _philippineTime(widget.startDate);
+    final current = _philippineTime(timestamp);
+    final startDay = DateTime(start.year, start.month, start.day);
+    final currentDay = DateTime(current.year, current.month, current.day);
     return (currentDay.difference(startDay).inDays + 1).clamp(1, 999999);
   }
 
@@ -3191,14 +3802,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
       "January", "February", "March", "April", "May", "June", 
       "July", "August", "September", "October", "November", "December"
     ];
-    String month = months[dt.month - 1];
-    int hour24 = dt.hour;
+    final philippinesTime = _philippineTime(dt);
+    String month = months[philippinesTime.month - 1];
+    int hour24 = philippinesTime.hour;
     String amPm = hour24 >= 12 ? "PM" : "AM";
     int hour12 = hour24 % 12;
     if (hour12 == 0) hour12 = 12;
     String minutes = dt.minute.toString().padLeft(2, '0');
     
-    return "$month ${dt.day}, ${dt.year} $hour12:$minutes $amPm";
+    return "$month ${philippinesTime.day}, ${philippinesTime.year} $hour12:$minutes $amPm";
   }
 
   String _getDateCategoryHeader(DateTime dt) {
@@ -3209,122 +3821,221 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     return "Pre-cycle Preparation";
   }
 
+  void _trackPendingCommand(String key, String actuatorName, String commandId) {
+    _pendingCommandIds[actuatorName] = commandId;
+    _pendingActuatorStates[key] = true;
+    _actuatorBusy[key] = true;
+    _commandTimeouts[commandId]?.cancel();
+    final timeout = actuatorName.startsWith('waterPump')
+        ? const Duration(minutes: 3)
+        : const Duration(seconds: 20);
+    _commandTimeouts[commandId] = Timer(timeout, () {
+      if (_pendingCommandIds[actuatorName] != commandId) return;
+      _pendingCommandIds.remove(actuatorName);
+      _commandTimeouts.remove(commandId);
+      _pendingActuatorStates.remove(key);
+      _actuatorBusy[key] = false;
+      if (mounted) setState(() {});
+    });
+  }
+
+  void _clearPendingCommand(String actuatorName, String commandId) {
+    if (_pendingCommandIds[actuatorName] != commandId) return;
+    _pendingCommandIds.remove(actuatorName);
+    _commandTimeouts.remove(commandId)?.cancel();
+    final key = _getActuatorBusyKey(actuatorName);
+    if (key != null) {
+      _pendingActuatorStates.remove(key);
+      _actuatorBusy[key] = false;
+    }
+  }
+
   Future<void> _toggleActuator(String key, String actuatorName) async {
-    if (_actuatorBusy[key] == true) return;
+    if (_pendingCommandIds.containsKey(actuatorName) || _actuatorBusy[key] == true) return;
+    if ((key == 'bed1_ph_down' && _bed1.ph < _minPhThreshold) ||
+        (key == 'bed1_ph_up' && _bed1.ph > _maxPhThreshold) ||
+        (key == 'bed2_ph_down' && _bed2.ph < _minPhThreshold) ||
+        (key == 'bed2_ph_up' && _bed2.ph > _maxPhThreshold)) {
+      return;
+    }
+
     final savedTarget = _esp32Ip.trim();
     final targets = <String>{
       if (savedTarget.isNotEmpty) savedTarget,
+      '192.168.4.1',
       'hydrodeck.local',
     };
-    final nextValue = !(_controlStates[key] ?? false) ? 1 : 0;
-    _actuatorBusy[key] = true;
-    _pendingActuatorStates[key] = nextValue == 1;
+    final isGrowLight = actuatorName == 'growLight';
+    final nextGrowLight = !(_controlStates['grow_light'] ?? false);
+    final database = FirebaseDatabase.instanceFor(
+      app: Firebase.app(),
+      databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
+    );
+    final commandSlot = database.ref('hydrodeck/commands/$actuatorName');
+    final commandId = commandSlot.push().key ??
+        'cmd_${DateTime.now().microsecondsSinceEpoch}_${actuatorName.hashCode.abs()}';
+
+    if (!isGrowLight) {
+      _trackPendingCommand(key, actuatorName, commandId);
+    } else {
+      _actuatorBusy[key] = true;
+    }
     if (mounted) setState(() {});
 
-    try {
-      final actuatorRef = FirebaseDatabase.instanceFor(
-        app: Firebase.app(),
-        databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
-      ).ref('hydrodeck/$actuatorName');
-      await actuatorRef.set(nextValue == 1);
-      unawaited(_sendLocalActuatorCommand(targets, actuatorName, nextValue));
-      await Future<void>.delayed(const Duration(milliseconds: 800));
-      _actuatorBusy[key] = false;
-      if (mounted) setState(() {});
-      return;
-    } catch (_) {
-      // Fall back to local control when Firebase is temporarily unavailable.
-    }
-
-    for (final target in targets) {
+    var sent = false;
+    if (_firebaseConnected) {
       try {
-        final response = await http.get(
-          Uri.parse('http://$target/control?actuator=$actuatorName&state=$nextValue'),
-          headers: {'Connection': 'close'},
-        ).timeout(const Duration(seconds: 3));
-        if (response.statusCode == 200) {
-          if (mounted) {
-            setState(() => _controlStates[key] = nextValue == 1);
-          }
-          if (target != savedTarget && _supportsBackgroundService) {
-            FlutterBackgroundService().invoke('updateIp', {'ip': target});
-          }
-          _actuatorBusy[key] = false;
-          if (mounted) setState(() {});
-          return;
+        if (isGrowLight) {
+          await database.ref('hydrodeck/growLight').set(nextGrowLight);
+          _controlStates['grow_light'] = nextGrowLight;
+          sent = true;
+        } else {
+          await commandSlot.set(commandId);
+          sent = true;
         }
       } catch (_) {
-        // Try the next known local ESP32 host.
+        // The local HTTP route retries this same request ID safely.
       }
     }
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Pump control could not reach the ESP32.')),
-      );
-    }
-    _actuatorBusy[key] = false;
-    if (mounted) setState(() {});
-  }
 
-  Future<void> _sendLocalActuatorCommand(
-    Iterable<String> targets,
-    String actuatorName,
-    int state,
-  ) async {
-    for (final target in targets) {
-      try {
-        final response = await http.get(
-          Uri.parse('http://$target/control?actuator=$actuatorName&state=$state'),
-          headers: {'Connection': 'close'},
-        ).timeout(const Duration(seconds: 2));
-        if (response.statusCode == 200) return;
-      } catch (_) {}
+    if (!sent) {
+      for (final target in targets) {
+        try {
+          final parameters = <String, String>{
+            'actuator': actuatorName,
+            'state': isGrowLight ? (nextGrowLight ? '1' : '0') : '1',
+            if (!isGrowLight) 'requestId': commandId,
+          };
+          final response = await http.get(
+            Uri.http(target, '/control', parameters),
+            headers: {'Connection': 'close'},
+          ).timeout(const Duration(seconds: 2));
+          if (response.statusCode == 200) {
+            if (isGrowLight) {
+              _controlStates['grow_light'] = nextGrowLight;
+            }
+            if (target != savedTarget && _supportsBackgroundService) {
+              FlutterBackgroundService().invoke('updateIp', {'ip': target});
+            }
+            sent = true;
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (!sent) {
+      // Both Firebase and HTTP failed
+      if (isGrowLight) {
+        _actuatorBusy[key] = false;
+      } else {
+        _clearPendingCommand(actuatorName, commandId);
+      }
+      if (mounted) setState(() {});
+      return;
+    }
+
+    if (isGrowLight) {
+      _actuatorBusy[key] = false;
+      if (mounted) setState(() {});
     }
   }
 
   void _showWifiSetupDialog() {
-    if (_wifiPromptShown || !mounted) return;
+    if (_wifiPromptShown || !mounted || _currentIndex != 0) return;
     _wifiPromptShown = true;
     showDialog(
       context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('Connect the ESP32 to Wi-Fi'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('The ESP32 is offline. Set up the Wi-Fi details below to reconnect it.'),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _wifiSsidController,
-              decoration: const InputDecoration(labelText: 'Wi-Fi SSID', border: OutlineInputBorder()),
+      builder: (context) {
+        bool scanning = false;
+        String? selectedHotspot;
+        String? scanMessage;
+        return StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            title: const Text('Connect the ESP32 to Wi-Fi'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('Find the ESP32 hotspot, then enter the Wi-Fi network the device should join.'),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: scanning ? null : () async {
+                      setDialogState(() { scanning = true; scanMessage = null; });
+                      try {
+                        final canScan = await WiFiScan.instance.canStartScan(askPermissions: true);
+                        if (canScan != CanStartScan.yes) {
+                          throw Exception('Wi-Fi scan permission or service is unavailable.');
+                        }
+                        final canReadResults = await WiFiScan.instance.canGetScannedResults(askPermissions: true);
+                        if (canReadResults != CanGetScannedResults.yes) {
+                          throw Exception('Wi-Fi scan results are unavailable.');
+                        }
+                        final resultsFuture = WiFiScan.instance.onScannedResultsAvailable
+                            .first
+                            .timeout(const Duration(seconds: 12));
+                        final started = await WiFiScan.instance.startScan();
+                        if (!started) throw Exception('The Wi-Fi scan did not start.');
+                        final networks = await resultsFuture;
+                        final matches = networks
+                            .map((network) => network.ssid)
+                            .where((ssid) => ssid.contains(_esp32Hotspot))
+                            .toSet()
+                            .toList();
+                        if (mounted) setState(() => _discoveredHotspots = matches);
+                        if (matches.contains(_esp32Hotspot)) selectedHotspot = _esp32Hotspot;
+                        setDialogState(() {
+                          scanning = false;
+                          scanMessage = matches.isEmpty ? 'ESP32 hotspot not found. Power it on and scan again.' : null;
+                        });
+                      } catch (_) {
+                        setDialogState(() {
+                          scanning = false;
+                          scanMessage = 'Wi-Fi scan unavailable. Enable Wi-Fi/location access, or connect to $_esp32Hotspot manually.';
+                        });
+                      }
+                    },
+                    icon: const Icon(Icons.wifi_find),
+                    label: Text(scanning ? 'Searching...' : 'Search for ESP32 hotspot'),
+                  ),
+                  if (_discoveredHotspots.isNotEmpty)
+                    DropdownButtonFormField<String>(
+                      initialValue: selectedHotspot,
+                      decoration: const InputDecoration(labelText: 'ESP32 hotspot'),
+                      items: _discoveredHotspots.map((ssid) => DropdownMenuItem(value: ssid, child: Text(ssid))).toList(),
+                      onChanged: (value) => setDialogState(() => selectedHotspot = value),
+                    ),
+                  if (scanMessage != null) ...[
+                    const SizedBox(height: 8),
+                    Text(scanMessage!, style: const TextStyle(color: Colors.orange, fontSize: 12)),
+                  ],
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _wifiSsidController,
+                    decoration: const InputDecoration(labelText: 'New Wi-Fi SSID', border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 12),
+                  _PasswordVisibilityField(controller: _wifiPasswordController, label: 'New Wi-Fi password', icon: Icons.lock_outline),
+                ],
+              ),
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _wifiPasswordController,
-              obscureText: true,
-              decoration: const InputDecoration(labelText: 'Wi-Fi Password', border: OutlineInputBorder()),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Later'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(context), child: const Text('Later')),
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(context);
+                  _connectAndProvisionWifi(hotspotSsid: selectedHotspot ?? _esp32Hotspot);
+                },
+                child: const Text('Connect'),
+              ),
+            ],
           ),
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              _connectAndProvisionWifi();
-            },
-            child: const Text('Connect'),
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 
-  Future<void> _connectAndProvisionWifi() async {
+  Future<void> _connectAndProvisionWifi({String hotspotSsid = _esp32Hotspot}) async {
     final ssid = _wifiSsidController.text.trim();
     final password = _wifiPasswordController.text;
     if (ssid.isEmpty || password.isEmpty) {
@@ -3334,19 +4045,88 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
 
     setState(() {
       _isHotspotConnecting = true;
-      _hotspotStatus = 'Connecting to $_esp32Hotspot...';
+      _hotspotStatus = 'Connecting to $hotspotSsid...';
     });
     try {
-      await WiFiForIoTPlugin.connect(_esp32Hotspot, password: _esp32HotspotPassword, security: NetworkSecurity.WPA, joinOnce: true);
+      await WiFiForIoTPlugin.connect(hotspotSsid, password: _esp32HotspotPassword, security: NetworkSecurity.WPA, joinOnce: true);
       await WiFiForIoTPlugin.forceWifiUsage(true);
       final response = await http.get(Uri.parse('http://192.168.4.1/provision?ssid=${Uri.encodeQueryComponent(ssid)}&password=${Uri.encodeQueryComponent(password)}')).timeout(const Duration(seconds: 10));
       if (response.statusCode != 200) throw Exception(response.body);
-      setState(() => _hotspotStatus = 'ESP32 successfully connected to the Wi-Fi');
+      if (mounted) {
+        setState(() => _hotspotStatus = 'Wi-Fi sent. Returning your phone to its normal network...');
+      }
+      await WiFiForIoTPlugin.forceWifiUsage(false);
+      await WiFiForIoTPlugin.disconnect();
+      try {
+        await WiFiForIoTPlugin.removeWifiNetwork(hotspotSsid);
+      } catch (_) {
+        // Android/iOS may restrict programmatic removal; disconnect still succeeds.
+      }
+      if (mounted) {
+        setState(() => _hotspotStatus = 'ESP32 is joining $ssid. Reconnect to your home Wi-Fi on this phone.');
+      }
     } catch (error) {
       setState(() => _hotspotStatus = 'Hotspot setup failed: $error');
     } finally {
       if (mounted) setState(() => _isHotspotConnecting = false);
     }
+  }
+
+  Future<void> _publishPhThresholds() async {
+    try {
+      final settingsRef = FirebaseDatabase.instanceFor(
+        app: Firebase.app(),
+        databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
+      ).ref('hydrodeck/settings');
+      await Future.wait([
+        settingsRef.child('minPh').set(_minPhThreshold),
+        settingsRef.child('maxPh').set(_maxPhThreshold),
+      ]);
+    } catch (_) {}
+
+    for (final target in <String>{_esp32Ip.trim(), '192.168.4.1', 'hydrodeck.local'}..remove('')) {
+      try {
+        await http.get(Uri.parse(
+          'http://$target/settings?minPh=${_minPhThreshold.toStringAsFixed(2)}&maxPh=${_maxPhThreshold.toStringAsFixed(2)}',
+        )).timeout(const Duration(seconds: 2));
+        return;
+      } catch (_) {}
+    }
+  }
+
+  void _schedulePhThresholdPublish() {
+    _thresholdPublishTimer?.cancel();
+    _thresholdPublishTimer = Timer(
+      const Duration(milliseconds: 500),
+      () => unawaited(_publishPhThresholds()),
+    );
+  }
+
+  void _showConnectionHelp() {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Connect Hydrodeck'),
+        content: const SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('1. Power on the ESP32 and wait for its setup hotspot.'),
+              SizedBox(height: 10),
+              Text('2. If it is not on your home Wi-Fi, tap the Wi-Fi setup prompt and search for ESP32-HYDRODECK.'),
+              SizedBox(height: 10),
+              Text('3. Connect to the hotspot using its configured password, then enter your home Wi-Fi name and password.'),
+              SizedBox(height: 10),
+              Text('4. The ESP32 will join home Wi-Fi and turn off its setup hotspot. Reconnect this phone to the same home Wi-Fi.'),
+              SizedBox(height: 10),
+              Text('5. Tap refresh. “Connected locally” means this phone can reach the ESP32; “System online” means Firebase and the ESP32 heartbeat are current.'),
+            ],
+          ),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))],
+      ),
+    );
   }
 
   @override
@@ -3365,7 +4145,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         backgroundColor: Colors.white,
         foregroundColor: Colors.black,
         elevation: 0,
-        actions: [
+        actions: _currentIndex == 3 ? [
           IconButton(
             icon: const Icon(Icons.person_outline),
             onPressed: () {
@@ -3375,7 +4155,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
               );
             },
           ),
-        ],
+        ] : const [],
       ),
       body: SafeArea(child: screens[_currentIndex]),
       bottomNavigationBar: BottomNavigationBar(
@@ -3401,8 +4181,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   }
 
   Widget _buildHomeScreen(String waterLabel) {
-    final statusColor = _connectionStatus == "Connected" ? Colors.green : Colors.orange;
-    final statusText = _connectionStatus == "Connected" ? "System Online" : _connectionStatus;
+    final isOnline = _connectionStatus.startsWith('Connected');
+    final statusColor = isOnline ? Colors.green : Colors.orange;
+    final statusText = _connectionStatus == 'Connected' ? 'System Online' : _connectionStatus;
     final isBed1Warning = _bed1.ph < _minPhThreshold || _bed1.ph > _maxPhThreshold;
     final isBed2Warning = _bed2.ph < _minPhThreshold || _bed2.ph > _maxPhThreshold;
     final hasPhWarning = isBed1Warning || isBed2Warning;
@@ -3417,6 +4198,23 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               const Text('Home', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    tooltip: 'Connection guide',
+                    onPressed: _showConnectionHelp,
+                    icon: const Icon(Icons.help_outline),
+                  ),
+                  IconButton(
+                    tooltip: 'Refresh connection status',
+                    onPressed: _isRefreshingConnectivity ? null : () => _refreshConnectivity(),
+                    icon: _isRefreshingConnectivity
+                        ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.refresh),
+                  ),
+                ],
+              ),
             ],
           ),
           const SizedBox(height: 6),
@@ -3580,115 +4378,110 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     );
   }
 
-  Widget _buildControlToggle(String label, String key, {required String actuatorName}) {
-    final isOn = _controlStates[key] ?? false;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: Colors.grey.shade200),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Expanded(
-            child: Text(
-              label,
-              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.black87),
-            ),
-          ),
-          SizedBox(
-            width: 82,
-            child: ElevatedButton(
-              onPressed: _actuatorBusy[key] == true ? null : () => _toggleActuator(key, actuatorName),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: isOn ? const Color(0xFF2DC867) : Colors.grey.shade500,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 10),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-              ),
-              key: actuatorName == 'growLight' ? const ValueKey('grow-light-button') : null,
-              child: Text(isOn ? 'ON' : 'OFF'),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  // Old simple toggle helper removed; controls now use the redesigned layout.
 
   Widget _buildControlScreen() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(24.0),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('Hardware Controls', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 20),
-          Column(
-            children: [
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text('Grow Bed 1', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                          const SizedBox(height: 12),
-                          _buildControlToggle('Water Pump', 'bed1_water', actuatorName: 'waterPump1'),
-                          const Divider(height: 1),
-                          _buildControlToggle('pH Up', 'bed1_ph_up', actuatorName: 'phUp1'),
-                          const Divider(height: 1),
-                          _buildControlToggle('pH Down', 'bed1_ph_down', actuatorName: 'phDown1'),
-                          const Divider(height: 1),
-                          _buildControlToggle('Nutrient Solution', 'bed1_nutrient', actuatorName: 'nutrient1'),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text('Grow Bed 2', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                          const SizedBox(height: 12),
-                          _buildControlToggle('Water Pump', 'bed2_water', actuatorName: 'waterPump2'),
-                          const Divider(height: 1),
-                          _buildControlToggle('pH Up', 'bed2_ph_up', actuatorName: 'phUp2'),
-                          const Divider(height: 1),
-                          _buildControlToggle('pH Down', 'bed2_ph_down', actuatorName: 'phDown2'),
-                          const Divider(height: 1),
-                          _buildControlToggle('Nutrient Solution', 'bed2_nutrient', actuatorName: 'nutrient2'),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
-                      child: _buildControlToggle('Grow Light', 'grow_light', actuatorName: 'growLight'),
-                    ),
+    Widget sectionTitle(String title) => Padding(
+          padding: const EdgeInsets.only(top: 18, bottom: 8),
+          child: Text(title, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+        );
+
+    Widget phRow(int bedIndex, GrowBedReading bed) {
+      final isCritical = bed.ph < _minPhThreshold || bed.ph > _maxPhThreshold;
+      final minusKey = 'bed${bedIndex}_ph_down';
+      final plusKey = 'bed${bedIndex}_ph_up';
+      final minusName = bedIndex == 1 ? 'phDown1' : 'phDown2';
+      final plusName = bedIndex == 1 ? 'phUp1' : 'phUp2';
+      final minusNeeded = bed.ph > _maxPhThreshold;
+      final plusNeeded = bed.ph < _minPhThreshold;
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        color: isCritical ? Colors.red.shade100 : Colors.white,
+        child: Row(children: [
+          Expanded(flex: 2, child: Text('Grow bed $bedIndex', style: const TextStyle(fontWeight: FontWeight.w600))),
+          Expanded(child: Text(bed.ph.toStringAsFixed(2), textAlign: TextAlign.center, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
+          const SizedBox(width: 8),
+          SizedBox(width: 54, height: 52, child: ElevatedButton(
+            onPressed: _actuatorBusy[minusKey] == true || _actuatorBusy[plusKey] == true || bed.ph < _minPhThreshold ? null : () => _toggleActuator(minusKey, minusName),
+            style: ElevatedButton.styleFrom(backgroundColor: minusNeeded ? Colors.red : Colors.grey.shade200, foregroundColor: minusNeeded ? Colors.white : Colors.black87, padding: EdgeInsets.zero),
+            child: const Text('-', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+          )),
+          const SizedBox(width: 8),
+          SizedBox(width: 54, height: 52, child: ElevatedButton(
+            onPressed: _actuatorBusy[plusKey] == true || _actuatorBusy[minusKey] == true || bed.ph > _maxPhThreshold ? null : () => _toggleActuator(plusKey, plusName),
+            style: ElevatedButton.styleFrom(backgroundColor: plusNeeded ? Colors.green : Colors.grey.shade200, foregroundColor: plusNeeded ? Colors.white : Colors.black87, padding: EdgeInsets.zero),
+            child: const Text('+', style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold)),
+          )),
+        ]),
+      );
+    }
+
+    Widget pumpRow(int bedIndex, {required bool nutrient}) {
+      final key = nutrient ? 'bed${bedIndex}_nutrient' : 'bed${bedIndex}_water';
+      final actuator = nutrient
+          ? (bedIndex == 1 ? 'nutrient1' : 'nutrient2')
+          : (bedIndex == 1 ? 'waterPump1' : 'waterPump2');
+      final needsWater = bedIndex == 1 ? !_bed1.waterFull : !_bed2.waterFull;
+      return Container(
+        color: !nutrient && needsWater ? Colors.yellow.shade100 : Colors.white,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        child: Row(children: [
+          Expanded(child: Text('Grow bed $bedIndex', style: const TextStyle(fontWeight: FontWeight.w600))),
+          SizedBox(width: 112, height: 48, child: ElevatedButton(
+            onPressed: _actuatorBusy[key] == true ? null : () => _toggleActuator(key, actuator),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: !nutrient && needsWater ? Colors.amber.shade300 : Colors.grey.shade200,
+              foregroundColor: Colors.black87,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+            ),
+            child: Text(nutrient ? 'ADD' : 'PUMP', style: const TextStyle(fontWeight: FontWeight.bold)),
+          )),
+        ]),
+      );
+    }
+
+    Widget separatedRows(List<Widget> rows) => Container(
+          decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.grey.shade200), borderRadius: BorderRadius.circular(10)),
+          child: Column(children: [
+            for (var index = 0; index < rows.length; index++) ...[
+              if (index > 0) Divider(height: 1, color: Colors.grey.shade200),
+              rows[index],
             ],
+          ]),
+        );
+
+    final growLightOn = _controlStates['grow_light'] ?? false;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Hardware Controls', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+        sectionTitle('PH LEVEL'),
+        separatedRows([phRow(1, _bed1), phRow(2, _bed2)]),
+        sectionTitle('WATER PUMP'),
+        separatedRows([pumpRow(1, nutrient: false), pumpRow(2, nutrient: false)]),
+        sectionTitle('NUTRIENT SOLUTION'),
+        separatedRows([pumpRow(1, nutrient: true), pumpRow(2, nutrient: true)]),
+        sectionTitle('GROW LIGHT'),
+        SizedBox(width: double.infinity, height: 52, child: ElevatedButton(
+          key: const ValueKey('grow-light-button'),
+          onPressed: _actuatorBusy['grow_light'] == true ? null : () => _toggleActuator('grow_light', 'growLight'),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: growLightOn ? const Color(0xFF2DC867) : Colors.grey.shade200,
+            foregroundColor: growLightOn ? Colors.white : Colors.black87,
           ),
-        ],
-      ),
+          child: Text(growLightOn ? 'ON' : 'OFF', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        )),
+      ]),
     );
   }
 
   Widget _buildDataScreen() {
     List<HistoricalData> filteredLogs = _historyLogs.where((log) {
       if (_selectedFilterDate == null) return true;
-      return log.timestamp.year == _selectedFilterDate!.year &&
-          log.timestamp.month == _selectedFilterDate!.month &&
-          log.timestamp.day == _selectedFilterDate!.day;
+        final logDate = _philippineTime(log.timestamp);
+        return logDate.year == _selectedFilterDate!.year &&
+          logDate.month == _selectedFilterDate!.month &&
+          logDate.day == _selectedFilterDate!.day;
     }).toList();
 
     Map<String, List<HistoricalData>> categorizedLogs = {};
@@ -3877,11 +4670,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                   decoration: const InputDecoration(labelText: 'Wi-Fi SSID', border: OutlineInputBorder()),
                 ),
                 const SizedBox(height: 12),
-                TextField(
-                  controller: _wifiPasswordController,
-                  obscureText: true,
-                  decoration: const InputDecoration(labelText: 'Wi-Fi Password', border: OutlineInputBorder()),
-                ),
+                _PasswordVisibilityField(controller: _wifiPasswordController, label: 'Wi-Fi Password', icon: Icons.lock_outline),
                 const SizedBox(height: 12),
                 SizedBox(
                   width: double.infinity,
@@ -3935,6 +4724,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                       _minPhThreshold = val;
                     });
                     DatabaseHelper.instance.saveSettingsConfig(_minPhThreshold, _maxPhThreshold);
+                    _schedulePhThresholdPublish();
                     if (_supportsBackgroundService) {
                       FlutterBackgroundService().invoke('updateLimits', {
                         'minPh': _minPhThreshold,
@@ -3972,6 +4762,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                       _maxPhThreshold = val;
                     });
                     DatabaseHelper.instance.saveSettingsConfig(_minPhThreshold, _maxPhThreshold);
+                    _schedulePhThresholdPublish();
                     if (_supportsBackgroundService) {
                       FlutterBackgroundService().invoke('updateLimits', {
                         'minPh': _minPhThreshold,

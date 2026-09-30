@@ -10,6 +10,36 @@
     },
     "hydrodeck": {
       ".read": "auth != null",
+      "commands": {
+        "$actuator": {
+          ".read": "auth != null",
+          ".write": "auth != null",
+          ".validate": "newData.isString()"
+        }
+      },
+      "commandAcks": {
+        ".read": "auth != null",
+        "$requestId": {
+          ".write": "auth != null && auth.token.email === 'esp32@esp32.com'",
+          ".validate": "newData.isString()"
+        }
+      },
+      "actuators": {
+        ".read": "auth != null",
+        ".write": "auth != null && auth.token.email === 'esp32@esp32.com'",
+        "$actuator": {
+          ".read": "auth != null",
+          ".write": "auth != null && auth.token.email === 'esp32@esp32.com'",
+          ".validate": "newData.isBoolean()"
+        }
+      },
+      "settings": {
+        "$setting": {
+          ".read": "auth != null",
+          ".write": "auth != null",
+          ".validate": "newData.isNumber()"
+        }
+      },
       "waterPump1": { ".read": "auth != null", ".write": "auth != null", ".validate": "newData.isBoolean()" },
       "phUp1": { ".read": "auth != null", ".write": "auth != null", ".validate": "newData.isBoolean()" },
       "phDown1": { ".read": "auth != null", ".write": "auth != null", ".validate": "newData.isBoolean()" },

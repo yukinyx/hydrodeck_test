@@ -4,7 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:hydrodeck_test/main.dart';
 
 void main() {
-  testWidgets('dashboard shows dual-bed metrics and a single grow-light toggle', (WidgetTester tester) async {
+  testWidgets('dashboard shows the dual-bed controls layout', (WidgetTester tester) async {
     await tester.pumpWidget(
       MaterialApp(
         home: HydroponicsDashboard(
@@ -14,6 +14,8 @@ void main() {
         ),
       ),
     );
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
 
     expect(find.text('Home'), findsOneWidget);
     expect(find.text('Grow Bed 1 Metrics'), findsOneWidget);
@@ -23,16 +25,13 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Hardware Controls'), findsOneWidget);
-    expect(find.text('Grow Light'), findsOneWidget);
+    expect(find.text('PH LEVEL'), findsOneWidget);
+    expect(find.text('WATER PUMP'), findsOneWidget);
+    expect(find.text('NUTRIENT SOLUTION'), findsOneWidget);
+    expect(find.text('GROW LIGHT'), findsOneWidget);
 
     final growLightButton = find.byKey(const ValueKey('grow-light-button'));
     expect(growLightButton, findsOneWidget);
-    expect(find.text('OFF'), findsWidgets);
-
-    await tester.ensureVisible(growLightButton);
-    await tester.tap(growLightButton);
-    await tester.pump();
-
-    expect(find.text('ON'), findsWidgets);
+    expect(find.text('OFF'), findsOneWidget);
   });
 }
