@@ -1,4 +1,4 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
@@ -72,10 +72,13 @@ Preferences wifiPreferences;
 Preferences commandPreferences;
 bool firebaseInitialized = false;
 bool wifiConnectInProgress = false;
+bool mdnsStarted = false;
 unsigned long lastWifiRetry = 0;
 unsigned long wifiConnectStarted = 0;
+unsigned long lastHotspotAttempt = 0;
 const unsigned long wifiRetryInterval = 10000;
 const unsigned long wifiConnectTimeout = 30000;
+const unsigned long hotspotRetryInterval = 5000;
 
 static const char* AP_SSID = "ESP32-HYDRODECK";
 static const char* AP_PASSWORD = "hydrodeck";
@@ -132,8 +135,6 @@ bool phLimitRequestPending = false;
 int phLimitRequestIndex = 0;
 unsigned long waterLowSince1 = 0;
 unsigned long waterLowSince2 = 0;
-bool automaticPhPulse1 = false;
-bool automaticPhPulse2 = false;
 
 // NEW: Variables for 10-second delay automatic pH control
 unsigned long bed1PhLowSince = 0;
@@ -322,6 +323,7 @@ void publishCommandAck(const String& requestId, const String& status) {
 
 bool startPumpRun(int pumpNum, unsigned long durationMs, bool stopWhenFull, const String& requestId = "") {
   if (pumpNum < 1 || pumpNum > 8 || pumpRuns[pumpNum - 1].active) return false;
+  if ((pumpNum == 1 && pumpRuns[4].active) || (pumpNum == 5 && pumpRuns[0].active)) return false;
   if ((pumpNum == 2 || pumpNum == 3) && (pumpRuns[1].active || pumpRuns[2].active)) return false;
   if ((pumpNum == 6 || pumpNum == 7) && (pumpRuns[5].active || pumpRuns[6].active)) return false;
   PumpRunState& run = pumpRuns[pumpNum - 1];
@@ -333,6 +335,34 @@ bool startPumpRun(int pumpNum, unsigned long durationMs, bool stopWhenFull, cons
   publishActuatorState(remoteActuatorNames[pumpNum - 1], true);
   publishCommandAck(requestId, "running");
   return true;
+}
+
+void serviceAutomaticPhControl(int bed, float phValue, unsigned long now) {
+  const int upPump = bed == 1 ? 2 : 6;
+  const int downPump = bed == 1 ? 3 : 7;
+  const unsigned long pulseDuration =
+      (bed == 1 ? BED1_PH_PUMP_SECONDS : BED2_PH_PUMP_SECONDS) * 1000UL;
+  unsigned long& lowSince = bed == 1 ? bed1PhLowSince : bed2PhLowSince;
+  unsigned long& highSince = bed == 1 ? bed1PhHighSince : bed2PhHighSince;
+
+  if (phValue < minPhThreshold) {
+    highSince = 0;
+    if (lowSince == 0) lowSince = now;
+    if (now - lowSince >= phDelayThreshold &&
+        startPumpRun(upPump, pulseDuration, false)) {
+      lowSince = now;
+    }
+  } else if (phValue > maxPhThreshold) {
+    lowSince = 0;
+    if (highSince == 0) highSince = now;
+    if (now - highSince >= phDelayThreshold &&
+        startPumpRun(downPump, pulseDuration, false)) {
+      highSince = now;
+    }
+  } else {
+    lowSince = 0;
+    highSince = 0;
+  }
 }
 
 void stopPumpRun(int pumpNum) {
@@ -355,6 +385,7 @@ bool executePumpRequest(const String& actuator, bool enforceManualRules, const S
 
   unsigned long durationMs = 0;
   bool stopWhenFull = false;
+  int* manualShortRunCounter = nullptr;
   if (actuator == "phUp1" || actuator == "phDown1") {
     if ((actuator == "phUp1" && currentPhValue1 > maxPhThreshold) ||
       (actuator == "phDown1" && currentPhValue1 < minPhThreshold)) return false;
@@ -375,13 +406,15 @@ bool executePumpRequest(const String& actuator, bool enforceManualRules, const S
       if (enforceManualRules) {
         int& count = actuator == "waterPump1" ? manualWaterShortRuns1 : manualWaterShortRuns2;
         if (count >= 2) return false;
-        count++;
+        manualShortRunCounter = &count;
       }
     } else {
       stopWhenFull = true;
     }
   }
-  return startPumpRun(pumpNum, durationMs, stopWhenFull, requestId);
+  const bool started = startPumpRun(pumpNum, durationMs, stopWhenFull, requestId);
+  if (started && manualShortRunCounter != nullptr) (*manualShortRunCounter)++;
+  return started;
 }
 
 void servicePumpRuns() {
@@ -406,19 +439,40 @@ void processRemoteActuatorResult(AsyncResult& result) {
     return;
   }
 
+  const String commandPath = "/hydrodeck/commands/" + actuator;
+  const String payload = result.to<RealtimeDatabaseResult>().to<String>();
+  String requestId = payload;
+  bool growLightState = false;
+  bool validGrowLightCommand = true;
+
   if (actuator == "growLight") {
-    const bool value = result.to<RealtimeDatabaseResult>().to<bool>();
-    setGrowLight(value);
-    publishActuatorState(actuator, value);
-  } else {
-    const String requestId = result.to<RealtimeDatabaseResult>().to<String>();
+    const int separator = payload.lastIndexOf('|');
+    if (separator <= 0) {
+      validGrowLightCommand = false;
+    } else {
+      requestId = payload.substring(0, separator);
+      const String requestedState = payload.substring(separator + 1);
+      validGrowLightCommand = requestedState == "0" || requestedState == "1";
+      growLightState = requestedState == "1";
+    }
+  }
+
+  if (payload.length() > 0) {
+    Database.set<String>(aClient, commandPath, "");
     if (requestId.length() > 0) {
-      Database.set<String>(aClient, "/hydrodeck/commands/" + actuator, "");
       if (wasCommandConsumed(requestId)) {
         publishCommandAck(requestId, "completed");
       } else {
         rememberConsumedCommand(requestId);
-        if (!executePumpRequest(actuator, true, requestId)) {
+        if (actuator == "growLight") {
+          if (validGrowLightCommand) {
+            setGrowLight(growLightState);
+            publishActuatorState(actuator, growLightState);
+            publishCommandAck(requestId, "completed");
+          } else {
+            publishCommandAck(requestId, "failed");
+          }
+        } else if (!executePumpRequest(actuator, true, requestId)) {
           publishCommandAck(requestId, "failed");
         }
       }
@@ -432,9 +486,7 @@ void requestRemoteActuatorCommand() {
   if (!firebaseInitialized || !app.ready() || remoteCommandPending || phLimitRequestPending) return;
 
   const String actuator = remoteActuatorNames[remoteCommandIndex];
-  const String path = actuator == "growLight"
-      ? "/hydrodeck/growLight"
-      : "/hydrodeck/commands/" + actuator;
+  const String path = "/hydrodeck/commands/" + actuator;
   remoteCommandPending = true;
   Database.get(aClient, path, processRemoteActuatorResult, false, "remoteCommand");
 }
@@ -528,19 +580,36 @@ void handleCombinedStatus() {
 }
 
 void maintainProvisioningHotspot() {
-  const bool shouldEnableAp = WiFi.status() != WL_CONNECTED || provisioningPending;
-  if (shouldEnableAp) {
-    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
-    if (WiFi.softAPIP() != apIp) {
-      WiFi.softAPConfig(apIp, apGateway, apSubnet);
-      WiFi.softAP(AP_SSID, AP_PASSWORD);
-      Serial.println("Provisioning hotspot is available at 192.168.4.1.");
+  if (WiFi.getMode() == WIFI_AP_STA && WiFi.softAPIP() == apIp) return;
+
+  const unsigned long now = millis();
+  if (lastHotspotAttempt != 0 && now - lastHotspotAttempt < hotspotRetryInterval) return;
+  lastHotspotAttempt = now;
+
+  if (WiFi.getMode() != WIFI_AP_STA) {
+    if (!WiFi.mode(WIFI_AP_STA)) {
+      Serial.println("Failed to enable AP+STA mode; hotspot startup will retry.");
+      return;
     }
-  } else if (WiFi.getMode() == WIFI_AP_STA) {
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
-    Serial.println("Home Wi-Fi connected; provisioning hotspot disabled.");
+    delay(100);
   }
+
+  WiFi.setSleep(false);
+  WiFi.softAPdisconnect(false);
+  if (!WiFi.softAPConfig(apIp, apGateway, apSubnet)) {
+    Serial.println("Failed to configure the ESP32 hotspot IP; startup will retry.");
+    return;
+  }
+
+  const bool started = WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4);
+  if (!started || WiFi.softAPIP() != apIp) {
+    Serial.println("Failed to start ESP32-HYDRODECK hotspot; startup will retry.");
+    return;
+  }
+  Serial.print("ESP32 hotspot is broadcasting: ");
+  Serial.print(AP_SSID);
+  Serial.print(" at ");
+  Serial.println(WiFi.softAPIP());
 }
 
 // HTTP API Control Handlers
@@ -551,7 +620,6 @@ void handleControl() {
     bool state = (server.arg("state") == "1" || server.arg("state") == "on");
     if (actuator == "growLight") {
       setGrowLight(state);
-      if (firebaseInitialized && app.ready()) Database.set<bool>(aClient, "/hydrodeck/growLight", state);
       publishActuatorState(actuator, state);
       server.send(200, "text/plain", "OK");
       return;
@@ -686,32 +754,12 @@ void setup() {
   String savedPassword = wifiPreferences.getString("password", password);
   savedSsid.toCharArray(ssid, sizeof(ssid));
   savedPassword.toCharArray(password, sizeof(password));
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAPConfig(apIp, apGateway, apSubnet);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-  Serial.print("Provisioning hotspot: ");
-  Serial.println(AP_SSID);
+  maintainProvisioningHotspot();
 
   WiFi.begin(ssid, password);
   wifiConnectInProgress = true;
   wifiConnectStarted = millis();
-  Serial.print("Connecting to Wi-Fi");
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
-    delay(500);
-    Serial.print('.');
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnectInProgress = false;
-    Serial.print("\nESP32 IP: ");
-    Serial.println(WiFi.localIP());
-    if (MDNS.begin("hydrodeck")) Serial.println("mDNS: hydrodeck.local");
-    initializeFirebase();
-    maintainProvisioningHotspot();
-  } else {
-    wifiConnectInProgress = false;
-    Serial.println("\nWi-Fi connection failed. ESP32-HYDRODECK hotspot remains available.");
-  }
+  Serial.println("Connecting to home Wi-Fi in the background; hotspot remains available.");
 
   server.on("/", HTTP_GET, handleRootIdent);
   server.on("/provision", HTTP_GET, handleProvision);
@@ -727,6 +775,10 @@ void loop() {
   unsigned long now = millis();
 
   maintainProvisioningHotspot();
+  if (WiFi.status() == WL_CONNECTED && !mdnsStarted) {
+    mdnsStarted = MDNS.begin("hydrodeck");
+    if (mdnsStarted) Serial.println("mDNS: hydrodeck.local");
+  }
 
   // Apply replacement Wi-Fi credentials without disabling the setup AP.
   if (provisioningPending) {
@@ -818,73 +870,8 @@ void loop() {
     currentPhValue1 = readPhSensor(PH_PIN1, slope1);
     currentPhValue2 = readPhSensor(PH_PIN2, slope2);
 
-    // === BED 1 pH CONTROL WITH 10-SECOND DELAY ===
-    if (currentPhValue1 < minPhThreshold) {
-      // pH too low for bed 1
-      if (bed1PhLowSince == 0) {
-        // First time detecting low pH - start timer
-        bed1PhLowSince = now;
-      } else if (now - bed1PhLowSince >= phDelayThreshold) {
-        // pH has been low for >10 seconds - activate pH up pump for 3 seconds
-        if (!automaticPhPulse1 && startPumpRun(2, BED1_PH_PUMP_SECONDS * 1000UL, false)) {
-          automaticPhPulse1 = true;
-          // Reset timer after activation to prevent rapid re-triggering
-          bed1PhLowSince = 0;
-        }
-      }
-    } else if (currentPhValue1 > maxPhThreshold) {
-      // pH too high for bed 1
-      if (bed1PhHighSince == 0) {
-        // First time detecting high pH - start timer
-        bed1PhHighSince = now;
-      } else if (now - bed1PhHighSince >= phDelayThreshold) {
-        // pH has been high for >10 seconds - activate pH down pump for 3 seconds
-        if (!automaticPhPulse1 && startPumpRun(3, BED1_PH_PUMP_SECONDS * 1000UL, false)) {
-          automaticPhPulse1 = true;
-          // Reset timer after activation to prevent rapid re-triggering
-          bed1PhHighSince = 0;
-        }
-      }
-    } else {
-      // pH is in normal range - reset both timers
-      bed1PhLowSince = 0;
-      bed1PhHighSince = 0;
-      automaticPhPulse1 = false;
-    }
-
-    // === BED 2 pH CONTROL WITH 10-SECOND DELAY ===
-    if (currentPhValue2 < minPhThreshold) {
-      // pH too low for bed 2
-      if (bed2PhLowSince == 0) {
-        // First time detecting low pH - start timer
-        bed2PhLowSince = now;
-      } else if (now - bed2PhLowSince >= phDelayThreshold) {
-        // pH has been low for >10 seconds - activate pH up pump for 5 seconds
-        if (!automaticPhPulse2 && startPumpRun(6, BED2_PH_PUMP_SECONDS * 1000UL, false)) {
-          automaticPhPulse2 = true;
-          // Reset timer after activation to prevent rapid re-triggering
-          bed2PhLowSince = 0;
-        }
-      }
-    } else if (currentPhValue2 > maxPhThreshold) {
-      // pH too high for bed 2
-      if (bed2PhHighSince == 0) {
-        // First time detecting high pH - start timer
-        bed2PhHighSince = now;
-      } else if (now - bed2PhHighSince >= phDelayThreshold) {
-        // pH has been high for >10 seconds - activate pH down pump for 5 seconds
-        if (!automaticPhPulse2 && startPumpRun(7, BED2_PH_PUMP_SECONDS * 1000UL, false)) {
-          automaticPhPulse2 = true;
-          // Reset timer after activation to prevent rapid re-triggering
-          bed2PhHighSince = 0;
-        }
-      }
-    } else {
-      // pH is in normal range - reset both timers
-      bed2PhLowSince = 0;
-      bed2PhHighSince = 0;
-      automaticPhPulse2 = false;
-    }
+    serviceAutomaticPhControl(1, currentPhValue1, now);
+    serviceAutomaticPhControl(2, currentPhValue2, now);
   }
 
   const bool waterFull1 = digitalRead(WATER_SENSOR_PIN1) == HIGH;

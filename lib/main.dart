@@ -229,6 +229,18 @@ class DatabaseHelper {
     });
   }
 
+  Future<void> insertLogIfMissing(HistoricalData log, {bool cloudSynced = false}) async {
+    final db = await instance.database;
+    if (db == null) return;
+    final existing = await db.query(
+      'historical_logs',
+      where: 'timestamp = ? AND batchNumber = ?',
+      whereArgs: [log.timestamp.toIso8601String(), log.batchNumber],
+      limit: 1,
+    );
+    if (existing.isEmpty) await insertLog(log, cloudSynced: cloudSynced);
+  }
+
   HistoricalData _logFromRow(Map<String, Object?> row) => HistoricalData(
         timestamp: DateTime.parse(row['timestamp'] as String),
         pH: (row['pH'] as num).toDouble(),
@@ -513,11 +525,13 @@ class HydrodeckTelemetry {
   final GrowBedReading bed1;
   final GrowBedReading bed2;
   final bool growLightOn;
+  final Map<String, bool> actuatorStates;
 
   const HydrodeckTelemetry({
     required this.bed1,
     required this.bed2,
     required this.growLightOn,
+    required this.actuatorStates,
   });
 
   static double _readDouble(Map<String, dynamic> json, String key, {double fallback = 0.0}) {
@@ -594,23 +608,16 @@ class HydrodeckTelemetry {
       fallback: false,
     );
 
-    final waterPump1State = _readBoolLike(allMap, const ['waterPump1']);
-    final waterPump2State = _readBoolLike(allMap, const ['waterPump2']);
-    final phUp1State = _readBoolLike(allMap, const ['phUp1']);
-    final phDown1State = _readBoolLike(allMap, const ['phDown1']);
-    final nutrient1State = _readBoolLike(allMap, const ['nutrient1']);
-    final phUp2State = _readBoolLike(allMap, const ['phUp2']);
-    final phDown2State = _readBoolLike(allMap, const ['phDown2']);
-    final nutrient2State = _readBoolLike(allMap, const ['nutrient2']);
-
-    if (waterPump1State || waterPump2State || phUp1State || phDown1State || nutrient1State || phUp2State || phDown2State || nutrient2State) {
-      // no-op: these values are parsed for future UI use; the main display runs from the bed sensor payload.
-    }
+    final actuatorStates = {
+      for (final name in _actuatorControlKeys.keys)
+        name: _readBoolLike(allMap, [name]),
+    };
 
     return HydrodeckTelemetry(
       bed1: bed1,
       bed2: bed2,
       growLightOn: growLightOn,
+      actuatorStates: actuatorStates,
     );
   }
 }
@@ -1005,15 +1012,16 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     minuteTaskScheduled = true;
     try {
       final now = await getServerNow();
+        // Save and upload historical snapshots on five-minute local-time boundaries.
         final philippinesNow = _philippineTime(now);
+        final nextFiveMinute = (philippinesNow.minute ~/ 5 + 1) * 5;
         final nextBoundary = DateTime.utc(
           philippinesNow.year,
           philippinesNow.month,
           philippinesNow.day,
           philippinesNow.hour,
-          philippinesNow.minute,
-        )
-          .add(const Duration(minutes: 1));
+          nextFiveMinute,
+        );
         final wait = nextBoundary.difference(philippinesNow);
       Timer(wait.isNegative ? Duration.zero : wait, () async {
         try {
@@ -2164,11 +2172,25 @@ class PlantingRecord {
   });
 }
 
+class ActivePlantingSession {
+  final int batchNumber;
+  final DateTime startDate;
+
+  const ActivePlantingSession({required this.batchNumber, required this.startDate});
+}
+
 class CloudHistory {
   final List<PlantingRecord> runs;
   final List<HistoricalData> logs;
+  final ActivePlantingSession? activeSession;
+  final bool activeStateKnown;
 
-  const CloudHistory({required this.runs, required this.logs});
+  const CloudHistory({
+    required this.runs,
+    required this.logs,
+    this.activeSession,
+    this.activeStateKnown = false,
+  });
 }
 
 DateTime? _parseFirebaseTimestamp(dynamic value) {
@@ -2183,6 +2205,17 @@ DateTime? _parseFirebaseTimestamp(dynamic value) {
 }
 
 const String _sharedHydrodeckSystemId = 'hydrodeck';
+const Map<String, String> _actuatorControlKeys = {
+  'waterPump1': 'bed1_water',
+  'phUp1': 'bed1_ph_up',
+  'phDown1': 'bed1_ph_down',
+  'nutrient1': 'bed1_nutrient',
+  'waterPump2': 'bed2_water',
+  'phUp2': 'bed2_ph_up',
+  'phDown2': 'bed2_ph_down',
+  'nutrient2': 'bed2_nutrient',
+  'growLight': 'grow_light',
+};
 
 String _minuteBucketKey(DateTime timestamp) {
   final time = _philippineTime(timestamp);
@@ -2214,51 +2247,71 @@ Future<CloudHistory> downloadCloudHistory() async {
   final logs = <HistoricalData>[];
   final seenRuns = <int>{};
   final seenLogs = <String>{};
+  ActivePlantingSession? activeSession;
+  var activeStateKnown = false;
 
   if (FirebaseAuth.instance.currentUser != null) {
     try {
       final system = FirebaseFirestore.instance
           .collection('hydrodeckSystems')
           .doc(_sharedHydrodeckSystemId);
-      final snapshots = await Future.wait([
-        system.collection('plantingRuns').get(),
-        system.collection('minuteLogs').get(),
-      ]).timeout(const Duration(seconds: 6));
+      final activeDocumentFuture = system
+          .collection('metadata')
+          .doc('activePlanting')
+          .get();
+      try {
+        final activeDocument = await activeDocumentFuture.timeout(const Duration(seconds: 4));
+        activeStateKnown = activeDocument.exists;
+        final activeData = activeDocument.data();
+        if (activeData?['active'] == true) {
+          final batch = (activeData?['batchNumber'] as num?)?.toInt();
+          final start = _parseFirebaseTimestamp(activeData?['startedAt'] ?? activeData?['startDate']);
+          if (batch != null && start != null) {
+            activeSession = ActivePlantingSession(batchNumber: batch, startDate: start);
+          }
+        }
+      } catch (_) {}
 
-      for (final document in snapshots[0].docs) {
-        final map = document.data();
-        final batch = (map['batchNumber'] as num?)?.toInt() ?? int.tryParse(document.id);
-        final start = _parseFirebaseTimestamp(map['startedAt'] ?? map['startDate']);
-        final end = _parseFirebaseTimestamp(map['endedAt'] ?? map['endDate']);
-        final days = (map['totalDays'] as num?)?.toInt() ?? 1;
-        if (batch != null && start != null && end != null && seenRuns.add(batch)) {
-          runs.add(PlantingRecord(
+      try {
+        final snapshots = await Future.wait([
+          system.collection('plantingRuns').get(),
+          system.collection('minuteLogs').get(),
+        ]).timeout(const Duration(seconds: 6));
+        for (final document in snapshots[0].docs) {
+          final map = document.data();
+          final batch = (map['batchNumber'] as num?)?.toInt() ?? int.tryParse(document.id);
+          final start = _parseFirebaseTimestamp(map['startedAt'] ?? map['startDate']);
+          final end = _parseFirebaseTimestamp(map['endedAt'] ?? map['endDate']);
+          final days = (map['totalDays'] as num?)?.toInt() ?? 1;
+          if (batch != null && start != null && end != null && seenRuns.add(batch)) {
+            runs.add(PlantingRecord(
+              batchNumber: batch,
+              startDate: start,
+              endDate: end,
+              totalDays: days,
+            ));
+          }
+        }
+
+        for (final document in snapshots[1].docs) {
+          final map = document.data();
+          final timestamp = _parseFirebaseTimestamp(map['sampleTime'] ?? map['timestamp']);
+          if (timestamp == null) continue;
+          final batch = (map['batchNumber'] as num?)?.toInt();
+          final dedupeKey = '${batch ?? 0}|${document.id}';
+          if (!seenLogs.add(dedupeKey)) continue;
+          logs.add(HistoricalData(
+            timestamp: timestamp,
+            pH: (map['pH'] as num?)?.toDouble() ?? 0,
+            temperature: map['temperature']?.toString() ?? '',
+            waterLevel: map['waterLevel']?.toString() ?? 'Needs water',
+            tds: (map['tds'] as num?)?.toDouble() ?? 0,
             batchNumber: batch,
-            startDate: start,
-            endDate: end,
-            totalDays: days,
+            bed1: _decodeBedData(map['bed1']),
+            bed2: _decodeBedData(map['bed2']),
           ));
         }
-      }
-
-      for (final document in snapshots[1].docs) {
-        final map = document.data();
-        final timestamp = _parseFirebaseTimestamp(map['timestamp']);
-        if (timestamp == null) continue;
-        final batch = (map['batchNumber'] as num?)?.toInt();
-        final dedupeKey = '${batch ?? 0}|${document.id}';
-        if (!seenLogs.add(dedupeKey)) continue;
-        logs.add(HistoricalData(
-          timestamp: timestamp,
-          pH: (map['pH'] as num?)?.toDouble() ?? 0,
-          temperature: map['temperature']?.toString() ?? '',
-          waterLevel: map['waterLevel']?.toString() ?? 'Needs water',
-          tds: (map['tds'] as num?)?.toDouble() ?? 0,
-          batchNumber: batch,
-          bed1: _decodeBedData(map['bed1']),
-          bed2: _decodeBedData(map['bed2']),
-        ));
-      }
+      } catch (_) {}
     } catch (_) {
       // Keep local history usable while Firestore is unavailable.
     }
@@ -2323,7 +2376,12 @@ Future<CloudHistory> downloadCloudHistory() async {
 
   runs.sort((a, b) => a.batchNumber.compareTo(b.batchNumber));
   logs.sort((a, b) => b.timestamp.compareTo(a.timestamp));
-  return CloudHistory(runs: runs, logs: logs);
+  return CloudHistory(
+    runs: runs,
+    logs: logs,
+    activeSession: activeSession,
+    activeStateKnown: activeStateKnown,
+  );
 }
 
 Future<void> uploadHistoricalLog(HistoricalData snapshot) async {
@@ -2374,26 +2432,78 @@ Future<bool> hasPendingCloudRecords() async {
   return await DatabaseHelper.instance.getNextUnsyncedLog() != null;
 }
 
-Future<int> reservePlantingBatchNumber(int fallbackNumber) async {
-  if (FirebaseAuth.instance.currentUser == null) return fallbackNumber;
-  final counter = FirebaseFirestore.instance
+Future<void> syncLegacyActivePlantingSession(ActivePlantingSession session) async {
+  if (FirebaseAuth.instance.currentUser == null) return;
+  final system = FirebaseFirestore.instance
       .collection('hydrodeckSystems')
-      .doc(_sharedHydrodeckSystemId)
-      .collection('metadata')
-      .doc('counters');
+      .doc(_sharedHydrodeckSystemId);
+  final activeRef = system.collection('metadata').doc('activePlanting');
+  final counterRef = system.collection('metadata').doc('counters');
   try {
-    return await FirebaseFirestore.instance.runTransaction<int>((transaction) async {
-      final snapshot = await transaction.get(counter);
-      final stored = (snapshot.data()?['lastBatchNumber'] as num?)?.toInt() ?? 0;
-      final next = stored >= fallbackNumber ? stored + 1 : fallbackNumber;
-      transaction.set(counter, {
-        'lastBatchNumber': next,
+    await FirebaseFirestore.instance.runTransaction<void>((transaction) async {
+      final activeSnapshot = await transaction.get(activeRef);
+      if (activeSnapshot.exists) return;
+      final counterSnapshot = await transaction.get(counterRef);
+      final stored = (counterSnapshot.data()?['lastBatchNumber'] as num?)?.toInt() ?? 0;
+      transaction.set(counterRef, {
+        'lastBatchNumber': stored < session.batchNumber ? session.batchNumber : stored,
         'updatedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
-      return next;
+      transaction.set(activeRef, {
+        'active': true,
+        'status': 'active',
+        'systemId': _sharedHydrodeckSystemId,
+        'batchNumber': session.batchNumber,
+        'startedAt': Timestamp.fromDate(session.startDate.toUtc()),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+    });
+  } catch (_) {}
+}
+
+Future<ActivePlantingSession> startOrResumePlanting(
+  DateTime now,
+  int fallbackNumber,
+) async {
+  if (FirebaseAuth.instance.currentUser == null) {
+    return ActivePlantingSession(batchNumber: fallbackNumber, startDate: now);
+  }
+  final system = FirebaseFirestore.instance
+      .collection('hydrodeckSystems')
+      .doc(_sharedHydrodeckSystemId);
+  final activeRef = system.collection('metadata').doc('activePlanting');
+  final counterRef = system.collection('metadata').doc('counters');
+  try {
+    return await FirebaseFirestore.instance.runTransaction<ActivePlantingSession>((transaction) async {
+      final activeSnapshot = await transaction.get(activeRef);
+      final activeData = activeSnapshot.data();
+      if (activeData?['active'] == true) {
+        final existingBatch = (activeData?['batchNumber'] as num?)?.toInt();
+        final existingStart = _parseFirebaseTimestamp(activeData?['startedAt'] ?? activeData?['startDate']);
+        if (existingBatch != null && existingStart != null) {
+          return ActivePlantingSession(batchNumber: existingBatch, startDate: existingStart);
+        }
+      }
+
+      final counterSnapshot = await transaction.get(counterRef);
+      final stored = (counterSnapshot.data()?['lastBatchNumber'] as num?)?.toInt() ?? 0;
+      final batchNumber = stored >= fallbackNumber ? stored + 1 : fallbackNumber;
+      transaction.set(counterRef, {
+        'lastBatchNumber': batchNumber,
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+      transaction.set(activeRef, {
+        'active': true,
+        'status': 'active',
+        'systemId': _sharedHydrodeckSystemId,
+        'batchNumber': batchNumber,
+        'startedAt': Timestamp.fromDate(now.toUtc()),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      return ActivePlantingSession(batchNumber: batchNumber, startDate: now);
     });
   } catch (_) {
-    return fallbackNumber;
+    return ActivePlantingSession(batchNumber: fallbackNumber, startDate: now);
   }
 }
 
@@ -2404,18 +2514,35 @@ Future<bool> uploadPlantingRecord(PlantingRecord record) async {
       .doc(_sharedHydrodeckSystemId)
       .collection('plantingRuns')
       .doc(record.batchNumber.toString());
+  final activeRef = FirebaseFirestore.instance
+      .collection('hydrodeckSystems')
+      .doc(_sharedHydrodeckSystemId)
+      .collection('metadata')
+      .doc('activePlanting');
   return FirebaseFirestore.instance.runTransaction<bool>((transaction) async {
     final existing = await transaction.get(runRef);
-    if (existing.exists) return true;
-    transaction.set(runRef, {
-      'systemId': _sharedHydrodeckSystemId,
-      'batchNumber': record.batchNumber,
-      'startedAt': Timestamp.fromDate(record.startDate.toUtc()),
-      'endedAt': Timestamp.fromDate(record.endDate.toUtc()),
-      'uploadedAt': FieldValue.serverTimestamp(),
-      'totalDays': record.totalDays,
-      'status': 'completed',
-    });
+    final active = await transaction.get(activeRef);
+    if (!existing.exists) {
+      transaction.set(runRef, {
+        'systemId': _sharedHydrodeckSystemId,
+        'batchNumber': record.batchNumber,
+        'startedAt': Timestamp.fromDate(record.startDate.toUtc()),
+        'endedAt': Timestamp.fromDate(record.endDate.toUtc()),
+        'uploadedAt': FieldValue.serverTimestamp(),
+        'totalDays': record.totalDays,
+        'status': 'completed',
+      });
+    }
+    if (active.data()?['active'] == true &&
+        (active.data()?['batchNumber'] as num?)?.toInt() == record.batchNumber) {
+      transaction.set(activeRef, {
+        'active': false,
+        'status': 'completed',
+        'endedAt': Timestamp.fromDate(record.endDate.toUtc()),
+        'totalDays': record.totalDays,
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    }
     return true;
   });
 }
@@ -2920,11 +3047,15 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
   bool _isLoading = true;
 
   bool _isPlantingActive = false;
+  bool _showContinuePrompt = false;
+  bool _dashboardOpen = false;
   DateTime? _plantingStartDate;
+  int? _activeBatchNumber;
   List<PlantingRecord> _pastPlantingRuns = [];
   
   String _activeEsp32Ip = "hydrodeck.local";
   StreamSubscription? _bgSubscription;
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _activePlantingSubscription;
 
   @override
   void initState() {
@@ -2936,15 +3067,15 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
   @override
   void dispose() {
     _bgSubscription?.cancel();
+    _activePlantingSubscription?.cancel();
     super.dispose();
   }
 
   Future<void> _loadStoredSessionAndData() async {
-    final activeDate = await DatabaseHelper.instance.getActiveSession();
+    final localActiveDate = await DatabaseHelper.instance.getActiveSession();
+    final localActiveBatch = await DatabaseHelper.instance.getActiveBatchNumber();
     final localRuns = await DatabaseHelper.instance.getPlantingHistory();
-    final cloudHistory = await downloadCloudHistory().timeout(const Duration(seconds: 4)).catchError(
-      (_) => const CloudHistory(runs: [], logs: []),
-    );
+    final cloudHistory = await downloadCloudHistory();
     final pastRuns = <PlantingRecord>[...localRuns];
     final knownBatches = pastRuns.map((run) => run.batchNumber).toSet();
     for (final run in cloudHistory.runs) {
@@ -2960,27 +3091,48 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     for (final log in cloudHistory.logs) {
       final key = '${log.batchNumber}|${log.timestamp.toIso8601String()}';
       if (knownLogKeys.add(key)) {
-        await DatabaseHelper.instance.insertLog(log, cloudSynced: true);
+        await DatabaseHelper.instance.insertLogIfMissing(log, cloudSynced: true);
       }
     }
+
+    ActivePlantingSession? activeSession;
+    if (cloudHistory.activeStateKnown) {
+      activeSession = cloudHistory.activeSession;
+      if (activeSession == null) {
+        await DatabaseHelper.instance.clearActiveSession();
+      } else {
+        await DatabaseHelper.instance.saveActiveSession(
+          activeSession.startDate,
+          activeSession.batchNumber,
+        );
+      }
+    } else if (localActiveDate != null) {
+      activeSession = ActivePlantingSession(
+        batchNumber: localActiveBatch ??
+            (pastRuns.isEmpty ? 1 : pastRuns.last.batchNumber + 1),
+        startDate: localActiveDate,
+      );
+      unawaited(syncLegacyActivePlantingSession(activeSession));
+    }
+
     final savedIp = await DatabaseHelper.instance.getActiveIp();
     if (mounted) {
       setState(() {
         _pastPlantingRuns = pastRuns..sort((a, b) => a.batchNumber.compareTo(b.batchNumber));
         _activeEsp32Ip = savedIp;
-
-        if (activeDate != null) {
-          _plantingStartDate = activeDate;
-          _isPlantingActive = true;
-        }
+        _plantingStartDate = activeSession?.startDate;
+        _activeBatchNumber = activeSession?.batchNumber;
+        _isPlantingActive = activeSession != null;
+        _showContinuePrompt = activeSession != null;
         _isLoading = false;
       });
     }
     final hasPendingRecords = await hasPendingCloudRecords();
-    if ((activeDate != null || hasPendingRecords) && _supportsBackgroundService) {
+    if ((activeSession != null || hasPendingRecords) && _supportsBackgroundService) {
       await initializeBackgroundService();
-      FlutterBackgroundService().invoke('setPlantingState', {'active': activeDate != null});
+      FlutterBackgroundService().invoke('setPlantingState', {'active': activeSession != null});
     }
+    _subscribeToActivePlanting();
   }
 
   void _listenToBackgroundService() {
@@ -2996,6 +3148,72 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     } catch (_) {}
   }
 
+  void _subscribeToActivePlanting() {
+    try {
+      final activeRef = FirebaseFirestore.instance
+          .collection('hydrodeckSystems')
+          .doc(_sharedHydrodeckSystemId)
+          .collection('metadata')
+          .doc('activePlanting');
+      _activePlantingSubscription = activeRef.snapshots().listen((snapshot) async {
+        final data = snapshot.data();
+        if (data == null) return;
+        final batch = (data['batchNumber'] as num?)?.toInt();
+        final start = _parseFirebaseTimestamp(data['startedAt'] ?? data['startDate']);
+        if (data['active'] == true && batch != null && start != null) {
+          await DatabaseHelper.instance.saveActiveSession(start, batch);
+          if (!mounted) return;
+          final isNewSession = !_isPlantingActive || _activeBatchNumber != batch;
+          setState(() {
+            _isPlantingActive = true;
+            _plantingStartDate = start;
+            _activeBatchNumber = batch;
+            if (isNewSession) {
+              _showContinuePrompt = true;
+              _dashboardOpen = false;
+            }
+          });
+          if (isNewSession && _supportsBackgroundService) {
+            await initializeBackgroundService();
+            FlutterBackgroundService().invoke('setPlantingState', {'active': true});
+          }
+          return;
+        }
+
+        if (batch != null && start != null) {
+          final end = _parseFirebaseTimestamp(data['endedAt']);
+          if (end != null) {
+            final record = PlantingRecord(
+              batchNumber: batch,
+              startDate: start,
+              endDate: end,
+              totalDays: (data['totalDays'] as num?)?.toInt() ?? 1,
+            );
+            if (!_pastPlantingRuns.any((run) => run.batchNumber == batch)) {
+              await DatabaseHelper.instance.insertPlantingRecord(record, cloudSynced: true);
+              if (mounted) setState(() => _pastPlantingRuns.add(record));
+            }
+          }
+        }
+
+        if (batch == _activeBatchNumber) {
+          await DatabaseHelper.instance.clearActiveSession();
+          if (!mounted) return;
+          setState(() {
+            _isPlantingActive = false;
+            _showContinuePrompt = false;
+            _dashboardOpen = false;
+            _plantingStartDate = null;
+            _activeBatchNumber = null;
+          });
+          if (_supportsBackgroundService) {
+            FlutterBackgroundService().invoke('setPlantingState', {'active': false});
+          }
+        }
+      }, onError: (_) {});
+    } catch (_) {}
+  }
+
   void _startPlanting() async {
     final now = await getServerNow();
     final localCandidate = _pastPlantingRuns.fold<int>(
@@ -3003,8 +3221,11 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
           (maximum, run) => run.batchNumber > maximum ? run.batchNumber : maximum,
         ) +
         1;
-    final batchNumber = await reservePlantingBatchNumber(localCandidate);
-    await DatabaseHelper.instance.saveActiveSession(now, batchNumber);
+    final activeSession = await startOrResumePlanting(now, localCandidate);
+    await DatabaseHelper.instance.saveActiveSession(
+      activeSession.startDate,
+      activeSession.batchNumber,
+    );
 
     if (_supportsBackgroundService) {
       await initializeBackgroundService();
@@ -3012,8 +3233,18 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     }
 
     setState(() {
-      _plantingStartDate = now;
+      _plantingStartDate = activeSession.startDate;
+      _activeBatchNumber = activeSession.batchNumber;
       _isPlantingActive = true;
+      _showContinuePrompt = false;
+      _dashboardOpen = true;
+    });
+  }
+
+  void _continuePlanting() {
+    setState(() {
+      _showContinuePrompt = false;
+      _dashboardOpen = true;
     });
   }
 
@@ -3023,7 +3254,8 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     final now = await getServerNow();
     int totalDays = (now.difference(_plantingStartDate!).inDays + 1).clamp(1, 999999);
 
-    final batchNumber = await DatabaseHelper.instance.getActiveBatchNumber() ??
+    final batchNumber = _activeBatchNumber ??
+      await DatabaseHelper.instance.getActiveBatchNumber() ??
         (_pastPlantingRuns.isEmpty ? 1 : _pastPlantingRuns.last.batchNumber + 1);
     final newRecord = PlantingRecord(
       batchNumber: batchNumber,
@@ -3034,20 +3266,22 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
 
     await DatabaseHelper.instance.insertPlantingRecord(newRecord);
     await DatabaseHelper.instance.clearActiveSession();
+    unawaited(uploadPlantingRecord(newRecord).then((uploaded) async {
+      if (uploaded) {
+        await DatabaseHelper.instance.markPlantingRecordCloudSynced(newRecord.batchNumber);
+      }
+    }).catchError((_) {}));
     if (_supportsBackgroundService) {
       FlutterBackgroundService().invoke('setPlantingState', {'active': false});
-    } else {
-      try {
-        if (await uploadPlantingRecord(newRecord)) {
-          await DatabaseHelper.instance.markPlantingRecordCloudSynced(newRecord.batchNumber);
-        }
-      } catch (_) {}
     }
 
     setState(() {
       _pastPlantingRuns.add(newRecord);
       _isPlantingActive = false;
+      _showContinuePrompt = false;
+      _dashboardOpen = false;
       _plantingStartDate = null;
+      _activeBatchNumber = null;
     });
   }
 
@@ -3061,14 +3295,22 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
       );
     }
 
-    if (!_isPlantingActive) {
+    if (!_isPlantingActive || (_showContinuePrompt && !_dashboardOpen)) {
       return StartPlantingScreen(
         onStart: _startPlanting,
+        onContinue: _continuePlanting,
+        activeSession: _isPlantingActive && _plantingStartDate != null && _activeBatchNumber != null
+            ? ActivePlantingSession(
+                batchNumber: _activeBatchNumber!,
+                startDate: _plantingStartDate!,
+              )
+            : null,
         history: _pastPlantingRuns,
       );
     }
     return HydroponicsDashboard(
       startDate: _plantingStartDate!,
+      batchNumber: _activeBatchNumber,
       onEndPlanting: _endPlanting,
       initialIp: _activeEsp32Ip,
     );
@@ -3077,11 +3319,15 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
 
 class StartPlantingScreen extends StatelessWidget {
   final VoidCallback onStart;
+  final VoidCallback onContinue;
+  final ActivePlantingSession? activeSession;
   final List<PlantingRecord> history;
 
   const StartPlantingScreen({
     super.key,
     required this.onStart,
+    required this.onContinue,
+    this.activeSession,
     required this.history,
   });
 
@@ -3230,7 +3476,7 @@ class StartPlantingScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: 60),
                 ElevatedButton(
-                  onPressed: onStart,
+                  onPressed: activeSession == null ? onStart : onContinue,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF2DC867),
                     foregroundColor: Colors.white,
@@ -3240,8 +3486,8 @@ class StartPlantingScreen extends StatelessWidget {
                     ),
                     elevation: 2,
                   ),
-                  child: const Text(
-                    'Start Planting',
+                  child: Text(
+                    activeSession == null ? 'Start Planting' : 'Continue Planting',
                     style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                   ),
                 ),
@@ -3272,12 +3518,14 @@ class StartPlantingScreen extends StatelessWidget {
 
 class HydroponicsDashboard extends StatefulWidget {
   final DateTime startDate;
+  final int? batchNumber;
   final VoidCallback onEndPlanting;
   final String initialIp;
 
   const HydroponicsDashboard({
     super.key,
     required this.startDate,
+    this.batchNumber,
     required this.onEndPlanting,
     this.initialIp = "hydrodeck.local",
   });
@@ -3317,6 +3565,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   StreamSubscription? _telemetrySub;
   StreamSubscription? _snapshotSub;
   StreamSubscription? _firebaseSub;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _cloudLogsSub;
   StreamSubscription? _firebaseConnectionSub;
   StreamSubscription? _firebaseCommandsSub; // Subscription for command status updates
   Timer? _connectionTimer;
@@ -3354,6 +3603,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _wifiSsidController = TextEditingController();
     _wifiPasswordController = TextEditingController();
     _loadStoredLogsAndSettings();
+    unawaited(_subscribeToCloudLogs());
     _subscribeToFirebase();
     _subscribeToFirebaseConnection();
     _subscribeToBackgroundUpdates();
@@ -3370,7 +3620,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         // Only prompt to provision the ESP32 when the user is on the Home screen
         // and the device has been offline for a while. This prevents intrusive
         // popups while navigating other screens.
-        if (_connectionStatus.startsWith('Connected')) {
+        if (_connectionStatus != 'Firebase Offline') {
           _offlineSince = null;
           _wifiPromptShown = false;
         } else {
@@ -3390,6 +3640,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _telemetrySub?.cancel();
     _snapshotSub?.cancel();
     _firebaseSub?.cancel();
+    _cloudLogsSub?.cancel();
     _firebaseConnectionSub?.cancel();
     _firebaseCommandsSub?.cancel();
     _connectionTimer?.cancel();
@@ -3431,7 +3682,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         setState(() {
           if (heartbeatFresh) {
             _lastFirebaseTelemetryAt = DateTime.now();
-            _firebaseConnected = true;
           } else {
             _lastFirebaseTelemetryAt = null;
           }
@@ -3474,7 +3724,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   }
 
   void _subscribeToFirebaseConnection() {
-    if (kIsWeb) return;
     try {
       final connectionRef = FirebaseDatabase.instanceFor(
         app: Firebase.app(),
@@ -3483,13 +3732,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
       _firebaseConnectionSub = connectionRef.onValue.listen((event) {
         if (!mounted) return;
         setState(() {
-          _firebaseConnected = event.snapshot.value == true || _hasFreshFirebaseTelemetry;
+          _firebaseConnected = event.snapshot.value == true;
           _updateConnectionStatus();
         });
       }, onError: (_) {
         if (!mounted) return;
         setState(() {
-          _firebaseConnected = _hasFreshFirebaseTelemetry;
+          _firebaseConnected = false;
           _updateConnectionStatus();
         });
       });
@@ -3531,31 +3780,51 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   }
 
   String? _getActuatorBusyKey(String actuatorName) {
-    switch (actuatorName) {
-      case 'waterPump1': return 'bed1_water';
-      case 'phUp1': return 'bed1_ph_up';
-      case 'phDown1': return 'bed1_ph_down';
-      case 'nutrientPump1': return 'bed1_nutrient';
-      case 'waterPump2': return 'bed2_water';
-      case 'phUp2': return 'bed2_ph_up';
-      case 'phDown2': return 'bed2_ph_down';
-      case 'nutrientPump2': return 'bed2_nutrient';
-      case 'growLight': return 'grow_light';
-      default: return null;
+    return _actuatorControlKeys[actuatorName];
+  }
+
+  bool _otherWaterPumpIsRunning(String actuatorName) {
+    final otherActuator = switch (actuatorName) {
+      'waterPump1' => 'waterPump2',
+      'waterPump2' => 'waterPump1',
+      _ => null,
+    };
+    if (otherActuator == null) return false;
+    final otherKey = _actuatorControlKeys[otherActuator]!;
+    return _actuatorBusy[otherKey] == true ||
+        _pendingCommandIds.containsKey(otherActuator);
+  }
+
+  void _updateActuatorStates(Map<String, bool> states) {
+    for (final entry in states.entries) {
+      final key = _actuatorControlKeys[entry.key];
+      if (key != null) {
+        _updateActuatorFromFirebase(key, entry.key, {entry.key: entry.value});
+      }
     }
   }
 
   void _updateActuatorFromFirebase(String key, String actuatorName, Map<String, dynamic> actuators) {
     if (!actuators.containsKey(actuatorName)) return;
     final value = HydrodeckTelemetry._readBoolLike(actuators, [actuatorName]);
+    final pendingId = _pendingCommandIds[actuatorName];
+    if (pendingId != null) {
+      if (value) {
+        _actuatorsSeenRunning.add(key);
+      } else if (_actuatorsSeenRunning.remove(key)) {
+        _clearPendingCommand(actuatorName, pendingId);
+      } else {
+        _actuatorBusy[key] = true;
+      }
+      return;
+    }
+
     _controlStates[key] = value;
     _actuatorBusy[key] = value;
     if (value) {
       _actuatorsSeenRunning.add(key);
-    } else if (_actuatorsSeenRunning.remove(key)) {
-      final pendingId = _pendingCommandIds.remove(actuatorName);
-      if (pendingId != null) _commandTimeouts.remove(pendingId)?.cancel();
-      _pendingActuatorStates.remove(key);
+    } else {
+      _actuatorsSeenRunning.remove(key);
     }
   }
 
@@ -3608,6 +3877,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           _bed1 = result.value.bed1;
           _bed2 = result.value.bed2;
           _controlStates['grow_light'] = result.value.growLightOn;
+          _updateActuatorStates(result.value.actuatorStates);
           _esp32Ip = result.key;
           _ipController.text = result.key;
           _lastLocalTelemetryAt = DateTime.now();
@@ -3630,7 +3900,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           final connection = await database.ref('.info/connected')
               .get()
               .timeout(const Duration(seconds: 2));
-          firebaseReachable = connection.value == true || _firebaseConnected;
+          firebaseReachable = connection.value == true;
           final snapshot = await database.ref('hydrodeck/lastSeen')
               .get()
               .timeout(const Duration(seconds: 2));
@@ -3648,7 +3918,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         } catch (_) {}
         if (mounted) {
           setState(() {
-            _firebaseConnected = firebaseReachable || freshDeviceHeartbeat;
+            _firebaseConnected = firebaseReachable;
             _lastLocalTelemetryAt = null;
             if (!freshDeviceHeartbeat) _lastFirebaseTelemetryAt = null;
           });
@@ -3685,7 +3955,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
 
   
   Future<void> _loadStoredLogsAndSettings() async {
-    final activeBatchNumber = await DatabaseHelper.instance.getActiveBatchNumber();
+    final activeBatchNumber = widget.batchNumber ??
+        await DatabaseHelper.instance.getActiveBatchNumber();
     final storedLogs = activeBatchNumber == null
       ? <HistoricalData>[]
       : await DatabaseHelper.instance.getLogsForBatch(activeBatchNumber);
@@ -3707,6 +3978,54 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         }
       });
     }
+  }
+
+  Future<void> _subscribeToCloudLogs() async {
+    final batchNumber = widget.batchNumber ??
+        await DatabaseHelper.instance.getActiveBatchNumber();
+    if (batchNumber == null || FirebaseAuth.instance.currentUser == null) return;
+
+    try {
+      _cloudLogsSub = FirebaseFirestore.instance
+          .collection('hydrodeckSystems')
+          .doc(_sharedHydrodeckSystemId)
+          .collection('minuteLogs')
+          .where('batchNumber', isEqualTo: batchNumber)
+          .snapshots()
+          .listen((snapshot) async {
+        final incoming = <HistoricalData>[];
+        for (final document in snapshot.docs) {
+          final map = document.data();
+          final timestamp = _parseFirebaseTimestamp(map['sampleTime'] ?? map['timestamp']);
+          if (timestamp == null) continue;
+          incoming.add(HistoricalData(
+            timestamp: timestamp,
+            pH: (map['pH'] as num?)?.toDouble() ?? 0,
+            temperature: map['temperature']?.toString() ?? '',
+            waterLevel: map['waterLevel']?.toString() ?? 'Needs water',
+            tds: (map['tds'] as num?)?.toDouble() ?? 0,
+            batchNumber: (map['batchNumber'] as num?)?.toInt() ?? batchNumber,
+            bed1: _decodeBedData(map['bed1']),
+            bed2: _decodeBedData(map['bed2']),
+          ));
+        }
+        for (final log in incoming) {
+          await DatabaseHelper.instance.insertLogIfMissing(log, cloudSynced: true);
+        }
+        if (!mounted || incoming.isEmpty) return;
+        setState(() {
+          final merged = <String, HistoricalData>{
+            for (final log in _historyLogs)
+              '${log.batchNumber}|${log.timestamp.toUtc().millisecondsSinceEpoch}': log,
+          };
+          for (final log in incoming) {
+            merged['${log.batchNumber}|${log.timestamp.toUtc().millisecondsSinceEpoch}'] = log;
+          }
+          _historyLogs = merged.values.toList()
+            ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+        });
+      }, onError: (_) {});
+    } catch (_) {}
   }
 
   
@@ -3825,6 +4144,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _pendingCommandIds[actuatorName] = commandId;
     _pendingActuatorStates[key] = true;
     _actuatorBusy[key] = true;
+    _actuatorsSeenRunning.remove(key);
     _commandTimeouts[commandId]?.cancel();
     final timeout = actuatorName.startsWith('waterPump')
         ? const Duration(minutes: 3)
@@ -3852,6 +4172,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
 
   Future<void> _toggleActuator(String key, String actuatorName) async {
     if (_pendingCommandIds.containsKey(actuatorName) || _actuatorBusy[key] == true) return;
+    if (_otherWaterPumpIsRunning(actuatorName)) return;
     if ((key == 'bed1_ph_down' && _bed1.ph < _minPhThreshold) ||
         (key == 'bed1_ph_up' && _bed1.ph > _maxPhThreshold) ||
         (key == 'bed2_ph_down' && _bed2.ph < _minPhThreshold) ||
@@ -3875,27 +4196,19 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     final commandId = commandSlot.push().key ??
         'cmd_${DateTime.now().microsecondsSinceEpoch}_${actuatorName.hashCode.abs()}';
 
-    if (!isGrowLight) {
-      _trackPendingCommand(key, actuatorName, commandId);
-    } else {
-      _actuatorBusy[key] = true;
-    }
+    _trackPendingCommand(key, actuatorName, commandId);
+    if (isGrowLight) _pendingActuatorStates[key] = nextGrowLight;
     if (mounted) setState(() {});
 
     var sent = false;
-    if (_firebaseConnected) {
-      try {
-        if (isGrowLight) {
-          await database.ref('hydrodeck/growLight').set(nextGrowLight);
-          _controlStates['grow_light'] = nextGrowLight;
-          sent = true;
-        } else {
-          await commandSlot.set(commandId);
-          sent = true;
-        }
-      } catch (_) {
-        // The local HTTP route retries this same request ID safely.
-      }
+    try {
+      final payload = isGrowLight
+          ? '$commandId|${nextGrowLight ? 1 : 0}'
+          : commandId;
+      await commandSlot.set(payload).timeout(const Duration(seconds: 3));
+      sent = true;
+    } catch (_) {
+      // Retry over local HTTP when Firebase cannot accept the command.
     }
 
     if (!sent) {
@@ -3913,6 +4226,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           if (response.statusCode == 200) {
             if (isGrowLight) {
               _controlStates['grow_light'] = nextGrowLight;
+              _clearPendingCommand(actuatorName, commandId);
             }
             if (target != savedTarget && _supportsBackgroundService) {
               FlutterBackgroundService().invoke('updateIp', {'ip': target});
@@ -3926,18 +4240,54 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
 
     if (!sent) {
       // Both Firebase and HTTP failed
-      if (isGrowLight) {
-        _actuatorBusy[key] = false;
-      } else {
-        _clearPendingCommand(actuatorName, commandId);
-      }
+      _clearPendingCommand(actuatorName, commandId);
       if (mounted) setState(() {});
       return;
     }
+  }
 
-    if (isGrowLight) {
-      _actuatorBusy[key] = false;
-      if (mounted) setState(() {});
+  Future<void> _connectToEsp32Hotspot() async {
+    if (_isHotspotConnecting) return;
+    setState(() {
+      _isHotspotConnecting = true;
+      _hotspotStatus = 'Connecting to $_esp32Hotspot...';
+    });
+    try {
+      await WiFiForIoTPlugin.connect(
+        _esp32Hotspot,
+        password: _esp32HotspotPassword,
+        security: NetworkSecurity.WPA,
+        joinOnce: true,
+      );
+      await WiFiForIoTPlugin.forceWifiUsage(true);
+      final response = await http.get(
+        Uri.parse('http://192.168.4.1/status'),
+        headers: {'Connection': 'close'},
+      ).timeout(const Duration(seconds: 5));
+      if (response.statusCode != 200) {
+        throw Exception('ESP32 did not respond on its hotspot.');
+      }
+      final telemetry = HydrodeckTelemetry.fromJson(
+        Map<String, dynamic>.from(jsonDecode(response.body) as Map),
+      );
+      await DatabaseHelper.instance.saveActiveIp('192.168.4.1');
+      if (!mounted) return;
+      setState(() {
+        _esp32Ip = '192.168.4.1';
+        _ipController.text = _esp32Ip;
+        _lastLocalTelemetryAt = DateTime.now();
+        _bed1 = telemetry.bed1;
+        _bed2 = telemetry.bed2;
+        _hotspotStatus = 'Connected to ESP32 hotspot for local control.';
+        _updateConnectionStatus();
+      });
+      if (_supportsBackgroundService) {
+        FlutterBackgroundService().invoke('updateIp', {'ip': '192.168.4.1'});
+      }
+    } catch (error) {
+      if (mounted) setState(() => _hotspotStatus = 'Hotspot connection failed: $error');
+    } finally {
+      if (mounted) setState(() => _isHotspotConnecting = false);
     }
   }
 
@@ -4118,7 +4468,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
               SizedBox(height: 10),
               Text('3. Connect to the hotspot using its configured password, then enter your home Wi-Fi name and password.'),
               SizedBox(height: 10),
-              Text('4. The ESP32 will join home Wi-Fi and turn off its setup hotspot. Reconnect this phone to the same home Wi-Fi.'),
+              Text('4. The ESP32 stays available on its hotspot while it joins home Wi-Fi. Reconnect this phone to the same home Wi-Fi for direct local access.'),
               SizedBox(height: 10),
               Text('5. Tap refresh. “Connected locally” means this phone can reach the ESP32; “System online” means Firebase and the ESP32 heartbeat are current.'),
             ],
@@ -4180,8 +4530,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     );
   }
 
+  // Home screen
   Widget _buildHomeScreen(String waterLabel) {
-    final isOnline = _connectionStatus.startsWith('Connected');
+    final isOnline = _connectionStatus.startsWith('Connected') || _connectionStatus == 'System Online';
     final statusColor = isOnline ? Colors.green : Colors.orange;
     final statusText = _connectionStatus == 'Connected' ? 'System Online' : _connectionStatus;
     final isBed1Warning = _bed1.ph < _minPhThreshold || _bed1.ph > _maxPhThreshold;
@@ -4320,6 +4671,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     );
   }
 
+  // TDS, pH, temperature, and water-level metrics
   Widget _buildGrowBedMetrics(String title, GrowBedReading data) {
     final isPhOptimal = data.ph >= _minPhThreshold && data.ph <= _maxPhThreshold;
     final isTdsOptimal = data.tds < 900;
@@ -4380,6 +4732,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
 
   // Old simple toggle helper removed; controls now use the redesigned layout.
 
+  // Control screen
   Widget _buildControlScreen() {
     Widget sectionTitle(String title) => Padding(
           padding: const EdgeInsets.only(top: 18, bottom: 8),
@@ -4422,13 +4775,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           ? (bedIndex == 1 ? 'nutrient1' : 'nutrient2')
           : (bedIndex == 1 ? 'waterPump1' : 'waterPump2');
       final needsWater = bedIndex == 1 ? !_bed1.waterFull : !_bed2.waterFull;
+      final otherWaterPumpRunning = !nutrient && _otherWaterPumpIsRunning(actuator);
       return Container(
         color: !nutrient && needsWater ? Colors.yellow.shade100 : Colors.white,
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
         child: Row(children: [
           Expanded(child: Text('Grow bed $bedIndex', style: const TextStyle(fontWeight: FontWeight.w600))),
           SizedBox(width: 112, height: 48, child: ElevatedButton(
-            onPressed: _actuatorBusy[key] == true ? null : () => _toggleActuator(key, actuator),
+            onPressed: _actuatorBusy[key] == true || otherWaterPumpRunning
+              ? null
+              : () => _toggleActuator(key, actuator),
             style: ElevatedButton.styleFrom(
               backgroundColor: !nutrient && needsWater ? Colors.amber.shade300 : Colors.grey.shade200,
               foregroundColor: Colors.black87,
@@ -4475,6 +4831,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     );
   }
 
+  // Data screen
   Widget _buildDataScreen() {
     List<HistoricalData> filteredLogs = _historyLogs.where((log) {
       if (_selectedFilterDate == null) return true;
@@ -4553,7 +4910,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             ),
           const SizedBox(height: 12),
           const Text(
-            'Saved snapshots (uploaded every 60 seconds):',
+            'Saved snapshots (uploaded every 5 minutes):',
             style: TextStyle(fontSize: 11, color: Colors.grey, fontStyle: FontStyle.italic)
           ),
           const SizedBox(height: 10),
@@ -4619,6 +4976,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     );
   }
 
+  // Settings screen
   Widget _buildSettingsScreen() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24.0),
@@ -4677,13 +5035,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                   child: ElevatedButton.icon(
                     onPressed: _isHotspotConnecting ? null : _connectAndProvisionWifi,
                     icon: const Icon(Icons.wifi_find),
-                    label: Text(_isHotspotConnecting ? 'Connecting...' : 'Connect to ESP32 Hotspot'),
+                    label: Text(_isHotspotConnecting ? 'Connecting...' : 'Send Wi-Fi to ESP32'),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF2DC867),
                       foregroundColor: Colors.white,
                       padding: const EdgeInsets.symmetric(vertical: 14),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: _isHotspotConnecting ? null : _connectToEsp32Hotspot,
+                    icon: const Icon(Icons.wifi),
+                    label: Text(_isHotspotConnecting ? 'Connecting...' : 'Connect to ESP32 Hotspot'),
                   ),
                 ),
                 const SizedBox(height: 8),
