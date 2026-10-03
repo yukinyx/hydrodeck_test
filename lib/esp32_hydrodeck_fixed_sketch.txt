@@ -298,6 +298,12 @@ bool wasCommandConsumed(const String& requestId) {
   return ("," + consumedIds + ",").indexOf(token) >= 0;
 }
 
+bool isValidCommandRequestId(const String& requestId) {
+  // Current app IDs are Firebase push IDs or the cmd_* fallback format.
+  return requestId.startsWith("cmd_") ||
+      (requestId.startsWith("-") && requestId.length() >= 16);
+}
+
 void rememberConsumedCommand(const String& requestId) {
   String consumedIds = commandPreferences.getString("recentIds", "");
   if (wasCommandConsumed(requestId)) return;
@@ -326,6 +332,16 @@ bool startPumpRun(int pumpNum, unsigned long durationMs, bool stopWhenFull, cons
   if ((pumpNum == 1 && pumpRuns[4].active) || (pumpNum == 5 && pumpRuns[0].active)) return false;
   if ((pumpNum == 2 || pumpNum == 3) && (pumpRuns[1].active || pumpRuns[2].active)) return false;
   if ((pumpNum == 6 || pumpNum == 7) && (pumpRuns[5].active || pumpRuns[6].active)) return false;
+  const bool chemicalPump = pumpNum == 2 || pumpNum == 3 || pumpNum == 4 ||
+      pumpNum == 6 || pumpNum == 7 || pumpNum == 8;
+  if (chemicalPump) {
+    for (int index = 0; index < 8; index++) {
+      const int otherPump = index + 1;
+      const bool otherIsChemical = otherPump == 2 || otherPump == 3 || otherPump == 4 ||
+          otherPump == 6 || otherPump == 7 || otherPump == 8;
+      if (otherPump != pumpNum && otherIsChemical && pumpRuns[index].active) return false;
+    }
+  }
   PumpRunState& run = pumpRuns[pumpNum - 1];
   run.active = true;
   run.stopWhenFull = stopWhenFull;
@@ -459,7 +475,7 @@ void processRemoteActuatorResult(AsyncResult& result) {
 
   if (payload.length() > 0) {
     Database.set<String>(aClient, commandPath, "");
-    if (requestId.length() > 0) {
+    if (validGrowLightCommand && isValidCommandRequestId(requestId)) {
       if (wasCommandConsumed(requestId)) {
         publishCommandAck(requestId, "completed");
       } else {
@@ -633,6 +649,10 @@ void handleControl() {
           Database.set<String>(aClient, "/hydrodeck/commands/" + actuator, "");
         }
         server.send(200, "text/plain", "OK");
+        return;
+      }
+      if (requestId.length() > 0 && !isValidCommandRequestId(requestId)) {
+        server.send(400, "text/plain", "Invalid request ID");
         return;
       }
       if (requestId.length() > 0 &&

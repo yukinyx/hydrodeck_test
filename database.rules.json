@@ -20,7 +20,7 @@
       "commandAcks": {
         ".read": "auth != null",
         "$requestId": {
-          ".write": "auth != null && auth.token.email === 'esp32@esp32.com'",
+          ".write": "auth != null && (auth.token.email === 'esp32@esp32.com' || !newData.exists())",
           ".validate": "newData.isString()"
         }
       },

@@ -28,6 +28,7 @@ bool get _supportsBackgroundService =>
 int? _cachedServerTimeOffsetMs;
 DateTime? _serverClockAnchorUtc;
 Stopwatch? _serverClockStopwatch;
+const int _deviceHeartbeatGraceSeconds = 7;
 
 DateTime _philippineTime(DateTime timestamp) =>
     timestamp.toUtc().add(const Duration(hours: 8));
@@ -948,7 +949,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
           final heartbeatFresh = heartbeatMillis != null &&
               DateTime.now().difference(
                 DateTime.fromMillisecondsSinceEpoch(heartbeatMillis),
-              ).inSeconds <= 15;
+              ).inSeconds <= _deviceHeartbeatGraceSeconds;
           isConnected = data['wifiConnected'] == true &&
               data['firebaseReady'] == true &&
               heartbeatFresh;
@@ -2413,18 +2414,17 @@ Future<void> uploadHistoricalLog(HistoricalData snapshot) async {
 }
 
 Future<void> uploadNextUnsyncedRecord() async {
-  final run = await DatabaseHelper.instance.getNextUnsyncedPlantingRecord();
-  if (run != null) {
-    if (await uploadPlantingRecord(run)) {
-      await DatabaseHelper.instance.markPlantingRecordCloudSynced(run.batchNumber);
-    }
+  final log = await DatabaseHelper.instance.getNextUnsyncedLog();
+  if (log != null) {
+    await uploadHistoricalLog(log);
+    await DatabaseHelper.instance.markLogCloudSynced(log.timestamp);
     return;
   }
 
-  final log = await DatabaseHelper.instance.getNextUnsyncedLog();
-  if (log == null) return;
-  await uploadHistoricalLog(log);
-  await DatabaseHelper.instance.markLogCloudSynced(log.timestamp);
+  final run = await DatabaseHelper.instance.getNextUnsyncedPlantingRecord();
+  if (run != null && await uploadPlantingRecord(run)) {
+    await DatabaseHelper.instance.markPlantingRecordCloudSynced(run.batchNumber);
+  }
 }
 
 Future<bool> hasPendingCloudRecords() async {
@@ -3620,7 +3620,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         // Only prompt to provision the ESP32 when the user is on the Home screen
         // and the device has been offline for a while. This prevents intrusive
         // popups while navigating other screens.
-        if (_connectionStatus != 'Firebase Offline') {
+        if (_connectionStatus.startsWith('Connected')) {
           _offlineSince = null;
           _wifiPromptShown = false;
         } else {
@@ -3675,15 +3675,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             DateTime.now()
                     .difference(DateTime.fromMillisecondsSinceEpoch(heartbeatMillis))
                     .inSeconds <=
-                30;
+                  _deviceHeartbeatGraceSeconds;
         final telemetry = HydrodeckTelemetry.fromJson(payload);
 
         if (!mounted) return;
         setState(() {
           if (heartbeatFresh) {
             _lastFirebaseTelemetryAt = DateTime.now();
-          } else {
-            _lastFirebaseTelemetryAt = null;
           }
                                         if (payload.containsKey('temp1') || payload.containsKey('ph1') || payload.containsKey('tds1') || payload.containsKey('water1') || payload['bed1'] is Map) {
             _bed1 = telemetry.bed1;
@@ -3762,20 +3760,44 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         var changed = false;
         for (final pending in _pendingCommandIds.entries.toList()) {
           final status = acknowledgments[pending.value]?.toString();
+          if (status == 'running') {
+            final busyKey = _getActuatorBusyKey(pending.key);
+            if (busyKey != null && _actuatorBusy[busyKey] != true) {
+              _actuatorBusy[busyKey] = true;
+              changed = true;
+            }
+            continue;
+          }
           if (status != 'completed' && status != 'failed') continue;
           _pendingCommandIds.remove(pending.key);
           _commandTimeouts.remove(pending.value)?.cancel();
           final busyKey = _getActuatorBusyKey(pending.key);
           if (busyKey != null) {
+            if (pending.key == 'growLight') {
+              final requestedState = _pendingActuatorStates[busyKey];
+              if (requestedState != null) _controlStates[busyKey] = requestedState;
+            }
             _actuatorBusy[busyKey] = false;
             _pendingActuatorStates.remove(busyKey);
           }
+          unawaited(_removeCommandAcknowledgment(pending.value));
           changed = true;
         }
         if (changed && mounted) setState(() {});
       });
     } catch (_) {
       // Firebase commands subscription failed - commands will rely on telemetry feedback
+    }
+  }
+
+  Future<void> _removeCommandAcknowledgment(String commandId) async {
+    try {
+      await FirebaseDatabase.instanceFor(
+        app: Firebase.app(),
+        databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
+      ).ref('hydrodeck/commandAcks/$commandId').remove();
+    } catch (_) {
+      // A future acknowledgment event or ESP32-side retention cleanup can retry.
     }
   }
 
@@ -3793,6 +3815,17 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     final otherKey = _actuatorControlKeys[otherActuator]!;
     return _actuatorBusy[otherKey] == true ||
         _pendingCommandIds.containsKey(otherActuator);
+  }
+
+  bool get _chemicalPumpBusy {
+    const chemicalActuators = [
+      'phUp1', 'phDown1', 'nutrient1',
+      'phUp2', 'phDown2', 'nutrient2',
+    ];
+    return chemicalActuators.any((actuator) {
+      final key = _actuatorControlKeys[actuator]!;
+      return _actuatorBusy[key] == true || _pendingCommandIds.containsKey(actuator);
+    });
   }
 
   void _updateActuatorStates(Map<String, bool> states) {
@@ -3910,8 +3943,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           freshDeviceHeartbeat = heartbeatMillis != null &&
               DateTime.now()
                       .difference(DateTime.fromMillisecondsSinceEpoch(heartbeatMillis))
-                      .inSeconds <=
-                  30;
+                        .inSeconds <=
+                      _deviceHeartbeatGraceSeconds;
           if (freshDeviceHeartbeat) {
             _lastFirebaseTelemetryAt = DateTime.now();
           }
@@ -3920,7 +3953,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           setState(() {
             _firebaseConnected = firebaseReachable;
             _lastLocalTelemetryAt = null;
-            if (!freshDeviceHeartbeat) _lastFirebaseTelemetryAt = null;
+            if (!freshDeviceHeartbeat &&
+                (_lastFirebaseTelemetryAt == null ||
+                    DateTime.now().difference(_lastFirebaseTelemetryAt!).inSeconds >
+                      _deviceHeartbeatGraceSeconds)) {
+              _lastFirebaseTelemetryAt = null;
+            }
           });
         }
       }
@@ -3946,12 +3984,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     } else if (_firebaseConnected) {
       _connectionStatus = 'ESP32 Offline';
     } else {
-      _connectionStatus = 'Firebase Offline';
+      _connectionStatus = 'ESP32 Offline';
     }
   }
 
   bool get _hasFreshFirebaseTelemetry => _lastFirebaseTelemetryAt != null &&
-      DateTime.now().difference(_lastFirebaseTelemetryAt!).inSeconds <= 15;
+      DateTime.now().difference(_lastFirebaseTelemetryAt!).inSeconds <=
+        _deviceHeartbeatGraceSeconds;
 
   
   Future<void> _loadStoredLogsAndSettings() async {
@@ -4173,6 +4212,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   Future<void> _toggleActuator(String key, String actuatorName) async {
     if (_pendingCommandIds.containsKey(actuatorName) || _actuatorBusy[key] == true) return;
     if (_otherWaterPumpIsRunning(actuatorName)) return;
+    final isChemicalPump = actuatorName.startsWith('phUp') ||
+        actuatorName.startsWith('phDown') ||
+        actuatorName.startsWith('nutrient');
+    if (isChemicalPump && _chemicalPumpBusy) return;
     if ((key == 'bed1_ph_down' && _bed1.ph < _minPhThreshold) ||
         (key == 'bed1_ph_up' && _bed1.ph > _maxPhThreshold) ||
         (key == 'bed2_ph_down' && _bed2.ph < _minPhThreshold) ||
@@ -4755,13 +4798,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           Expanded(child: Text(bed.ph.toStringAsFixed(2), textAlign: TextAlign.center, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
           const SizedBox(width: 8),
           SizedBox(width: 54, height: 52, child: ElevatedButton(
-            onPressed: _actuatorBusy[minusKey] == true || _actuatorBusy[plusKey] == true || bed.ph < _minPhThreshold ? null : () => _toggleActuator(minusKey, minusName),
+            onPressed: _chemicalPumpBusy || _actuatorBusy[minusKey] == true || _actuatorBusy[plusKey] == true || bed.ph < _minPhThreshold ? null : () => _toggleActuator(minusKey, minusName),
             style: ElevatedButton.styleFrom(backgroundColor: minusNeeded ? Colors.red : Colors.grey.shade200, foregroundColor: minusNeeded ? Colors.white : Colors.black87, padding: EdgeInsets.zero),
             child: const Text('-', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
           )),
           const SizedBox(width: 8),
           SizedBox(width: 54, height: 52, child: ElevatedButton(
-            onPressed: _actuatorBusy[plusKey] == true || _actuatorBusy[minusKey] == true || bed.ph > _maxPhThreshold ? null : () => _toggleActuator(plusKey, plusName),
+            onPressed: _chemicalPumpBusy || _actuatorBusy[plusKey] == true || _actuatorBusy[minusKey] == true || bed.ph > _maxPhThreshold ? null : () => _toggleActuator(plusKey, plusName),
             style: ElevatedButton.styleFrom(backgroundColor: plusNeeded ? Colors.green : Colors.grey.shade200, foregroundColor: plusNeeded ? Colors.white : Colors.black87, padding: EdgeInsets.zero),
             child: const Text('+', style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold)),
           )),
@@ -4782,7 +4825,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         child: Row(children: [
           Expanded(child: Text('Grow bed $bedIndex', style: const TextStyle(fontWeight: FontWeight.w600))),
           SizedBox(width: 112, height: 48, child: ElevatedButton(
-            onPressed: _actuatorBusy[key] == true || otherWaterPumpRunning
+            onPressed: _actuatorBusy[key] == true || otherWaterPumpRunning || (nutrient && _chemicalPumpBusy)
               ? null
               : () => _toggleActuator(key, actuator),
             style: ElevatedButton.styleFrom(
