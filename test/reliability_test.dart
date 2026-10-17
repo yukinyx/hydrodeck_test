@@ -1,0 +1,168 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+
+import 'package:hydrodeck_test/command_ack_policy.dart';
+import 'package:hydrodeck_test/history_interval.dart';
+import 'package:hydrodeck_test/login_validation.dart';
+import 'package:hydrodeck_test/pump_control_policy.dart';
+
+void main() {
+  sqfliteFfiInit();
+
+  group('Manila history intervals', () {
+    test('uses fixed half-hour keys and UTC instants', () {
+      final firstHalf = DateTime.utc(2026, 10, 17, 2, 15);
+      final secondHalf = DateTime.utc(2026, 10, 17, 2, 45);
+
+      expect(manilaIntervalKey(firstHalf), '20261017_1000');
+      expect(manilaIntervalKey(secondHalf), '20261017_1030');
+      expect(
+        utcFromManilaIntervalKey('20261017_1030'),
+        DateTime.utc(2026, 10, 17, 2, 30),
+      );
+      expect(
+        nextManilaIntervalUtc(firstHalf),
+        DateTime.utc(2026, 10, 17, 2, 30),
+      );
+    });
+
+    test(
+      'creates stable per-batch record identities and prefers ESP32 data',
+      () {
+        const intervalKey = '20261017_1030';
+        final firstId = scheduledSnapshotRecordId(
+          batchNumber: 8,
+          intervalKey: intervalKey,
+        );
+        final retryId = scheduledSnapshotRecordId(
+          batchNumber: 8,
+          intervalKey: intervalKey,
+        );
+
+        expect(firstId, retryId);
+        expect(
+          shouldReplaceHistoryRecord(
+            existing: {'source': 'esp32', 'readingsComplete': true},
+            incoming: {'source': 'app', 'readingsComplete': true},
+          ),
+          isFalse,
+        );
+        expect(
+          shouldReplaceHistoryRecord(
+            existing: {'source': 'app', 'readingsComplete': true},
+            incoming: {'source': 'esp32', 'readingsComplete': true},
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test('SQLite ignores duplicate record IDs', () async {
+      final database = await databaseFactoryFfi.openDatabase(
+        inMemoryDatabasePath,
+        options: OpenDatabaseOptions(
+          version: 1,
+          onCreate: (db, version) async {
+            await db.execute(
+              'CREATE TABLE historical_logs (recordId TEXT NOT NULL)',
+            );
+            await db.execute(
+              'CREATE UNIQUE INDEX idx_historical_logs_record_id ON historical_logs(recordId)',
+            );
+          },
+        ),
+      );
+      addTearDown(database.close);
+
+      expect(
+        await database.insert('historical_logs', {
+          'recordId': 'b8_scheduled_20261017_1030',
+        }),
+        greaterThan(0),
+      );
+      expect(
+        await database.insert('historical_logs', {
+          'recordId': 'b8_scheduled_20261017_1030',
+        }, conflictAlgorithm: ConflictAlgorithm.ignore),
+        0,
+      );
+      expect(await database.query('historical_logs'), hasLength(1));
+    });
+  });
+
+  group('pump command policy', () {
+    test('uses timed bed duration but fills a low bed until full', () {
+      expect(timedPumpDurationMs('nutrient1'), growBed1PumpDurationMs);
+      expect(timedPumpDurationMs('phDown2'), growBed2PumpDurationMs);
+
+      final refill = decidePumpCommand(
+        actuator: 'waterPump1',
+        requestId: 'cmd_refill',
+        pumpActive: false,
+        activeRequestId: '',
+        bedIsFull: false,
+        isWaterPump: true,
+      );
+      expect(refill.start, isTrue);
+      expect(refill.durationMs, 0);
+      expect(refill.stopWhenFull, isTrue);
+    });
+
+    test('does not restart duplicate IDs and rejects a new ID while busy', () {
+      final duplicate = decidePumpCommand(
+        actuator: 'phUp1',
+        requestId: 'cmd_same',
+        pumpActive: true,
+        activeRequestId: 'cmd_same',
+        bedIsFull: true,
+        isWaterPump: false,
+      );
+      expect(duplicate.start, isFalse);
+      expect(duplicate.alreadyRunningSameCommand, isTrue);
+      expect(duplicate.status, 'running');
+
+      final conflicting = decidePumpCommand(
+        actuator: 'phUp1',
+        requestId: 'cmd_new',
+        pumpActive: true,
+        activeRequestId: 'cmd_same',
+        bedIsFull: true,
+        isWaterPump: false,
+      );
+      expect(conflicting.reject, isTrue);
+      expect(conflicting.status, 'rejected');
+    });
+
+    test('pump deadline comparison survives millis rollover', () {
+      expect(millisDeadlineReached(0xfffffffe, 4), isFalse);
+      expect(millisDeadlineReached(4, 4), isTrue);
+      expect(millisDeadlineReached(6, 4), isTrue);
+    });
+  });
+
+  group('login and command acknowledgments', () {
+    test('validates empty and malformed login fields', () {
+      expect(validateLoginFields(email: ' ', password: ''), isNotNull);
+      expect(
+        validateLoginFields(email: 'not-an-email', password: 'secret'),
+        'Please enter a valid email address.',
+      );
+      expect(
+        validateLoginFields(email: 'grower@example.com', password: 'secret'),
+        isNull,
+      );
+    });
+
+    test('recognizes command lifecycle and terminal ack states', () {
+      for (final status in commandAckStatuses) {
+        expect(isValidCommandAckStatus(status), isTrue);
+      }
+      expect(isTerminalCommandAckStatus('accepted'), isFalse);
+      expect(isTerminalCommandAckStatus('running'), isFalse);
+      expect(isTerminalCommandAckStatus('completed'), isTrue);
+      expect(isTerminalCommandAckStatus('rejected'), isTrue);
+      expect(isTerminalCommandAckStatus('timed_out'), isTrue);
+      expect(isValidCommandAckStatus('failed'), isFalse);
+    });
+  });
+}

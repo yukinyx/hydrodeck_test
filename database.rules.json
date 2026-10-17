@@ -11,17 +11,32 @@
     "hydrodeck": {
       ".read": "auth != null",
       "commands": {
+        ".read": "auth != null",
         "$actuator": {
           ".read": "auth != null",
           ".write": "auth != null",
-          ".validate": "newData.isString()"
+          ".validate": "newData.hasChildren()",
+          "$commandId": {
+            ".validate": "newData.isString()"
+          }
         }
       },
       "commandAcks": {
         ".read": "auth != null",
         "$requestId": {
-          ".write": "auth != null && (auth.token.email === 'esp32@esp32.com' || !newData.exists())",
-          ".validate": "newData.isString()"
+          ".write": "auth != null && auth.token.email === 'esp32@esp32.com'",
+          ".validate": "newData.isString() && (newData.val() === 'accepted' || newData.val() === 'running' || newData.val() === 'completed' || newData.val() === 'rejected' || newData.val() === 'timed_out')"
+        }
+      },
+      "intervalSnapshots": {
+        ".read": "auth != null",
+        "$intervalKey": {
+          "sessions": {
+            "$batchNumber": {
+              ".write": "auth != null && auth.token.email === 'esp32@esp32.com'",
+              ".validate": "newData.hasChildren(['intervalKey', 'batchNumber', 'capturedAt', 'source', 'bed1', 'bed2']) && newData.child('intervalKey').val() === $intervalKey && newData.child('batchNumber').isNumber() && newData.child('capturedAt').isNumber() && newData.child('source').val() === 'esp32' && newData.child('bed1').child('temp').isNumber() && newData.child('bed1').child('ph').isNumber() && newData.child('bed1').child('tds').isNumber() && newData.child('bed1').child('water').isString() && newData.child('bed2').child('temp').isNumber() && newData.child('bed2').child('ph').isNumber() && newData.child('bed2').child('tds').isNumber() && newData.child('bed2').child('water').isString()"
+            }
+          }
         }
       },
       "actuators": {

@@ -11,6 +11,8 @@
 #include <DallasTemperature.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <ArduinoJson.h>
+#include <time.h>
 
 char ssid[65] = "TEST";
 char password[65] = "12345678";
@@ -76,9 +78,11 @@ bool mdnsStarted = false;
 unsigned long lastWifiRetry = 0;
 unsigned long wifiConnectStarted = 0;
 unsigned long lastHotspotAttempt = 0;
+unsigned long lastActiveBatchPoll = 0;
 const unsigned long wifiRetryInterval = 10000;
 const unsigned long wifiConnectTimeout = 30000;
 const unsigned long hotspotRetryInterval = 5000;
+const unsigned long activeBatchPollInterval = 10000;
 
 static const char* AP_SSID = "ESP32-HYDRODECK";
 static const char* AP_PASSWORD = "hydrodeck";
@@ -97,6 +101,31 @@ const unsigned long remoteCommandInterval = 100;
 unsigned long lastRemoteCommandPoll = 0;
 int remoteCommandIndex = 0;
 bool remoteCommandPending = false;
+String pendingRemoteActuator;
+String pendingRemoteCommandId;
+String pendingRemoteCommandValue;
+String pendingRemoteCommandPath;
+bool activeBatchRequestPending = false;
+bool snapshotCheckPending = false;
+bool snapshotWritePending = false;
+bool ntpConfigured = false;
+int activeBatchNumber = 0;
+bool temperatureSensorValid1 = false;
+bool temperatureSensorValid2 = false;
+bool phSensorValid1 = false;
+bool phSensorValid2 = false;
+bool tdsSensorValid1 = false;
+bool tdsSensorValid2 = false;
+unsigned long lastTemperatureValidAt1 = 0;
+unsigned long lastTemperatureValidAt2 = 0;
+unsigned long lastPhValidAt1 = 0;
+unsigned long lastPhValidAt2 = 0;
+unsigned long lastTdsValidAt1 = 0;
+unsigned long lastTdsValidAt2 = 0;
+String lastIntervalSnapshotIdentity;
+String pendingIntervalSnapshotKey;
+String pendingIntervalSnapshotIdentity;
+String pendingIntervalSnapshotPath;
 String activeCommandIds[8];
 const unsigned long firebaseHeartbeatInterval = 5000;
 OneWire oneWire1(DS18B20_PIN1);
@@ -141,20 +170,21 @@ unsigned long bed1PhLowSince = 0;
 unsigned long bed1PhHighSince = 0;
 unsigned long bed2PhLowSince = 0;
 unsigned long bed2PhHighSince = 0;
+unsigned long bed1PhLastAttemptLogAt = 0;
+unsigned long bed2PhLastAttemptLogAt = 0;
 const unsigned long phDelayThreshold = 10000; // 10 seconds in milliseconds
+const unsigned long phAutoRetryLogInterval = 5000UL;
+const float phControlHysteresis = 0.15f;
 
-// Pump timing controls: edit these seconds to tune each dosing cycle.
-const unsigned long BED1_PH_PUMP_SECONDS = 3;
-const unsigned long BED2_PH_PUMP_SECONDS = 5;
-const unsigned long BED1_NUTRIENT_PUMP_SECONDS = 2;
-const unsigned long BED2_NUTRIENT_PUMP_SECONDS = 4;
-const unsigned long FULL_WATER_MANUAL_PULSE_SECONDS = 2;
+const unsigned long BED1_PUMP_DURATION_MS = 3000UL;
+const unsigned long BED2_PUMP_DURATION_MS = 5000UL;
 const unsigned long WATER_AUTO_START_DELAY_SECONDS = 20; // Set to 0 for immediate auto-fill.
 const unsigned long waterAutoDelay = WATER_AUTO_START_DELAY_SECONDS * 1000UL;
 
 struct PumpRunState {
   bool active = false;
   bool stopWhenFull = false;
+  bool hasDeadline = false;
   unsigned long stopAt = 0;
 };
 
@@ -190,7 +220,6 @@ float readPhSensor(int pin, float sensorSlope) {
   int samples = 10;
   for (int i = 0; i < samples; i++) {
     measurings += analogRead(pin);
-    delay(10);
   }
   float voltage = (v_ref / 4095.0f) * (float)measurings / (float)samples;
   float ph = 7.0 + ((2.5 - voltage) / sensorSlope);
@@ -219,6 +248,7 @@ void setPump(int pumpNum, bool turnOn) {
 
 void setGrowLight(bool turnOn) {
   digitalWrite(growLightPin, turnOn ? LIGHT_ON : LIGHT_OFF);
+  commandPreferences.putBool("growLightOn", turnOn);
 }
 
 int pumpNumberForActuator(const String& actuator) {
@@ -266,7 +296,7 @@ void parsePhAdjustCommand(const String& command) {
   if (!shouldActivate) return;
 
   // Set durations based on bed
-  unsigned long durationMs = (bed == 1 ? BED1_PH_PUMP_SECONDS : BED2_PH_PUMP_SECONDS) * 1000UL;
+  unsigned long durationMs = bed == 1 ? BED1_PUMP_DURATION_MS : BED2_PUMP_DURATION_MS;
 
   // Find pump number
   int pumpNum = pumpNumberForActuator(actuatorName);
@@ -283,6 +313,7 @@ void parsePhAdjustCommand(const String& command) {
   PumpRunState& run = pumpRuns[pumpNum - 1];
   run.active = true;
   run.stopWhenFull = false;
+  run.hasDeadline = true;
   run.stopAt = millis() + durationMs;
   setPump(pumpNum, true);
   publishActuatorState(actuatorName, true);
@@ -292,10 +323,26 @@ bool waterSensorFullForPump(int pumpNum) {
   return digitalRead(pumpNum == 1 ? WATER_SENSOR_PIN1 : WATER_SENSOR_PIN2) == HIGH;
 }
 
+String consumedCommandStatus(const String& requestId) {
+  const String entries = commandPreferences.getString("recentIds", "");
+  int start = 0;
+  while (start < entries.length()) {
+    const int separator = entries.indexOf(',', start);
+    const int end = separator < 0 ? entries.length() : separator;
+    const String entry = entries.substring(start, end);
+    const int statusSeparator = entry.indexOf('=');
+    const String storedId = statusSeparator < 0 ? entry : entry.substring(0, statusSeparator);
+    if (storedId == requestId) {
+      return statusSeparator < 0 ? "completed" : entry.substring(statusSeparator + 1);
+    }
+    if (separator < 0) break;
+    start = separator + 1;
+  }
+  return "";
+}
+
 bool wasCommandConsumed(const String& requestId) {
-  String consumedIds = commandPreferences.getString("recentIds", "");
-  const String token = "," + requestId + ",";
-  return ("," + consumedIds + ",").indexOf(token) >= 0;
+  return consumedCommandStatus(requestId).length() > 0;
 }
 
 bool isValidCommandRequestId(const String& requestId) {
@@ -304,17 +351,32 @@ bool isValidCommandRequestId(const String& requestId) {
       (requestId.startsWith("-") && requestId.length() >= 16);
 }
 
-void rememberConsumedCommand(const String& requestId) {
-  String consumedIds = commandPreferences.getString("recentIds", "");
-  if (wasCommandConsumed(requestId)) return;
-  if (consumedIds.length() > 0) consumedIds += ",";
-  consumedIds += requestId;
-  while (consumedIds.length() > 700) {
-    const int separator = consumedIds.indexOf(',');
+void rememberConsumedCommand(const String& requestId, const String& status = "accepted") {
+  if (requestId.length() == 0) return;
+  String entries = commandPreferences.getString("recentIds", "");
+  String retained;
+  int start = 0;
+  while (start < entries.length()) {
+    const int separator = entries.indexOf(',', start);
+    const int end = separator < 0 ? entries.length() : separator;
+    const String entry = entries.substring(start, end);
+    const int statusSeparator = entry.indexOf('=');
+    const String storedId = statusSeparator < 0 ? entry : entry.substring(0, statusSeparator);
+    if (storedId != requestId && entry.length() > 0) {
+      if (retained.length() > 0) retained += ",";
+      retained += entry;
+    }
     if (separator < 0) break;
-    consumedIds.remove(0, separator + 1);
+    start = separator + 1;
   }
-  commandPreferences.putString("recentIds", consumedIds);
+  if (retained.length() > 0) retained += ",";
+  retained += requestId + "=" + status;
+  while (retained.length() > 700) {
+    const int separator = retained.indexOf(',');
+    if (separator < 0) break;
+    retained.remove(0, separator + 1);
+  }
+  commandPreferences.putString("recentIds", retained);
 }
 
 void publishActuatorState(const String& actuator, bool state) {
@@ -323,15 +385,21 @@ void publishActuatorState(const String& actuator, bool state) {
 }
 
 void publishCommandAck(const String& requestId, const String& status) {
+  rememberConsumedCommand(requestId, status);
   if (requestId.length() == 0 || !firebaseInitialized || !app.ready()) return;
   Database.set<String>(aClient, "/hydrodeck/commandAcks/" + requestId, status);
 }
 
-bool startPumpRun(int pumpNum, unsigned long durationMs, bool stopWhenFull, const String& requestId = "") {
-  if (pumpNum < 1 || pumpNum > 8 || pumpRuns[pumpNum - 1].active) return false;
-  if ((pumpNum == 1 && pumpRuns[4].active) || (pumpNum == 5 && pumpRuns[0].active)) return false;
-  if ((pumpNum == 2 || pumpNum == 3) && (pumpRuns[1].active || pumpRuns[2].active)) return false;
-  if ((pumpNum == 6 || pumpNum == 7) && (pumpRuns[5].active || pumpRuns[6].active)) return false;
+String pumpStartRejectionReason(int pumpNum) {
+  if (pumpNum < 1 || pumpNum > 8) return "invalid_pump";
+  if (pumpRuns[pumpNum - 1].active) return "pump_already_active";
+  if ((pumpNum == 1 && pumpRuns[4].active) || (pumpNum == 5 && pumpRuns[0].active)) {
+    return "other_bed_water_pump_active";
+  }
+  if ((pumpNum == 2 && pumpRuns[2].active) || (pumpNum == 3 && pumpRuns[1].active) ||
+      (pumpNum == 6 && pumpRuns[6].active) || (pumpNum == 7 && pumpRuns[5].active)) {
+    return "opposite_ph_pump_active";
+  }
   const bool chemicalPump = pumpNum == 2 || pumpNum == 3 || pumpNum == 4 ||
       pumpNum == 6 || pumpNum == 7 || pumpNum == 8;
   if (chemicalPump) {
@@ -339,12 +407,27 @@ bool startPumpRun(int pumpNum, unsigned long durationMs, bool stopWhenFull, cons
       const int otherPump = index + 1;
       const bool otherIsChemical = otherPump == 2 || otherPump == 3 || otherPump == 4 ||
           otherPump == 6 || otherPump == 7 || otherPump == 8;
-      if (otherPump != pumpNum && otherIsChemical && pumpRuns[index].active) return false;
+      if (otherPump != pumpNum && otherIsChemical && pumpRuns[index].active) {
+        return "chemical_mutex_busy_by_" + String(remoteActuatorNames[index]);
+      }
     }
   }
+  return "";
+}
+
+bool startPumpRun(
+    int pumpNum,
+    unsigned long durationMs,
+    bool stopWhenFull,
+    const String& requestId = "",
+    String* rejectionReason = nullptr) {
+  const String reason = pumpStartRejectionReason(pumpNum);
+  if (rejectionReason != nullptr) *rejectionReason = reason;
+  if (reason.length() > 0) return false;
   PumpRunState& run = pumpRuns[pumpNum - 1];
   run.active = true;
   run.stopWhenFull = stopWhenFull;
+  run.hasDeadline = durationMs > 0;
   run.stopAt = durationMs == 0 ? 0 : millis() + durationMs;
   activeCommandIds[pumpNum - 1] = requestId;
   setPump(pumpNum, true);
@@ -357,27 +440,73 @@ void serviceAutomaticPhControl(int bed, float phValue, unsigned long now) {
   const int upPump = bed == 1 ? 2 : 6;
   const int downPump = bed == 1 ? 3 : 7;
   const unsigned long pulseDuration =
-      (bed == 1 ? BED1_PH_PUMP_SECONDS : BED2_PH_PUMP_SECONDS) * 1000UL;
+      bed == 1 ? BED1_PUMP_DURATION_MS : BED2_PUMP_DURATION_MS;
   unsigned long& lowSince = bed == 1 ? bed1PhLowSince : bed2PhLowSince;
   unsigned long& highSince = bed == 1 ? bed1PhHighSince : bed2PhHighSince;
+  unsigned long& lastAttemptLogAt =
+      bed == 1 ? bed1PhLastAttemptLogAt : bed2PhLastAttemptLogAt;
 
   if (phValue < minPhThreshold) {
     highSince = 0;
     if (lowSince == 0) lowSince = now;
-    if (now - lowSince >= phDelayThreshold &&
-        startPumpRun(upPump, pulseDuration, false)) {
-      lowSince = now;
+    const unsigned long secondsBelowMin = (now - lowSince) / 1000UL;
+    if (now - lowSince >= phDelayThreshold) {
+      String rejectionReason;
+      const bool started = startPumpRun(
+        upPump,
+        pulseDuration,
+        false,
+        "",
+        &rejectionReason
+      );
+      if (started || lastAttemptLogAt == 0 ||
+          now - lastAttemptLogAt >= phAutoRetryLogInterval) {
+        Serial.printf(
+          "Auto pH-up bed=%d pH=%.2f min=%.2f max=%.2f secondsBelowMin=%lu result=%s reason=%s\n",
+          bed,
+          phValue,
+          minPhThreshold,
+          maxPhThreshold,
+          secondsBelowMin,
+          started ? "accepted" : "rejected",
+          started ? "none" : rejectionReason.c_str()
+        );
+        lastAttemptLogAt = now;
+      }
+      if (started) lowSince = now;
     }
   } else if (phValue > maxPhThreshold) {
     lowSince = 0;
     if (highSince == 0) highSince = now;
-    if (now - highSince >= phDelayThreshold &&
-        startPumpRun(downPump, pulseDuration, false)) {
-      highSince = now;
+    const unsigned long secondsAboveMax = (now - highSince) / 1000UL;
+    if (now - highSince >= phDelayThreshold) {
+      String rejectionReason;
+      const bool started = startPumpRun(
+        downPump,
+        pulseDuration,
+        false,
+        "",
+        &rejectionReason
+      );
+      if (started || lastAttemptLogAt == 0 ||
+          now - lastAttemptLogAt >= phAutoRetryLogInterval) {
+        Serial.printf(
+          "Auto pH-down bed=%d pH=%.2f min=%.2f max=%.2f secondsAboveMax=%lu result=%s reason=%s\n",
+          bed,
+          phValue,
+          minPhThreshold,
+          maxPhThreshold,
+          secondsAboveMax,
+          started ? "accepted" : "rejected",
+          started ? "none" : rejectionReason.c_str()
+        );
+        lastAttemptLogAt = now;
+      }
+      if (started) highSince = now;
     }
   } else {
-    lowSince = 0;
-    highSince = 0;
+    if (phValue >= minPhThreshold + phControlHysteresis) lowSince = 0;
+    if (phValue <= maxPhThreshold - phControlHysteresis) highSince = 0;
   }
 }
 
@@ -390,6 +519,7 @@ void stopPumpRun(int pumpNum) {
   activeCommandIds[pumpNum - 1] = "";
   run.active = false;
   run.stopWhenFull = false;
+  run.hasDeadline = false;
   run.stopAt = 0;
   publishActuatorState(remoteActuatorNames[pumpNum - 1], false);
   publishCommandAck(requestId, "completed");
@@ -405,20 +535,20 @@ bool executePumpRequest(const String& actuator, bool enforceManualRules, const S
   if (actuator == "phUp1" || actuator == "phDown1") {
     if ((actuator == "phUp1" && currentPhValue1 > maxPhThreshold) ||
       (actuator == "phDown1" && currentPhValue1 < minPhThreshold)) return false;
-    durationMs = BED1_PH_PUMP_SECONDS * 1000UL;
+    durationMs = BED1_PUMP_DURATION_MS;
   } else if (actuator == "phUp2" || actuator == "phDown2") {
     if ((actuator == "phUp2" && currentPhValue2 > maxPhThreshold) ||
       (actuator == "phDown2" && currentPhValue2 < minPhThreshold)) return false;
-    durationMs = BED2_PH_PUMP_SECONDS * 1000UL;
+    durationMs = BED2_PUMP_DURATION_MS;
   } else if (actuator == "nutrient1") {
-    durationMs = BED1_NUTRIENT_PUMP_SECONDS * 1000UL;
+    durationMs = BED1_PUMP_DURATION_MS;
   } else if (actuator == "nutrient2") {
-    durationMs = BED2_NUTRIENT_PUMP_SECONDS * 1000UL;
+    durationMs = BED2_PUMP_DURATION_MS;
   } else if (actuator == "waterPump1" || actuator == "waterPump2") {
     if (pumpRuns[pumpNum - 1].active) return false;
     const bool isFull = waterSensorFullForPump(pumpNum);
     if (isFull) {
-      durationMs = FULL_WATER_MANUAL_PULSE_SECONDS * 1000UL;
+      durationMs = pumpNum <= 4 ? BED1_PUMP_DURATION_MS : BED2_PUMP_DURATION_MS;
       if (enforceManualRules) {
         int& count = actuator == "waterPump1" ? manualWaterShortRuns1 : manualWaterShortRuns2;
         if (count >= 2) return false;
@@ -440,12 +570,75 @@ void servicePumpRuns() {
     if (!run.active) continue;
     if (run.stopWhenFull && waterSensorFullForPump(pumpNum)) {
       stopPumpRun(pumpNum);
-    } else if (run.stopAt != 0 && (long)(now - run.stopAt) >= 0) {
+    } else if (run.hasDeadline && (long)(now - run.stopAt) >= 0) {
       stopPumpRun(pumpNum);
     }
   }
 }
 
+
+void finishRemoteCommand(const String& previousStatus) {
+  const String requestId = pendingRemoteCommandId;
+  const String actuator = pendingRemoteActuator;
+  const String commandValue = pendingRemoteCommandValue;
+
+  if (previousStatus.length() > 0) {
+    bool commandIsRunning = false;
+    for (int index = 0; index < 8; index++) {
+      if (activeCommandIds[index] == requestId) commandIsRunning = true;
+    }
+    if (commandIsRunning) {
+      publishCommandAck(requestId, "running");
+    } else if (previousStatus == "accepted" || previousStatus == "running") {
+      publishCommandAck(requestId, "timed_out");
+    } else if (previousStatus == "failed") {
+      publishCommandAck(requestId, "rejected");
+    } else if (previousStatus == "completed" || previousStatus == "rejected" ||
+               previousStatus == "timed_out") {
+      publishCommandAck(requestId, previousStatus);
+    } else {
+      publishCommandAck(requestId, "rejected");
+    }
+  } else {
+    publishCommandAck(requestId, "accepted");
+    if (actuator == "growLight") {
+      if (commandValue == "0" || commandValue == "1") {
+        const bool requestedState = commandValue == "1";
+        setGrowLight(requestedState);
+        publishActuatorState(actuator, requestedState);
+        publishCommandAck(requestId, "completed");
+      } else {
+        publishCommandAck(requestId, "rejected");
+      }
+    } else if (commandValue != "1" || !executePumpRequest(actuator, true, requestId)) {
+      publishCommandAck(requestId, "rejected");
+    }
+  }
+
+  Database.remove(aClient, pendingRemoteCommandPath);
+  pendingRemoteActuator = "";
+  pendingRemoteCommandId = "";
+  pendingRemoteCommandValue = "";
+  pendingRemoteCommandPath = "";
+  remoteCommandPending = false;
+  remoteCommandIndex = (remoteCommandIndex + 1) % 9;
+}
+
+void processRemoteCommandAckResult(AsyncResult& result) {
+  if (result.isError() || !result.available()) {
+    remoteCommandPending = false;
+    pendingRemoteActuator = "";
+    pendingRemoteCommandId = "";
+    pendingRemoteCommandValue = "";
+    pendingRemoteCommandPath = "";
+    result.clear();
+    return;
+  }
+  String previousStatus = result.to<RealtimeDatabaseResult>().to<String>();
+  if (previousStatus == "null") previousStatus = "";
+  finishRemoteCommand(previousStatus);
+  result.clear();
+}
 
 void processRemoteActuatorResult(AsyncResult& result) {
   remoteCommandPending = false;
@@ -455,47 +648,73 @@ void processRemoteActuatorResult(AsyncResult& result) {
     return;
   }
 
-  const String commandPath = "/hydrodeck/commands/" + actuator;
+  String commandPath = "/hydrodeck/commands/" + actuator;
   const String payload = result.to<RealtimeDatabaseResult>().to<String>();
-  String requestId = payload;
-  bool growLightState = false;
-  bool validGrowLightCommand = true;
+  String requestId;
+  String commandValue;
+  bool queuedRecord = false;
+  bool foundCommand = false;
 
-  if (actuator == "growLight") {
-    const int separator = payload.lastIndexOf('|');
-    if (separator <= 0) {
-      validGrowLightCommand = false;
-    } else {
-      requestId = payload.substring(0, separator);
-      const String requestedState = payload.substring(separator + 1);
-      validGrowLightCommand = requestedState == "0" || requestedState == "1";
-      growLightState = requestedState == "1";
+  DynamicJsonDocument commandDocument(1024);
+  const DeserializationError parseError = deserializeJson(commandDocument, payload);
+  if (!parseError && commandDocument.is<JsonObject>()) {
+    JsonObject commandMap = commandDocument.as<JsonObject>();
+    if (!commandMap.isNull() && commandMap.size() > 0) {
+      JsonPair command = *commandMap.begin();
+      requestId = command.key().c_str();
+      if (command.value().is<const char*>()) {
+        commandValue = command.value().as<const char*>();
+      }
+      commandPath += "/" + requestId;
+      queuedRecord = true;
+      foundCommand = true;
     }
   }
 
-  if (payload.length() > 0) {
-    Database.set<String>(aClient, commandPath, "");
-    if (validGrowLightCommand && isValidCommandRequestId(requestId)) {
-      if (wasCommandConsumed(requestId)) {
-        publishCommandAck(requestId, "completed");
-      } else {
-        rememberConsumedCommand(requestId);
-        if (actuator == "growLight") {
-          if (validGrowLightCommand) {
-            setGrowLight(growLightState);
-            publishActuatorState(actuator, growLightState);
-            publishCommandAck(requestId, "completed");
-          } else {
-            publishCommandAck(requestId, "failed");
-          }
-        } else if (!executePumpRequest(actuator, true, requestId)) {
-          publishCommandAck(requestId, "failed");
-        }
+  if (!queuedRecord && payload.length() > 0 && payload != "null") {
+    foundCommand = true;
+    if (actuator == "growLight") {
+      const int separator = payload.lastIndexOf('|');
+      if (separator > 0) {
+        requestId = payload.substring(0, separator);
+        commandValue = payload.substring(separator + 1);
       }
+    } else {
+      requestId = payload;
+      commandValue = "1";
     }
+  }
+
+  if (!foundCommand) {
+    remoteCommandIndex = (remoteCommandIndex + 1) % 9;
+    result.clear();
+    return;
+  }
+  if (!isValidCommandRequestId(requestId)) {
+    Database.remove(aClient, commandPath);
+    remoteCommandIndex = (remoteCommandIndex + 1) % 9;
+    result.clear();
+    return;
+  }
+
+  pendingRemoteActuator = actuator;
+  pendingRemoteCommandId = requestId;
+  pendingRemoteCommandValue = commandValue;
+  pendingRemoteCommandPath = commandPath;
+  const String previousStatus = consumedCommandStatus(requestId);
+  if (previousStatus.length() > 0) {
+    finishRemoteCommand(previousStatus);
+  } else {
+    remoteCommandPending = true;
+    Database.get(
+      aClient,
+      "/hydrodeck/commandAcks/" + requestId,
+      processRemoteCommandAckResult,
+      false,
+      "remoteCommandAck"
+    );
   }
   result.clear();
-  remoteCommandIndex = (remoteCommandIndex + 1) % 9;
 }
 
 void requestRemoteActuatorCommand() {
@@ -510,10 +729,17 @@ void requestRemoteActuatorCommand() {
 void processPhLimitResult(AsyncResult& result) {
   phLimitRequestPending = false;
   if (!result.isError() && result.available()) {
-    const float value = result.to<RealtimeDatabaseResult>().to<float>();
-    if (value >= 0.0f && value <= 14.0f) {
-      if (phLimitRequestIndex == 0 && value < maxPhThreshold) minPhThreshold = value;
-      if (phLimitRequestIndex == 1 && value > minPhThreshold) maxPhThreshold = value;
+    const String rawValue = result.to<RealtimeDatabaseResult>().to<String>();
+    const float value = rawValue.toFloat();
+    if (rawValue.length() > 0 && rawValue != "null" && value > 0.0f && value <= 14.0f) {
+      if (phLimitRequestIndex == 0 && value < maxPhThreshold) {
+        minPhThreshold = value;
+        Serial.printf("pH minimum threshold updated to %.2f (maximum %.2f).\n", minPhThreshold, maxPhThreshold);
+      }
+      if (phLimitRequestIndex == 1 && value > minPhThreshold) {
+        maxPhThreshold = value;
+        Serial.printf("pH maximum threshold updated to %.2f (minimum %.2f).\n", maxPhThreshold, minPhThreshold);
+      }
     }
     result.clear();
   }
@@ -525,6 +751,120 @@ void requestPhLimit() {
   const String key = phLimitRequestIndex == 0 ? "minPh" : "maxPh";
   phLimitRequestPending = true;
   Database.get(aClient, "/hydrodeck/settings/" + key, processPhLimitResult, false, "phLimit");
+}
+
+void processActiveBatchResult(AsyncResult& result) {
+  activeBatchRequestPending = false;
+  if (!result.isError() && result.available()) {
+    int receivedBatch = result.to<RealtimeDatabaseResult>().to<int>();
+    activeBatchNumber = receivedBatch > 0 ? receivedBatch : 0;
+    result.clear();
+  }
+}
+
+void requestActiveBatchNumber() {
+  if (!firebaseInitialized || !app.ready() || activeBatchRequestPending) return;
+  activeBatchRequestPending = true;
+  Database.get(
+    aClient,
+    "/hydrodeck/settings/activeBatchNumber",
+    processActiveBatchResult,
+    false,
+    "activeBatch"
+  );
+}
+
+String currentManilaIntervalKey(const struct tm& localTime) {
+  char key[16];
+  const int slotMinute = localTime.tm_min < 30 ? 0 : 30;
+  snprintf(
+    key,
+    sizeof(key),
+    "%04d%02d%02d_%02d%02d",
+    localTime.tm_year + 1900,
+    localTime.tm_mon + 1,
+    localTime.tm_mday,
+    localTime.tm_hour,
+    slotMinute
+  );
+  return String(key);
+}
+
+void processIntervalSnapshotWrite(AsyncResult& result) {
+  snapshotWritePending = false;
+  if (result.isError()) return;
+  lastIntervalSnapshotIdentity = pendingIntervalSnapshotIdentity;
+  commandPreferences.putString("lastSnapshotIdentity", lastIntervalSnapshotIdentity);
+  result.clear();
+}
+
+void processIntervalSnapshotCheck(AsyncResult& result) {
+  snapshotCheckPending = false;
+  if (result.isError() || !result.available()) return;
+  const String currentValue = result.to<RealtimeDatabaseResult>().to<String>();
+  result.clear();
+  if (currentValue.length() > 0 && currentValue != "null") {
+    lastIntervalSnapshotIdentity = pendingIntervalSnapshotIdentity;
+    commandPreferences.putString("lastSnapshotIdentity", lastIntervalSnapshotIdentity);
+    return;
+  }
+
+  const unsigned long nowMs = millis();
+    if (!temperatureSensorValid1 || !temperatureSensorValid2 ||
+      !phSensorValid1 || !phSensorValid2 || !tdsSensorValid1 || !tdsSensorValid2 ||
+      nowMs - lastTemperatureValidAt1 > 5000UL ||
+      nowMs - lastTemperatureValidAt2 > 5000UL ||
+      nowMs - lastPhValidAt1 > 5000UL || nowMs - lastPhValidAt2 > 5000UL ||
+      nowMs - lastTdsValidAt1 > 5000UL || nowMs - lastTdsValidAt2 > 5000UL) return;
+
+  const time_t capturedAt = time(nullptr);
+  String snapshotJson = "{";
+  snapshotJson += "\"intervalKey\":\"" + pendingIntervalSnapshotKey + "\",";
+  snapshotJson += "\"batchNumber\":" + String(activeBatchNumber) + ",";
+  snapshotJson += "\"capturedAt\":" + String((long)capturedAt) + ",";
+  snapshotJson += "\"source\":\"esp32\",";
+  snapshotJson += "\"bed1\":{\"temp\":" + String(currentTemperature1, 1) + ",";
+  snapshotJson += "\"ph\":" + String(currentPhValue1, 2) + ",";
+  snapshotJson += "\"tds\":" + String(currentTdsValue1, 0) + ",";
+  snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\"},";
+  snapshotJson += "\"bed2\":{\"temp\":" + String(currentTemperature2, 1) + ",";
+  snapshotJson += "\"ph\":" + String(currentPhValue2, 2) + ",";
+  snapshotJson += "\"tds\":" + String(currentTdsValue2, 0) + ",";
+  snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\"}}";
+
+  snapshotWritePending = true;
+  Database.set<object_t>(
+    aClient,
+    pendingIntervalSnapshotPath,
+    object_t(snapshotJson.c_str()),
+    processIntervalSnapshotWrite,
+    "intervalSnapshotWrite"
+  );
+}
+
+void requestIntervalSnapshot() {
+  if (!firebaseInitialized || !app.ready() || activeBatchNumber <= 0 ||
+      snapshotCheckPending || snapshotWritePending) return;
+
+  struct tm localTime;
+  if (!getLocalTime(&localTime, 0) || localTime.tm_year < (2024 - 1900)) return;
+  if (localTime.tm_min != 0 && localTime.tm_min != 30) return;
+  const String intervalKey = currentManilaIntervalKey(localTime);
+  const String intervalIdentity = intervalKey + "|" + String(activeBatchNumber);
+  if (intervalIdentity == lastIntervalSnapshotIdentity) return;
+
+  pendingIntervalSnapshotKey = intervalKey;
+  pendingIntervalSnapshotIdentity = intervalIdentity;
+  pendingIntervalSnapshotPath = "/hydrodeck/intervalSnapshots/" + intervalKey +
+      "/sessions/" + String(activeBatchNumber);
+  snapshotCheckPending = true;
+  Database.get(
+    aClient,
+    pendingIntervalSnapshotPath,
+    processIntervalSnapshotCheck,
+    false,
+    "intervalSnapshotCheck"
+  );
 }
 
 void handleRootIdent() {
@@ -561,7 +901,7 @@ void handleSettings() {
   }
   const float minimum = server.arg("minPh").toFloat();
   const float maximum = server.arg("maxPh").toFloat();
-  if (minimum < 0.0f || maximum > 14.0f || minimum >= maximum) {
+  if (minimum <= 0.0f || maximum > 14.0f || minimum >= maximum) {
     server.send(400, "text/plain", "Invalid pH thresholds");
     return;
   }
@@ -635,8 +975,19 @@ void handleControl() {
     String actuator = server.arg("actuator");
     bool state = (server.arg("state") == "1" || server.arg("state") == "on");
     if (actuator == "growLight") {
+      const String requestId = server.arg("requestId");
+      if (requestId.length() > 0 && !isValidCommandRequestId(requestId)) {
+        server.send(400, "text/plain", "Invalid request ID");
+        return;
+      }
+      if (requestId.length() > 0 && wasCommandConsumed(requestId)) {
+        server.send(200, "text/plain", "Duplicate request ignored");
+        return;
+      }
+      if (requestId.length() > 0) rememberConsumedCommand(requestId, "accepted");
       setGrowLight(state);
       publishActuatorState(actuator, state);
+      if (requestId.length() > 0) publishCommandAck(requestId, "completed");
       server.send(200, "text/plain", "OK");
       return;
     }
@@ -645,9 +996,6 @@ void handleControl() {
       const String requestId = server.arg("requestId");
       if (!state) {
         stopPumpRun(pumpNum);
-        if (firebaseInitialized && app.ready()) {
-          Database.set<String>(aClient, "/hydrodeck/commands/" + actuator, "");
-        }
         server.send(200, "text/plain", "OK");
         return;
       }
@@ -662,12 +1010,9 @@ void handleControl() {
       }
       if (requestId.length() > 0) rememberConsumedCommand(requestId);
       if (!executePumpRequest(actuator, true, requestId)) {
-        publishCommandAck(requestId, "failed");
+        publishCommandAck(requestId, "rejected");
         server.send(409, "text/plain", "Pump busy, threshold blocked, or water safety limit reached");
         return;
-      }
-      if (firebaseInitialized && app.ready()) {
-        Database.set<String>(aClient, "/hydrodeck/commands/" + actuator, "");
       }
       server.send(200, "text/plain", "OK");
       return;
@@ -692,28 +1037,33 @@ void handleControl() {
 void processFirebaseResult(AsyncResult& firebaseResult) {
   if (!firebaseResult.isResult()) return;
   if (firebaseResult.isError()) {
-    Serial.print("Firebase error [");
-    Serial.print(firebaseResult.uid());
-    Serial.print("] code: ");
+    Serial.print("Firebase error code: ");
     Serial.print(firebaseResult.error().code());
-    Serial.print(" message: ");
-    Serial.println(firebaseResult.error().message());
+    Serial.println();
   }
   if (firebaseResult.isEvent()) {
-    Serial.print("Firebase event: ");
-    Serial.println(firebaseResult.eventLog().message());
+    Serial.println("Firebase event received.");
   }
   if (firebaseResult.isDebug()) {
-    Serial.print("Firebase debug: ");
-    Serial.println(firebaseResult.debug());
+    Serial.println("Firebase debug event received.");
   }
+}
+
+void configureSafeOutput(int pin, int safeState) {
+  digitalWrite(pin, safeState);
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, safeState);
 }
 
 void initializeFirebase() {
   if (firebaseInitialized || WiFi.status() != WL_CONNECTED) return;
-  ssl_client.setInsecure();
+  ssl_client.useBuiltinCACertBundle();
   ssl_client.setConnectionTimeout(1000);
   ssl_client.setHandshakeTimeout(5);
+  if (!ntpConfigured) {
+    configTzTime("PHT-8", "pool.ntp.org", "time.nist.gov");
+    ntpConfigured = true;
+  }
   initializeApp(aClient, app, getAuth(user_auth), processFirebaseResult, "authTask");
   app.getApp<RealtimeDatabase>(Database);
   Database.url(DATABASE_URL);
@@ -725,15 +1075,15 @@ void setup() {
   Serial.begin(115200);
 
   // Initialize Actuators (Default OFF)
-  pinMode(waterPump1Pin, OUTPUT); digitalWrite(waterPump1Pin, PUMP_OFF);
-  pinMode(phUp1Pin, OUTPUT); digitalWrite(phUp1Pin, PUMP_OFF);
-  pinMode(phDown1Pin, OUTPUT); digitalWrite(phDown1Pin, PUMP_OFF);
-  pinMode(nutrientPump1Pin, OUTPUT); digitalWrite(nutrientPump1Pin, PUMP_OFF);
-  pinMode(waterPump2Pin, OUTPUT); digitalWrite(waterPump2Pin, PUMP_OFF);
-  pinMode(phUp2Pin, OUTPUT); digitalWrite(phUp2Pin, PUMP_OFF);
-  pinMode(phDown2Pin, OUTPUT); digitalWrite(phDown2Pin, PUMP_OFF);
-  pinMode(nutrientPump2Pin, OUTPUT); digitalWrite(nutrientPump2Pin, PUMP_OFF);
-  pinMode(growLightPin, OUTPUT); digitalWrite(growLightPin, LIGHT_OFF);
+  configureSafeOutput(waterPump1Pin, PUMP_OFF);
+  configureSafeOutput(phUp1Pin, PUMP_OFF);
+  configureSafeOutput(phDown1Pin, PUMP_OFF);
+  configureSafeOutput(nutrientPump1Pin, PUMP_OFF);
+  configureSafeOutput(waterPump2Pin, PUMP_OFF);
+  configureSafeOutput(phUp2Pin, PUMP_OFF);
+  configureSafeOutput(phDown2Pin, PUMP_OFF);
+  configureSafeOutput(nutrientPump2Pin, PUMP_OFF);
+  configureSafeOutput(growLightPin, LIGHT_OFF);
 
   // Initialize Sensors
   pinMode(WATER_SENSOR_PIN1, INPUT_PULLUP);
@@ -759,10 +1109,14 @@ void setup() {
   float tempReading1 = sensors1.getTempCByIndex(0);
   if (tempReading1 != DEVICE_DISCONNECTED_C && tempReading1 > -50.0) {
     currentTemperature1 = tempReading1;
+    temperatureSensorValid1 = true;
+    lastTemperatureValidAt1 = millis();
   }
   float tempReading2 = sensors2.getTempCByIndex(0);
   if (tempReading2 != DEVICE_DISCONNECTED_C && tempReading2 > -50.0) {
     currentTemperature2 = tempReading2;
+    temperatureSensorValid2 = true;
+    lastTemperatureValidAt2 = millis();
   }
   sensors1.setWaitForConversion(false);
   sensors2.setWaitForConversion(false);
@@ -770,6 +1124,8 @@ void setup() {
   // Wi-Fi and hotspot setup
   wifiPreferences.begin("wifi", false);
   commandPreferences.begin("pumpcmd", false);
+  setGrowLight(commandPreferences.getBool("growLightOn", false));
+  lastIntervalSnapshotIdentity = commandPreferences.getString("lastSnapshotIdentity", "");
   String savedSsid = wifiPreferences.getString("ssid", ssid);
   String savedPassword = wifiPreferences.getString("password", password);
   savedSsid.toCharArray(ssid, sizeof(ssid));
@@ -849,6 +1205,12 @@ void loop() {
     requestPhLimit();
   }
 
+  if (now - lastActiveBatchPoll >= activeBatchPollInterval) {
+    lastActiveBatchPoll = now;
+    requestActiveBatchNumber();
+  }
+  requestIntervalSnapshot();
+
   // Sampling TDS Sensor 1 & Sensor 2
   static unsigned long sampleTime = 0;
   if (now - sampleTime > 40U) {
@@ -873,6 +1235,8 @@ void loop() {
     float compV1 = avgV1 / compCoeff1;
     float tdsVal1 = (133.42 * compV1 * compV1 * compV1 - 255.86 * compV1 * compV1 + 857.39 * compV1) * 0.5;
     currentTdsValue1 = max(0.0f, tdsVal1) * tdsCalibrationFactor;
+    tdsSensorValid1 = true;
+    lastTdsValidAt1 = now;
 
     // Buffer 2
     for (int i = 0; i < SCOUNT; i++) analogBufferTemp2[i] = analogBuffer2[i];
@@ -882,6 +1246,8 @@ void loop() {
     float compV2 = avgV2 / compCoeff2;
     float tdsVal2 = (133.42 * compV2 * compV2 * compV2 - 255.86 * compV2 * compV2 + 857.39 * compV2) * 0.5;
     currentTdsValue2 = max(0.0f, tdsVal2) * tdsCalibrationFactor;
+    tdsSensorValid2 = true;
+    lastTdsValidAt2 = now;
   }
 
   // Reading pH Sensors with 10-second delay logic
@@ -889,6 +1255,10 @@ void loop() {
     lastPhCheck = now;
     currentPhValue1 = readPhSensor(PH_PIN1, slope1);
     currentPhValue2 = readPhSensor(PH_PIN2, slope2);
+    phSensorValid1 = true;
+    phSensorValid2 = true;
+    lastPhValidAt1 = now;
+    lastPhValidAt2 = now;
 
     serviceAutomaticPhControl(1, currentPhValue1, now);
     serviceAutomaticPhControl(2, currentPhValue2, now);
@@ -922,11 +1292,19 @@ void loop() {
     lastTempCheck = now;
 
     float reading1 = sensors1.getTempCByIndex(0);
-    if (reading1 != DEVICE_DISCONNECTED_C && reading1 > -50.0) currentTemperature1 = reading1;
+    if (reading1 != DEVICE_DISCONNECTED_C && reading1 > -50.0) {
+      currentTemperature1 = reading1;
+      temperatureSensorValid1 = true;
+      lastTemperatureValidAt1 = now;
+    }
     sensors1.requestTemperatures();
 
     float reading2 = sensors2.getTempCByIndex(0);
-    if (reading2 != DEVICE_DISCONNECTED_C && reading2 > -50.0) currentTemperature2 = reading2;
+    if (reading2 != DEVICE_DISCONNECTED_C && reading2 > -50.0) {
+      currentTemperature2 = reading2;
+      temperatureSensorValid2 = true;
+      lastTemperatureValidAt2 = now;
+    }
     sensors2.requestTemperatures();
   }
 
@@ -970,7 +1348,7 @@ void loop() {
 Arduino IDE setup:
 - Install Mobizt's FirebaseClient library.
 - Install/select the Espressif ESP32 board package. Preferences is included with it.
-- Install OneWire and DallasTemperature libraries.
+- Install ArduinoJson, OneWire, and DallasTemperature libraries.
 - In Arduino IDE choose Tools > Partition Scheme > Huge APP (3MB No OTA/1MB SPIFFS).
 - The default 1.31 MB app partition may not hold Firebase HTTPS/authentication together with the web server.
 - The ESP32 creates the protected Wi-Fi hotspot ESP32-HYDRODECK with password hydrodeck for provisioning.

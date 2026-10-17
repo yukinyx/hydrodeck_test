@@ -15,9 +15,13 @@ import 'package:wifi_scan/wifi_scan.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
+import 'package:firebase_database/firebase_database.dart' as rtdb;
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firebase_options.dart';
 import 'package:flutter/services.dart';
+import 'history_interval.dart';
+import 'login_validation.dart';
+import 'command_ack_policy.dart';
 
 bool get _supportsBackgroundService =>
   !kIsWeb &&
@@ -30,8 +34,16 @@ DateTime? _serverClockAnchorUtc;
 Stopwatch? _serverClockStopwatch;
 const int _deviceHeartbeatGraceSeconds = 7;
 
-DateTime _philippineTime(DateTime timestamp) =>
-    timestamp.toUtc().add(const Duration(hours: 8));
+DateTime _philippineTime(DateTime timestamp) => manilaDateTime(timestamp);
+
+FirebaseDatabase hydrodeckDatabase() => FirebaseDatabase.instanceFor(
+      app: Firebase.app(),
+      databaseURL:
+          'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
+    );
+
+const Duration commandAckTimeout = Duration(seconds: 20);
+const Duration waterPumpAckTimeout = Duration(minutes: 3);
 
 Future<DateTime> getServerNow() async {
   try {
@@ -83,7 +95,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 8,
+      version: 9,
       onCreate: _createDB,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -123,7 +135,68 @@ class DatabaseHelper {
         if (oldVersion < 8) {
           await db.execute('ALTER TABLE planting_history ADD COLUMN cloudSynced INTEGER NOT NULL DEFAULT 0');
         }
+        if (oldVersion < 9) {
+          await _migrateScheduledHistoryIdentities(db);
+        }
       },
+    );
+  }
+
+  Future<void> _migrateScheduledHistoryIdentities(Database db) async {
+    await db.execute(
+      "ALTER TABLE historical_logs ADD COLUMN intervalKey TEXT",
+    );
+    await db.execute(
+      "ALTER TABLE historical_logs ADD COLUMN recordType TEXT NOT NULL DEFAULT 'scheduled'",
+    );
+    await db.execute(
+      "ALTER TABLE historical_logs ADD COLUMN recordId TEXT",
+    );
+    await db.execute(
+      "ALTER TABLE historical_logs ADD COLUMN source TEXT NOT NULL DEFAULT 'app'",
+    );
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS history_capture_state (
+        id INTEGER PRIMARY KEY,
+        lastIntervalKey TEXT
+      )
+    ''');
+
+    final rows = await db.query('historical_logs', orderBy: 'timestamp ASC, id ASC');
+    final keptIds = <String>{};
+    for (final row in rows) {
+      final id = row['id'] as int;
+      final timestamp = DateTime.tryParse(row['timestamp'] as String);
+      final batch = row['batchNumber'] as int?;
+      if (timestamp == null) {
+        await db.delete('historical_logs', where: 'id = ?', whereArgs: [id]);
+        continue;
+      }
+      final intervalKey = manilaIntervalKey(timestamp);
+      final recordId = batch == null
+          ? 'legacy_$id'
+          : scheduledSnapshotRecordId(
+              batchNumber: batch,
+              intervalKey: intervalKey,
+            );
+      if (!keptIds.add(recordId)) {
+        await db.delete('historical_logs', where: 'id = ?', whereArgs: [id]);
+        continue;
+      }
+      await db.update(
+        'historical_logs',
+        {
+          'intervalKey': intervalKey,
+          'recordType': scheduledSnapshotRecordType,
+          'recordId': recordId,
+          'timestamp': manilaIntervalStartUtc(timestamp).toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+    }
+    await db.execute(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_historical_logs_record_id ON historical_logs(recordId)',
     );
   }
 
@@ -139,7 +212,20 @@ class DatabaseHelper {
         batchNumber INTEGER,
         bed1 TEXT,
         bed2 TEXT,
-        cloudSynced INTEGER NOT NULL DEFAULT 0
+        cloudSynced INTEGER NOT NULL DEFAULT 0,
+        intervalKey TEXT,
+        recordType TEXT NOT NULL DEFAULT 'scheduled',
+        recordId TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'app'
+      )
+    ''');
+    await db.execute(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_historical_logs_record_id ON historical_logs(recordId)',
+    );
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS history_capture_state (
+        id INTEGER PRIMARY KEY,
+        lastIntervalKey TEXT
       )
     ''');
 
@@ -213,12 +299,9 @@ class DatabaseHelper {
     return null;
   }
 
-  // Historical Logs Queries
-  Future<void> insertLog(HistoricalData log, {bool cloudSynced = false}) async {
-    final db = await instance.database;
-    if (db == null) return;
-    await db.insert('historical_logs', {
-      'timestamp': log.timestamp.toIso8601String(),
+  Map<String, Object?> _logToRow(HistoricalData log, {required bool cloudSynced}) {
+    return {
+      'timestamp': log.timestamp.toUtc().toIso8601String(),
       'pH': log.pH,
       'temperature': log.temperature,
       'waterLevel': log.waterLevel,
@@ -227,19 +310,67 @@ class DatabaseHelper {
       'bed1': log.bed1 != null ? jsonEncode(log.bed1!.toMap()) : null,
       'bed2': log.bed2 != null ? jsonEncode(log.bed2!.toMap()) : null,
       'cloudSynced': cloudSynced ? 1 : 0,
-    });
+      'intervalKey': log.intervalKey,
+      'recordType': log.recordType,
+      'recordId': log.identity,
+      'source': log.source,
+    };
   }
 
-  Future<void> insertLogIfMissing(HistoricalData log, {bool cloudSynced = false}) async {
+  // Historical Logs Queries
+  Future<bool> insertLog(HistoricalData log, {bool cloudSynced = false}) async {
     final db = await instance.database;
-    if (db == null) return;
-    final existing = await db.query(
+    if (db == null) return false;
+    final rowId = await db.insert(
       'historical_logs',
-      where: 'timestamp = ? AND batchNumber = ?',
-      whereArgs: [log.timestamp.toIso8601String(), log.batchNumber],
+      _logToRow(log, cloudSynced: cloudSynced),
+      conflictAlgorithm: ConflictAlgorithm.ignore,
+    );
+    return rowId != 0;
+  }
+
+  Future<bool> insertLogIfMissing(HistoricalData log, {bool cloudSynced = false}) async {
+    final db = await instance.database;
+    if (db == null) return false;
+    final existingRows = await db.query(
+      'historical_logs',
+      where: 'recordId = ?',
+      whereArgs: [log.identity],
       limit: 1,
     );
-    if (existing.isEmpty) await insertLog(log, cloudSynced: cloudSynced);
+    if (existingRows.isEmpty) {
+      return insertLog(log, cloudSynced: cloudSynced);
+    }
+    final existing = _logFromRow(existingRows.first);
+    final replace = shouldReplaceHistoryRecord(
+      existing: {
+        'source': existing.source,
+        'readingsComplete': existing.readingsComplete,
+      },
+      incoming: {
+        'source': log.source,
+        'readingsComplete': log.readingsComplete,
+      },
+    );
+    if (replace) {
+      final existingSynced = existingRows.first['cloudSynced'] == 1;
+      await db.update(
+        'historical_logs',
+        _logToRow(log, cloudSynced: cloudSynced || existingSynced),
+        where: 'recordId = ?',
+        whereArgs: [log.identity],
+      );
+      return true;
+    }
+    if (cloudSynced) {
+      await db.update(
+        'historical_logs',
+        {'cloudSynced': 1},
+        where: 'recordId = ?',
+        whereArgs: [log.identity],
+      );
+    }
+    return false;
   }
 
   HistoricalData _logFromRow(Map<String, Object?> row) => HistoricalData(
@@ -251,6 +382,10 @@ class DatabaseHelper {
         batchNumber: row['batchNumber'] as int?,
         bed1: _decodeBedData(row['bed1'] as String?),
         bed2: _decodeBedData(row['bed2'] as String?),
+        intervalKey: row['intervalKey'] as String?,
+        recordType: (row['recordType'] as String?) ?? scheduledSnapshotRecordType,
+        recordId: row['recordId'] as String?,
+        source: (row['source'] as String?) ?? 'app',
       );
 
   Future<HistoricalData?> getNextUnsyncedLog() async {
@@ -265,14 +400,32 @@ class DatabaseHelper {
     return result.isEmpty ? null : _logFromRow(result.first);
   }
 
-  Future<void> markLogCloudSynced(DateTime timestamp) async {
+  Future<void> markLogCloudSynced(HistoricalData log) async {
     final db = await instance.database;
     if (db == null) return;
     await db.update(
       'historical_logs',
       {'cloudSynced': 1},
-      where: 'timestamp = ?',
-      whereArgs: [timestamp.toIso8601String()],
+      where: 'recordId = ?',
+      whereArgs: [log.identity],
+    );
+  }
+
+  Future<String?> getLastCapturedIntervalKey() async {
+    final db = await instance.database;
+    if (db == null) return null;
+    final result = await db.query('history_capture_state', where: 'id = ?', whereArgs: [1]);
+    if (result.isEmpty) return null;
+    return result.first['lastIntervalKey'] as String?;
+  }
+
+  Future<void> saveLastCapturedIntervalKey(String intervalKey) async {
+    final db = await instance.database;
+    if (db == null) return;
+    await db.insert(
+      'history_capture_state',
+      {'id': 1, 'lastIntervalKey': intervalKey},
+      conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
 
@@ -648,6 +801,7 @@ Future<void> initializeBackgroundService() async {
     androidConfiguration: AndroidConfiguration(
       onStart: onBackgroundServiceStart,
       autoStart: false,
+      autoStartOnBoot: true,
       isForegroundMode: true,
       notificationChannelId: 'hydrodeck_bg_service',
       initialNotificationTitle: 'Hydrodeck Service Active',
@@ -665,6 +819,7 @@ Future<void> initializeBackgroundService() async {
 @pragma('vm:entry-point')
 void onBackgroundServiceStart(ServiceInstance service) async {
   DartPluginRegistrant.ensureInitialized();
+  initializeHydrodeckTimeZones();
 
   try {
     if (Firebase.apps.isEmpty) {
@@ -1005,77 +1160,85 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     isPolling = false;
   });
 
-  String? lastSnapshotMinute;
-  var minuteTaskScheduled = false;
+  String? lastSnapshotIntervalIdentity = await DatabaseHelper.instance.getLastCapturedIntervalKey();
+  var intervalTaskScheduled = false;
 
-  Future<void> scheduleNextMinuteTask() async {
-    if (minuteTaskScheduled || !backgroundActive) return;
-    minuteTaskScheduled = true;
+  Future<void> reconcileDueSnapshot() async {
+    if (!backgroundActive || !isPlantingActive) {
+      await uploadNextUnsyncedRecord();
+      return;
+    }
+    final serverNow = await getServerNow();
+    final intervalKey = manilaIntervalKey(serverNow);
+    final intervalIdentity = '${activeBatchNumber ?? 0}|$intervalKey';
+    if (intervalIdentity == lastSnapshotIntervalIdentity) {
+      await uploadNextUnsyncedRecord();
+      return;
+    }
+    final inserted = await captureDueScheduledSnapshot(
+      batchNumber: activeBatchNumber,
+      now: serverNow,
+    );
+    if (inserted) {
+      lastSnapshotIntervalIdentity = intervalIdentity;
+      final logs = await DatabaseHelper.instance.getLogsForBatch(activeBatchNumber!);
+      final recordId = scheduledSnapshotRecordId(
+        batchNumber: activeBatchNumber!,
+        intervalKey: intervalKey,
+      );
+      final snapshot = logs.firstWhere((log) => log.recordId == recordId);
+      service.invoke('newSnapshotLogged', {
+        'timestamp': snapshot.timestamp.toIso8601String(),
+        'pH': snapshot.pH,
+        'temperature': snapshot.temperature,
+        'waterLevel': snapshot.waterLevel,
+        'tds': snapshot.tds,
+        'batchNumber': snapshot.batchNumber,
+        'bed1': snapshot.bed1?.toMap(),
+        'bed2': snapshot.bed2?.toMap(),
+        'intervalKey': snapshot.intervalKey,
+        'recordId': snapshot.recordId,
+        'recordType': snapshot.recordType,
+        'source': snapshot.source,
+      });
+    }
+    await uploadNextUnsyncedRecord();
+  }
+
+  Future<void> scheduleNextIntervalTask() async {
+    if (intervalTaskScheduled || !backgroundActive) return;
+    intervalTaskScheduled = true;
     try {
       final now = await getServerNow();
-        // Save and upload historical snapshots on five-minute local-time boundaries.
-        final philippinesNow = _philippineTime(now);
-        final nextFiveMinute = (philippinesNow.minute ~/ 5 + 1) * 5;
-        final nextBoundary = DateTime.utc(
-          philippinesNow.year,
-          philippinesNow.month,
-          philippinesNow.day,
-          philippinesNow.hour,
-          nextFiveMinute,
-        );
-        final wait = nextBoundary.difference(philippinesNow);
-      Timer(wait.isNegative ? Duration.zero : wait, () async {
+      final wait = delayUntilNextManilaInterval(now);
+      Timer(wait, () async {
         try {
           if (!backgroundActive) return;
-          final serverNow = await getServerNow();
-          final minuteKey = _minuteBucketKey(serverNow);
-          if (isPlantingActive && minuteKey != lastSnapshotMinute) {
-            lastSnapshotMinute = minuteKey;
-            final snapshot = HistoricalData(
-              timestamp: serverNow,
-              pH: lastPh,
-              temperature: lastTemp,
-              waterLevel: lastWater == 'full' ? 'Water full' : 'Needs water',
-              tds: lastTds,
-              batchNumber: activeBatchNumber,
-              bed1: lastBed1,
-              bed2: lastBed2,
-            );
-            await DatabaseHelper.instance.insertLog(snapshot);
-            service.invoke('newSnapshotLogged', {
-              'timestamp': snapshot.timestamp.toIso8601String(),
-              'pH': snapshot.pH,
-              'temperature': snapshot.temperature,
-              'waterLevel': snapshot.waterLevel,
-              'tds': snapshot.tds,
-              'batchNumber': snapshot.batchNumber,
-              'bed1': snapshot.bed1?.toMap(),
-              'bed2': snapshot.bed2?.toMap(),
-            });
-          }
-            await uploadNextUnsyncedRecord();
-            if (!isPlantingActive && !await hasPendingCloudRecords()) {
+          await reconcileDueSnapshot();
+          if (!isPlantingActive && !await hasPendingCloudRecords()) {
             backgroundActive = false;
             service.stopSelf();
           }
         } catch (_) {
           // Local logs remain queued if the network or Firestore is unavailable.
         } finally {
-          minuteTaskScheduled = false;
-          if (backgroundActive) unawaited(scheduleNextMinuteTask());
+          intervalTaskScheduled = false;
+          if (backgroundActive) unawaited(scheduleNextIntervalTask());
         }
       });
     } catch (_) {
-      minuteTaskScheduled = false;
-      Timer(const Duration(seconds: 5), () => unawaited(scheduleNextMinuteTask()));
+      intervalTaskScheduled = false;
+      Timer(const Duration(seconds: 15), () => unawaited(scheduleNextIntervalTask()));
     }
   }
 
-  unawaited(scheduleNextMinuteTask());
+  unawaited(scheduleNextIntervalTask());
+  unawaited(reconcileDueSnapshot());
 }
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  initializeHydrodeckTimeZones();
   try {
     if (Firebase.apps.isEmpty) {
       await Firebase.initializeApp(
@@ -1330,12 +1493,31 @@ class _LoginScreenState extends State<LoginScreen> {
   void dispose() { _email.dispose(); _password.dispose(); super.dispose(); }
 
   Future<void> _login() async {
+    if (_busy) return;
+    final email = _email.text.trim();
+    final password = _password.text;
+    final validationError = validateLoginFields(email: _email.text, password: password);
+    if (validationError != null) {
+      setState(() => _error = validationError);
+      return;
+    }
     setState(() { _busy = true; _error = null; });
     try {
-      final result = await FirebaseAuth.instance.signInWithEmailAndPassword(email: _email.text.trim(), password: _password.text);
-      if (mounted) widget.onAuthenticated(result.user!);
-    } on FirebaseAuthException catch (e) { setState(() => _error = e.message ?? 'Could not log in.'); }
-    finally { if (mounted) setState(() => _busy = false); }
+      final result = await FirebaseAuth.instance.signInWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+      final user = result.user;
+      if (user == null) {
+        if (mounted) setState(() => _error = 'Login failed. Please try again.');
+        return;
+      }
+      if (mounted) widget.onAuthenticated(user);
+    } catch (error) {
+      if (mounted) setState(() => _error = friendlyLoginException(error));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   @override
@@ -1822,7 +2004,7 @@ class _AuthFormScaffold extends StatelessWidget {
   const _AuthFormScaffold({required this.title, required this.subtitle, required this.actionLabel, required this.error, required this.busy, required this.fields, required this.onAction, required this.footer});
   @override Widget build(BuildContext context) => Scaffold(body: SafeArea(child: Center(child: SingleChildScrollView(padding: const EdgeInsets.all(24), child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 460), child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
     const Text('HYDRODECK', textAlign: TextAlign.center, style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, letterSpacing: 2)), const SizedBox(height: 8), Text(subtitle, textAlign: TextAlign.center, style: const TextStyle(color: Colors.grey)), const SizedBox(height: 28), Text(title, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)), const SizedBox(height: 18),
-    ...fields.expand((field) => [field, const SizedBox(height: 12)]), if (error != null) Text(error!, style: const TextStyle(color: Colors.red)), const SizedBox(height: 12), ElevatedButton(onPressed: busy ? null : onAction, style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2DC867), foregroundColor: Colors.white, minimumSize: const Size.fromHeight(52)), child: Text(busy ? 'Please wait...' : actionLabel)), Center(child: footer),
+    ...fields.expand((field) => [field, const SizedBox(height: 12)]), if (error != null) Text(error!, style: const TextStyle(color: Colors.red)), const SizedBox(height: 12), ElevatedButton(onPressed: busy ? null : onAction, style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2DC867), foregroundColor: Colors.white, minimumSize: const Size.fromHeight(52)), child: busy ? const SizedBox(height: 22, width: 22, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)) : Text(actionLabel)), Center(child: footer),
   ]))))));
 }
 
@@ -2146,6 +2328,10 @@ class HistoricalData {
   final int? batchNumber;
   final GrowBedReading? bed1;
   final GrowBedReading? bed2;
+  final String? intervalKey;
+  final String recordType;
+  final String? recordId;
+  final String source;
 
   HistoricalData({
     required this.timestamp,
@@ -2156,7 +2342,41 @@ class HistoricalData {
     this.batchNumber,
     this.bed1,
     this.bed2,
+    this.intervalKey,
+    this.recordType = scheduledSnapshotRecordType,
+    this.recordId,
+    this.source = 'app',
   });
+
+  String get identity {
+    if (recordId != null && recordId!.isNotEmpty) return recordId!;
+    if (batchNumber != null && intervalKey != null) {
+      return historyIdentity(
+        batchNumber: batchNumber!,
+        recordType: recordType,
+        intervalOrEventKey: intervalKey!,
+      );
+    }
+    return '${batchNumber ?? 0}|${timestamp.toUtc().millisecondsSinceEpoch}';
+  }
+
+  bool get readingsComplete => bed1 != null && bed2 != null;
+
+  Map<String, dynamic> toCloudMap() => {
+        'sampleTime': Timestamp.fromDate(timestamp.toUtc()),
+        'batchNumber': batchNumber,
+        'intervalKey': intervalKey,
+        'recordType': recordType,
+        'recordId': identity,
+        'source': source,
+        'readingsComplete': readingsComplete,
+        'pH': pH,
+        'temperature': temperature,
+        'waterLevel': waterLevel,
+        'tds': tds,
+        'bed1': bed1?.toMap(),
+        'bed2': bed2?.toMap(),
+      };
 }
 
 class PlantingRecord {
@@ -2218,11 +2438,7 @@ const Map<String, String> _actuatorControlKeys = {
   'growLight': 'grow_light',
 };
 
-String _minuteBucketKey(DateTime timestamp) {
-  final time = _philippineTime(timestamp);
-  return '${time.year}${time.month.toString().padLeft(2, '0')}${time.day.toString().padLeft(2, '0')}_'
-      '${time.hour.toString().padLeft(2, '0')}${time.minute.toString().padLeft(2, '0')}';
-}
+String historyLogIdentity(HistoricalData log) => log.identity;
 
 GrowBedReading? _decodeBedData(dynamic value) {
   if (value == null) return null;
@@ -2299,7 +2515,17 @@ Future<CloudHistory> downloadCloudHistory() async {
           final timestamp = _parseFirebaseTimestamp(map['sampleTime'] ?? map['timestamp']);
           if (timestamp == null) continue;
           final batch = (map['batchNumber'] as num?)?.toInt();
-          final dedupeKey = '${batch ?? 0}|${document.id}';
+          final intervalKey = map['intervalKey']?.toString() ??
+              map['minuteKey']?.toString() ??
+              manilaIntervalKey(timestamp);
+          final recordId = map['recordId']?.toString() ??
+              (batch == null
+                  ? document.id
+                  : scheduledSnapshotRecordId(
+                      batchNumber: batch,
+                      intervalKey: intervalKey,
+                    ));
+          final dedupeKey = recordId;
           if (!seenLogs.add(dedupeKey)) continue;
           logs.add(HistoricalData(
             timestamp: timestamp,
@@ -2310,6 +2536,10 @@ Future<CloudHistory> downloadCloudHistory() async {
             batchNumber: batch,
             bed1: _decodeBedData(map['bed1']),
             bed2: _decodeBedData(map['bed2']),
+            intervalKey: intervalKey,
+            recordType: map['recordType']?.toString() ?? scheduledSnapshotRecordType,
+            recordId: recordId,
+            source: map['source']?.toString() ?? 'app',
           ));
         }
       } catch (_) {}
@@ -2385,46 +2615,163 @@ Future<CloudHistory> downloadCloudHistory() async {
   );
 }
 
-Future<void> uploadHistoricalLog(HistoricalData snapshot) async {
-  if (FirebaseAuth.instance.currentUser == null) return;
-  final serverNow = await getServerNow();
-  final minuteKey = _minuteBucketKey(serverNow);
+bool _historyUploadInFlight = false;
+bool _historyCaptureInFlight = false;
+
+HistoricalData buildScheduledSnapshot({
+  required int batchNumber,
+  required DateTime at,
+  required GrowBedReading bed1,
+  required GrowBedReading bed2,
+  String source = 'app',
+}) {
+  final intervalKey = manilaIntervalKey(at);
+  final boundary = manilaIntervalStartUtc(at);
+  return HistoricalData(
+    timestamp: boundary,
+    pH: bed2.ph,
+    temperature: '${bed2.temperature.toStringAsFixed(1)}°C',
+    waterLevel: bed2.waterFull ? 'Water full' : 'Needs water',
+    tds: bed2.tds,
+    batchNumber: batchNumber,
+    bed1: bed1,
+    bed2: bed2,
+    intervalKey: intervalKey,
+    recordType: scheduledSnapshotRecordType,
+    recordId: scheduledSnapshotRecordId(
+      batchNumber: batchNumber,
+      intervalKey: intervalKey,
+    ),
+    source: source,
+  );
+}
+
+Future<bool> uploadHistoricalLog(HistoricalData snapshot) async {
+  if (FirebaseAuth.instance.currentUser == null) return false;
+  final batchNumber = snapshot.batchNumber;
+  final intervalKey = snapshot.intervalKey ?? manilaIntervalKey(snapshot.timestamp);
+  if (batchNumber == null) return false;
+  final documentId = firestoreScheduledDocumentId(
+    batchNumber: batchNumber,
+    intervalKey: intervalKey,
+  );
   final minuteDoc = FirebaseFirestore.instance
       .collection('hydrodeckSystems')
       .doc(_sharedHydrodeckSystemId)
       .collection('minuteLogs')
-      .doc(minuteKey);
-  await FirebaseFirestore.instance.runTransaction((transaction) async {
-    final existing = await transaction.get(minuteDoc);
-    if (existing.exists) return;
-    transaction.set(minuteDoc, {
-      'systemId': _sharedHydrodeckSystemId,
-      'minuteKey': minuteKey,
-      'sampleTime': Timestamp.fromDate(snapshot.timestamp.toUtc()),
-      'batchNumber': snapshot.batchNumber,
-      'timestamp': FieldValue.serverTimestamp(),
-      'pH': snapshot.pH,
-      'temperature': snapshot.temperature,
-      'waterLevel': snapshot.waterLevel,
-      'tds': snapshot.tds,
-      'bed1': snapshot.bed1?.toMap(),
-      'bed2': snapshot.bed2?.toMap(),
+      .doc(documentId);
+  try {
+    await FirebaseFirestore.instance.runTransaction((transaction) async {
+      final existing = await transaction.get(minuteDoc);
+      final incoming = {
+        ...snapshot.toCloudMap(),
+        'systemId': _sharedHydrodeckSystemId,
+        'minuteKey': intervalKey,
+        'timestamp': FieldValue.serverTimestamp(),
+      };
+      if (!existing.exists) {
+        transaction.set(minuteDoc, incoming);
+        return;
+      }
+      if (shouldReplaceHistoryRecord(
+        existing: existing.data() ?? const {},
+        incoming: incoming,
+      )) {
+        transaction.set(minuteDoc, incoming, SetOptions(merge: true));
+      }
     });
-  });
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 Future<void> uploadNextUnsyncedRecord() async {
-  final log = await DatabaseHelper.instance.getNextUnsyncedLog();
-  if (log != null) {
-    await uploadHistoricalLog(log);
-    await DatabaseHelper.instance.markLogCloudSynced(log.timestamp);
-    return;
-  }
+  if (_historyUploadInFlight) return;
+  _historyUploadInFlight = true;
+  try {
+    for (var i = 0; i < 8; i++) {
+      final log = await DatabaseHelper.instance.getNextUnsyncedLog();
+      if (log != null) {
+        final uploaded = await uploadHistoricalLog(log);
+        if (!uploaded) return;
+        await DatabaseHelper.instance.markLogCloudSynced(log);
+        continue;
+      }
 
-  final run = await DatabaseHelper.instance.getNextUnsyncedPlantingRecord();
-  if (run != null && await uploadPlantingRecord(run)) {
-    await DatabaseHelper.instance.markPlantingRecordCloudSynced(run.batchNumber);
+      final run = await DatabaseHelper.instance.getNextUnsyncedPlantingRecord();
+      if (run != null) {
+        final uploaded = await uploadPlantingRecord(run);
+        if (!uploaded) return;
+        await DatabaseHelper.instance.markPlantingRecordCloudSynced(run.batchNumber);
+        continue;
+      }
+      return;
+    }
+  } finally {
+    _historyUploadInFlight = false;
   }
+}
+
+Future<HistoricalData?> _readAuthoritativeEsp32Snapshot(
+  String intervalKey,
+  int batchNumber,
+) async {
+  try {
+    final snapshot = await hydrodeckDatabase()
+        .ref('hydrodeck/intervalSnapshots/$intervalKey/sessions/$batchNumber')
+        .get()
+        .timeout(const Duration(seconds: 3));
+    if (!snapshot.exists || snapshot.value is! Map) return null;
+    final map = Map<String, dynamic>.from(snapshot.value as Map);
+    final bed1 = _decodeBedData(map['bed1']);
+    final bed2 = _decodeBedData(map['bed2']);
+    if (bed1 == null || bed2 == null) return null;
+    return buildScheduledSnapshot(
+      batchNumber: (map['batchNumber'] as num?)?.toInt() ?? batchNumber,
+      at: utcFromManilaIntervalKey(intervalKey) ?? DateTime.now().toUtc(),
+      bed1: bed1,
+      bed2: bed2,
+      source: 'esp32',
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<bool> captureDueScheduledSnapshot({
+  required int? batchNumber,
+  required DateTime now,
+}) async {
+  if (batchNumber == null) return false;
+  if (_historyCaptureInFlight) return false;
+  _historyCaptureInFlight = true;
+  try {
+    final intervalKey = manilaIntervalKey(now);
+    final intervalIdentity = '$batchNumber|$intervalKey';
+    if (await DatabaseHelper.instance.getLastCapturedIntervalKey() == intervalIdentity) {
+      return false;
+    }
+    final authoritative = await _readAuthoritativeEsp32Snapshot(intervalKey, batchNumber);
+    if (authoritative == null) return false;
+    if (authoritative.batchNumber == batchNumber) {
+      await DatabaseHelper.instance.insertLogIfMissing(authoritative);
+      await DatabaseHelper.instance.saveLastCapturedIntervalKey(intervalIdentity);
+      unawaited(uploadNextUnsyncedRecord());
+      return true;
+    }
+    return false;
+  } finally {
+    _historyCaptureInFlight = false;
+  }
+}
+
+Future<void> publishActiveBatchNumber(int? batchNumber) async {
+  try {
+    await hydrodeckDatabase()
+        .ref('hydrodeck/settings/activeBatchNumber')
+        .set(batchNumber ?? 0);
+  } catch (_) {}
 }
 
 Future<bool> hasPendingCloudRecords() async {
@@ -3085,11 +3432,9 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
       }
     }
     final localLogs = await DatabaseHelper.instance.getLogs();
-    final knownLogKeys = localLogs
-        .map((log) => '${log.batchNumber}|${log.timestamp.toIso8601String()}')
-        .toSet();
+    final knownLogKeys = localLogs.map(historyLogIdentity).toSet();
     for (final log in cloudHistory.logs) {
-      final key = '${log.batchNumber}|${log.timestamp.toIso8601String()}';
+      final key = historyLogIdentity(log);
       if (knownLogKeys.add(key)) {
         await DatabaseHelper.instance.insertLogIfMissing(log, cloudSynced: true);
       }
@@ -3127,6 +3472,9 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
         _isLoading = false;
       });
     }
+    if (activeSession != null) {
+      await publishActiveBatchNumber(activeSession.batchNumber);
+    }
     final hasPendingRecords = await hasPendingCloudRecords();
     if ((activeSession != null || hasPendingRecords) && _supportsBackgroundService) {
       await initializeBackgroundService();
@@ -3162,6 +3510,7 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
         final start = _parseFirebaseTimestamp(data['startedAt'] ?? data['startDate']);
         if (data['active'] == true && batch != null && start != null) {
           await DatabaseHelper.instance.saveActiveSession(start, batch);
+          unawaited(publishActiveBatchNumber(batch));
           if (!mounted) return;
           final isNewSession = !_isPlantingActive || _activeBatchNumber != batch;
           setState(() {
@@ -3226,6 +3575,7 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
       activeSession.startDate,
       activeSession.batchNumber,
     );
+    await publishActiveBatchNumber(activeSession.batchNumber);
 
     if (_supportsBackgroundService) {
       await initializeBackgroundService();
@@ -3242,6 +3592,7 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
   }
 
   void _continuePlanting() {
+    unawaited(publishActiveBatchNumber(_activeBatchNumber));
     setState(() {
       _showContinuePrompt = false;
       _dashboardOpen = true;
@@ -3266,6 +3617,7 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
 
     await DatabaseHelper.instance.insertPlantingRecord(newRecord);
     await DatabaseHelper.instance.clearActiveSession();
+    await publishActiveBatchNumber(null);
     unawaited(uploadPlantingRecord(newRecord).then((uploaded) async {
       if (uploaded) {
         await DatabaseHelper.instance.markPlantingRecordCloudSynced(newRecord.batchNumber);
@@ -3534,7 +3886,8 @@ class HydroponicsDashboard extends StatefulWidget {
   State<HydroponicsDashboard> createState() => _HydroponicsDashboardState();
 }
 
-class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
+class _HydroponicsDashboardState extends State<HydroponicsDashboard>
+  with WidgetsBindingObserver {
   static const String _esp32Hotspot = 'ESP32-HYDRODECK';
   static const String _esp32HotspotPassword = 'hydrodeck';
 
@@ -3572,6 +3925,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   bool _wifiPromptShown = false;
   bool _isRefreshingConnectivity = false;
   bool _connectivityProbeInProgress = false;
+  bool _historyReconcileInFlight = false;
+  DateTime? _lastHistoryReconcileAt;
   DateTime? _lastLocalTelemetryAt;
   DateTime? _lastFirebaseTelemetryAt;
   Timer? _thresholdPublishTimer;
@@ -3583,6 +3938,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   final Map<String, String> _pendingCommandIds = {}; // actuatorName -> commandId
   final Map<String, Timer> _commandTimeouts = {};
   final Set<String> _actuatorsSeenRunning = {};
+  bool? _confirmedGrowLightState;
 
   List<HistoricalData> _historyLogs = [];
   DateTime? _selectedFilterDate;
@@ -3598,11 +3954,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _esp32Ip = widget.initialIp;
     _ipController = TextEditingController(text: _esp32Ip);
     _wifiSsidController = TextEditingController();
     _wifiPasswordController = TextEditingController();
     _loadStoredLogsAndSettings();
+    unawaited(_reconcileHistory());
     unawaited(_subscribeToCloudLogs());
     _subscribeToFirebase();
     _subscribeToFirebaseConnection();
@@ -3636,7 +3994,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_refreshConnectivity(showLoading: false));
+      unawaited(_reconcileHistory(force: true));
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _telemetrySub?.cancel();
     _snapshotSub?.cancel();
     _firebaseSub?.cancel();
@@ -3701,11 +4068,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           _updateActuatorFromFirebase('bed2_ph_up', 'phUp2', actuators);
           _updateActuatorFromFirebase('bed2_ph_down', 'phDown2', actuators);
           _updateActuatorFromFirebase('bed2_nutrient', 'nutrient2', actuators);
-          final pendingGrowLight = _pendingActuatorStates['grow_light'];
-          if (pendingGrowLight == null || pendingGrowLight == telemetry.growLightOn) {
-            _controlStates['grow_light'] = telemetry.growLightOn;
-            if (pendingGrowLight == telemetry.growLightOn) _pendingActuatorStates.remove('grow_light');
-          }
+          _applyGrowLightTelemetry(telemetry.growLightOn);
           _updateConnectionStatus();
           if (payload['ip'] != null) {
             _esp32Ip = payload['ip'].toString();
@@ -3768,36 +4131,37 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             }
             continue;
           }
-          if (status != 'completed' && status != 'failed') continue;
+          if (!isTerminalCommandAckStatus(status)) continue;
           _pendingCommandIds.remove(pending.key);
           _commandTimeouts.remove(pending.value)?.cancel();
           final busyKey = _getActuatorBusyKey(pending.key);
           if (busyKey != null) {
             if (pending.key == 'growLight') {
               final requestedState = _pendingActuatorStates[busyKey];
-              if (requestedState != null) _controlStates[busyKey] = requestedState;
+              if (status == 'completed' && requestedState != null) {
+                _controlStates[busyKey] = requestedState;
+                _confirmedGrowLightState = requestedState;
+              } else {
+                _confirmedGrowLightState = null;
+              }
             }
             _actuatorBusy[busyKey] = false;
             _pendingActuatorStates.remove(busyKey);
           }
-          unawaited(_removeCommandAcknowledgment(pending.value));
+          if (status == 'rejected' || status == 'timed_out') {
+            _showCommandMessage(
+              pending.key,
+              status == 'rejected'
+                  ? 'The ESP32 rejected this command.'
+                  : 'The ESP32 did not confirm this command in time.',
+            );
+          }
           changed = true;
         }
         if (changed && mounted) setState(() {});
       });
     } catch (_) {
       // Firebase commands subscription failed - commands will rely on telemetry feedback
-    }
-  }
-
-  Future<void> _removeCommandAcknowledgment(String commandId) async {
-    try {
-      await FirebaseDatabase.instanceFor(
-        app: Firebase.app(),
-        databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
-      ).ref('hydrodeck/commandAcks/$commandId').remove();
-    } catch (_) {
-      // A future acknowledgment event or ESP32-side retention cleanup can retry.
     }
   }
 
@@ -3861,6 +4225,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     }
   }
 
+  void _applyGrowLightTelemetry(bool state) {
+    final pendingState = _pendingActuatorStates['grow_light'];
+    if (pendingState != null && pendingState != state) return;
+    final confirmedState = _confirmedGrowLightState;
+    if (confirmedState != null && confirmedState != state) return;
+    _controlStates['grow_light'] = state;
+    if (pendingState == state || confirmedState == state) {
+      _pendingActuatorStates.remove('grow_light');
+      _confirmedGrowLightState = null;
+      final pendingCommandId = _pendingCommandIds['growLight'];
+      if (pendingCommandId != null) {
+        _clearPendingCommand('growLight', pendingCommandId);
+      }
+    }
+  }
+
   Future<void> _refreshServerTime() async {
     DateTime now;
     try {
@@ -3879,6 +4259,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     _connectivityProbeInProgress = true;
     if (showLoading && mounted) setState(() => _isRefreshingConnectivity = true);
     var localConnected = false;
+    var deviceReachable = false;
     try {
       try {
         await WiFiForIoTPlugin.forceWifiUsage(true);
@@ -3909,13 +4290,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         setState(() {
           _bed1 = result.value.bed1;
           _bed2 = result.value.bed2;
-          _controlStates['grow_light'] = result.value.growLightOn;
+          _applyGrowLightTelemetry(result.value.growLightOn);
           _updateActuatorStates(result.value.actuatorStates);
           _esp32Ip = result.key;
           _ipController.text = result.key;
           _lastLocalTelemetryAt = DateTime.now();
         });
         localConnected = true;
+        deviceReachable = true;
         if (_currentIndex == 0) break;
       }
 
@@ -3946,6 +4328,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
                         .inSeconds <=
                       _deviceHeartbeatGraceSeconds;
           if (freshDeviceHeartbeat) {
+            deviceReachable = true;
             _lastFirebaseTelemetryAt = DateTime.now();
           }
         } catch (_) {}
@@ -3962,7 +4345,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           });
         }
       }
+      if (deviceReachable) unawaited(_reconcileHistory());
     } finally {
+      try {
+        await WiFiForIoTPlugin.forceWifiUsage(false);
+      } catch (_) {}
       _connectivityProbeInProgress = false;
       if (mounted) {
         setState(() {
@@ -4019,6 +4406,45 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     }
   }
 
+  Future<void> _reconcileHistory({bool force = false}) async {
+    if (_historyReconcileInFlight) return;
+    final wallClockNow = DateTime.now();
+    if (!force &&
+        _lastHistoryReconcileAt != null &&
+        wallClockNow.difference(_lastHistoryReconcileAt!).inSeconds < 30) {
+      await uploadNextUnsyncedRecord();
+      return;
+    }
+    _historyReconcileInFlight = true;
+    _lastHistoryReconcileAt = wallClockNow;
+    try {
+      final serverNow = await getServerNow();
+      final batchNumber = widget.batchNumber ??
+          await DatabaseHelper.instance.getActiveBatchNumber();
+      if (batchNumber != null) {
+        await captureDueScheduledSnapshot(
+          batchNumber: batchNumber,
+          now: serverNow,
+        );
+      }
+      await uploadNextUnsyncedRecord();
+      if (batchNumber != null) {
+        final storedLogs = await DatabaseHelper.instance.getLogsForBatch(batchNumber);
+        if (mounted && storedLogs.isNotEmpty) {
+          setState(() {
+            _historyLogs = mergeHistoryByIdentity(
+              [...storedLogs, ..._historyLogs],
+              historyLogIdentity,
+            ).values.toList()
+              ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+          });
+        }
+      }
+    } finally {
+      _historyReconcileInFlight = false;
+    }
+  }
+
   Future<void> _subscribeToCloudLogs() async {
     final batchNumber = widget.batchNumber ??
         await DatabaseHelper.instance.getActiveBatchNumber();
@@ -4037,6 +4463,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
           final map = document.data();
           final timestamp = _parseFirebaseTimestamp(map['sampleTime'] ?? map['timestamp']);
           if (timestamp == null) continue;
+          final intervalKey = map['intervalKey']?.toString() ??
+              map['minuteKey']?.toString() ??
+              manilaIntervalKey(timestamp);
+          final recordId = map['recordId']?.toString() ??
+              scheduledSnapshotRecordId(
+                batchNumber: (map['batchNumber'] as num?)?.toInt() ?? batchNumber,
+                intervalKey: intervalKey,
+              );
           incoming.add(HistoricalData(
             timestamp: timestamp,
             pH: (map['pH'] as num?)?.toDouble() ?? 0,
@@ -4046,6 +4480,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             batchNumber: (map['batchNumber'] as num?)?.toInt() ?? batchNumber,
             bed1: _decodeBedData(map['bed1']),
             bed2: _decodeBedData(map['bed2']),
+            intervalKey: intervalKey,
+            recordType: map['recordType']?.toString() ?? scheduledSnapshotRecordType,
+            recordId: recordId,
+            source: map['source']?.toString() ?? 'app',
           ));
         }
         for (final log in incoming) {
@@ -4053,14 +4491,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
         }
         if (!mounted || incoming.isEmpty) return;
         setState(() {
-          final merged = <String, HistoricalData>{
-            for (final log in _historyLogs)
-              '${log.batchNumber}|${log.timestamp.toUtc().millisecondsSinceEpoch}': log,
-          };
-          for (final log in incoming) {
-            merged['${log.batchNumber}|${log.timestamp.toUtc().millisecondsSinceEpoch}'] = log;
-          }
-          _historyLogs = merged.values.toList()
+          _historyLogs = mergeHistoryByIdentity(
+            [...incoming, ..._historyLogs],
+            historyLogIdentity,
+          ).values.toList()
             ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
         });
       }, onError: (_) {});
@@ -4093,9 +4527,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
               _bed2 = GrowBedReading.fromMap(Map<String, dynamic>.from(event['bed2'] as Map));
             }
             if (event['growLight'] != null) {
-                _controlStates['grow_light'] = event['growLight'] is bool
-                  ? event['growLight'] as bool
-                  : (event['growLight'].toString() == '1' || event['growLight'].toString().toLowerCase() == 'true');
+              _applyGrowLightTelemetry(
+                HydrodeckTelemetry._readBoolLike(
+                  {'growLight': event['growLight']},
+                  const ['growLight'],
+                ),
+              );
             }
             if (event['actuators'] is Map) {
               final actuatorMap = Map<String, dynamic>.from(event['actuators'] as Map);
@@ -4130,9 +4567,17 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             tds: (event['tds'] as num?)?.toDouble() ?? 0.0,
             bed1: _decodeBedData(event['bed1']),
             bed2: _decodeBedData(event['bed2']),
+            intervalKey: event['intervalKey']?.toString(),
+            recordType: event['recordType']?.toString() ?? scheduledSnapshotRecordType,
+            recordId: event['recordId']?.toString(),
+            source: event['source']?.toString() ?? 'esp32',
           );
           setState(() {
-            _historyLogs.insert(0, newLog);
+            _historyLogs = mergeHistoryByIdentity(
+              [newLog, ..._historyLogs],
+              historyLogIdentity,
+            ).values.toList()
+              ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
           });
         }
       });
@@ -4179,21 +4624,39 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     return "Pre-cycle Preparation";
   }
 
-  void _trackPendingCommand(String key, String actuatorName, String commandId) {
+  void _showCommandMessage(String actuatorName, String message) {
+    if (!mounted) return;
+    final label = actuatorName == 'growLight'
+        ? 'Grow light'
+        : actuatorName.replaceAll(RegExp(r'([0-9])'), r' $1');
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('$label: $message')),
+    );
+  }
+
+  void _trackPendingCommand(
+    String key,
+    String actuatorName,
+    String commandId,
+    DatabaseReference commandRef,
+  ) {
+    if (actuatorName == 'growLight') _confirmedGrowLightState = null;
     _pendingCommandIds[actuatorName] = commandId;
     _pendingActuatorStates[key] = true;
     _actuatorBusy[key] = true;
     _actuatorsSeenRunning.remove(key);
     _commandTimeouts[commandId]?.cancel();
     final timeout = actuatorName.startsWith('waterPump')
-        ? const Duration(minutes: 3)
-        : const Duration(seconds: 20);
+      ? waterPumpAckTimeout
+      : commandAckTimeout;
     _commandTimeouts[commandId] = Timer(timeout, () {
       if (_pendingCommandIds[actuatorName] != commandId) return;
       _pendingCommandIds.remove(actuatorName);
       _commandTimeouts.remove(commandId);
       _pendingActuatorStates.remove(key);
       _actuatorBusy[key] = false;
+      unawaited(commandRef.remove().catchError((_) {}));
+      _showCommandMessage(actuatorName, 'The ESP32 did not confirm this command in time.');
       if (mounted) setState(() {});
     });
   }
@@ -4207,6 +4670,114 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
       _pendingActuatorStates.remove(key);
       _actuatorBusy[key] = false;
     }
+  }
+
+  String _firebaseCommandFailureMessage(Object error) {
+    if (error is FirebaseException) {
+      final code = error.code.toLowerCase().replaceFirst('database/', '');
+      if (code == 'permission-denied') {
+        return 'Firebase denied this command. Check the deployed Realtime Database rules.';
+      }
+      if (code == 'unavailable' || code == 'network-error') {
+        return 'Firebase is unavailable right now.';
+      }
+      if (code == 'transaction-aborted') {
+        return 'Firebase could not update the command queue. Retry the command.';
+      }
+      return 'Firebase command write failed ($code).';
+    }
+    if (error is TimeoutException) {
+      return 'Firebase command write timed out.';
+    }
+    return 'Firebase command write failed.';
+  }
+
+  Future<void> _writeFirebaseCommand({
+    required DatabaseReference commandQueue,
+    required String commandId,
+    required String value,
+  }) async {
+    final transaction = await commandQueue
+        .runTransaction((currentValue) {
+          final commands = <String, Object?>{};
+          if (currentValue is Map) {
+            for (final entry in currentValue.entries) {
+              if (entry.key is String) {
+                commands[entry.key as String] = entry.value;
+              }
+            }
+          }
+          commands.putIfAbsent(commandId, () => value);
+          return rtdb.Transaction.success(commands);
+        }, applyLocally: false)
+        .timeout(const Duration(seconds: 9));
+    if (!transaction.committed) {
+      throw FirebaseException(
+        plugin: 'firebase_database',
+        code: 'transaction-aborted',
+      );
+    }
+  }
+
+  List<String> _localControlTargets() {
+    return <String>{_esp32Ip.trim(), '192.168.4.1', 'hydrodeck.local'}
+        .map((target) => target
+            .replaceFirst(RegExp(r'^https?://'), '')
+            .replaceFirst(RegExp(r'/.*$'), ''))
+        .where((target) => target.isNotEmpty)
+        .toList();
+  }
+
+  Future<String?> _sendLocalControlCommand({
+    required String actuatorName,
+    required String commandId,
+    required bool growLight,
+    required bool growLightState,
+  }) async {
+    var lastFailure = 'No ESP32 local HTTP target responded.';
+    try {
+      try {
+        await WiFiForIoTPlugin.forceWifiUsage(true);
+      } catch (_) {}
+      for (final target in _localControlTargets()) {
+        try {
+          final response = await http
+              .get(
+                Uri.http(target, '/control', {
+                  'actuator': actuatorName,
+                  'state': growLight ? (growLightState ? '1' : '0') : '1',
+                  'requestId': commandId,
+                }),
+                headers: {'Connection': 'close'},
+              )
+              .timeout(const Duration(seconds: 2));
+          if (response.statusCode == 200) {
+            await DatabaseHelper.instance.saveActiveIp(target);
+            if (mounted) {
+              setState(() {
+                _esp32Ip = target;
+                _ipController.text = target;
+                _lastLocalTelemetryAt = DateTime.now();
+              });
+            }
+            if (_supportsBackgroundService) {
+              FlutterBackgroundService().invoke('updateIp', {'ip': target});
+            }
+            return null;
+          }
+          lastFailure = response.statusCode == 409
+              ? 'ESP32 rejected the command: ${response.body}'
+              : 'ESP32 returned HTTP ${response.statusCode}.';
+        } catch (_) {
+          lastFailure = 'ESP32 local HTTP request timed out or was unreachable.';
+        }
+      }
+    } finally {
+      try {
+        await WiFiForIoTPlugin.forceWifiUsage(false);
+      } catch (_) {}
+    }
+    return lastFailure;
   }
 
   Future<void> _toggleActuator(String key, String actuatorName) async {
@@ -4223,67 +4794,80 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
       return;
     }
 
-    final savedTarget = _esp32Ip.trim();
-    final targets = <String>{
-      if (savedTarget.isNotEmpty) savedTarget,
-      '192.168.4.1',
-      'hydrodeck.local',
-    };
     final isGrowLight = actuatorName == 'growLight';
     final nextGrowLight = !(_controlStates['grow_light'] ?? false);
     final database = FirebaseDatabase.instanceFor(
       app: Firebase.app(),
       databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
     );
-    final commandSlot = database.ref('hydrodeck/commands/$actuatorName');
-    final commandId = commandSlot.push().key ??
+    final commandQueue = database.ref('hydrodeck/commands/$actuatorName');
+    final generatedCommandId = commandQueue.push().key;
+    final commandId = generatedCommandId ??
         'cmd_${DateTime.now().microsecondsSinceEpoch}_${actuatorName.hashCode.abs()}';
+    final commandRef = commandQueue.child(commandId);
+    final commandValue = isGrowLight ? (nextGrowLight ? '1' : '0') : '1';
 
-    _trackPendingCommand(key, actuatorName, commandId);
+    _trackPendingCommand(key, actuatorName, commandId, commandRef);
     if (isGrowLight) _pendingActuatorStates[key] = nextGrowLight;
     if (mounted) setState(() {});
 
-    var sent = false;
+    final localTelemetryFresh = _lastLocalTelemetryAt != null &&
+        DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <= 10;
+    final localFirst = localTelemetryFresh || _connectionStatus == 'Connected locally';
+    var localTried = false;
+    var localFailure = 'ESP32 local HTTP was not attempted.';
+    var localQueued = false;
+    var firebaseQueued = false;
+    Object? firebaseFailure;
+
+    if (localFirst) {
+      localTried = true;
+      localFailure = (await _sendLocalControlCommand(
+            actuatorName: actuatorName,
+            commandId: commandId,
+            growLight: isGrowLight,
+            growLightState: nextGrowLight,
+          )) ??
+          '';
+      localQueued = localFailure.isEmpty;
+    }
+
     try {
-      final payload = isGrowLight
-          ? '$commandId|${nextGrowLight ? 1 : 0}'
-          : commandId;
-      await commandSlot.set(payload).timeout(const Duration(seconds: 3));
-      sent = true;
-    } catch (_) {
-      // Retry over local HTTP when Firebase cannot accept the command.
+      try {
+        await WiFiForIoTPlugin.forceWifiUsage(false);
+      } catch (_) {}
+      await _writeFirebaseCommand(
+        commandQueue: commandQueue,
+        commandId: commandId,
+        value: commandValue,
+      );
+      firebaseQueued = true;
+    } catch (error) {
+      firebaseFailure = error;
     }
 
-    if (!sent) {
-      for (final target in targets) {
-        try {
-          final parameters = <String, String>{
-            'actuator': actuatorName,
-            'state': isGrowLight ? (nextGrowLight ? '1' : '0') : '1',
-            if (!isGrowLight) 'requestId': commandId,
-          };
-          final response = await http.get(
-            Uri.http(target, '/control', parameters),
-            headers: {'Connection': 'close'},
-          ).timeout(const Duration(seconds: 2));
-          if (response.statusCode == 200) {
-            if (isGrowLight) {
-              _controlStates['grow_light'] = nextGrowLight;
-              _clearPendingCommand(actuatorName, commandId);
-            }
-            if (target != savedTarget && _supportsBackgroundService) {
-              FlutterBackgroundService().invoke('updateIp', {'ip': target});
-            }
-            sent = true;
-            break;
-          }
-        } catch (_) {}
-      }
+    if (!firebaseQueued && !localTried) {
+      localTried = true;
+      localFailure = (await _sendLocalControlCommand(
+            actuatorName: actuatorName,
+            commandId: commandId,
+            growLight: isGrowLight,
+            growLightState: nextGrowLight,
+          )) ??
+          '';
+      localQueued = localFailure.isEmpty;
     }
 
-    if (!sent) {
-      // Both Firebase and HTTP failed
+    if (!firebaseQueued && !localQueued) {
       _clearPendingCommand(actuatorName, commandId);
+      unawaited(commandRef.remove().catchError((_) {}));
+      final firebaseMessage = firebaseFailure == null
+          ? 'Firebase was not reachable.'
+          : _firebaseCommandFailureMessage(firebaseFailure);
+      _showCommandMessage(
+        actuatorName,
+        '$firebaseMessage $localFailure',
+      );
       if (mounted) setState(() {});
       return;
     }
@@ -4330,6 +4914,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     } catch (error) {
       if (mounted) setState(() => _hotspotStatus = 'Hotspot connection failed: $error');
     } finally {
+      try {
+        await WiFiForIoTPlugin.forceWifiUsage(false);
+      } catch (_) {}
       if (mounted) setState(() => _isHotspotConnecting = false);
     }
   }
@@ -4461,6 +5048,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
     } catch (error) {
       setState(() => _hotspotStatus = 'Hotspot setup failed: $error');
     } finally {
+      try {
+        await WiFiForIoTPlugin.forceWifiUsage(false);
+      } catch (_) {}
       if (mounted) setState(() => _isHotspotConnecting = false);
     }
   }
@@ -4953,7 +5543,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard> {
             ),
           const SizedBox(height: 12),
           const Text(
-            'Saved snapshots (uploaded every 5 minutes):',
+            'Saved ESP32 snapshots (every 30 minutes, Manila time):',
             style: TextStyle(fontSize: 11, color: Colors.grey, fontStyle: FontStyle.italic)
           ),
           const SizedBox(height: 10),

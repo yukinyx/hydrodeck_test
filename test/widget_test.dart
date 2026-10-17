@@ -76,7 +76,7 @@ void main() {
 
     await tester.tap(find.text('DATA'));
     await tester.pumpAndSettle();
-    expect(find.text('Saved snapshots (uploaded every 5 minutes):'), findsOneWidget);
+    expect(find.text('Saved ESP32 snapshots (every 30 minutes, Manila time):'), findsOneWidget);
 
     await tester.tap(find.text('SETTINGS'));
     await tester.pumpAndSettle();

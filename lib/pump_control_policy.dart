@@ -1,0 +1,125 @@
+/// Firmware-aligned pump policy used by tests and documentation.
+/// The ESP32 is the only place that times and drives relays.
+const int growBed1PumpDurationMs = 3000;
+const int growBed2PumpDurationMs = 5000;
+
+const Set<String> growBed1Actuators = {
+  'waterPump1',
+  'phUp1',
+  'phDown1',
+  'nutrient1',
+};
+
+const Set<String> growBed2Actuators = {
+  'waterPump2',
+  'phUp2',
+  'phDown2',
+  'nutrient2',
+};
+
+const Set<String> validRemoteActuators = {
+  ...growBed1Actuators,
+  ...growBed2Actuators,
+  'growLight',
+};
+
+/// Timed pulse duration for a named actuator.
+///
+/// Safety exception: a water pump filling a low bed runs until the water
+/// sensor reports full (`durationMs = 0`, `stopWhenFull = true`) instead of
+/// using the 3s/5s pulse. Automatic refill uses that same fill-until-full
+/// behavior. Timed 3s/5s pulses apply to pH, nutrient, and manual water
+/// pulses when the bed is already full.
+int timedPumpDurationMs(String actuator) {
+  if (growBed1Actuators.contains(actuator)) return growBed1PumpDurationMs;
+  if (growBed2Actuators.contains(actuator)) return growBed2PumpDurationMs;
+  return 0;
+}
+
+class PumpRunDecision {
+  final bool start;
+  final bool reject;
+  final bool alreadyRunningSameCommand;
+  final String status;
+  final int durationMs;
+  final bool stopWhenFull;
+
+  const PumpRunDecision({
+    required this.start,
+    required this.reject,
+    required this.alreadyRunningSameCommand,
+    required this.status,
+    required this.durationMs,
+    required this.stopWhenFull,
+  });
+}
+
+/// Duplicate command IDs must not restart or extend a run. A new ID targeting
+/// an already-running pump is rejected.
+PumpRunDecision decidePumpCommand({
+  required String actuator,
+  required String requestId,
+  required bool pumpActive,
+  required String activeRequestId,
+  required bool bedIsFull,
+  required bool isWaterPump,
+}) {
+  if (!validRemoteActuators.contains(actuator) || actuator == 'growLight') {
+    return const PumpRunDecision(
+      start: false,
+      reject: true,
+      alreadyRunningSameCommand: false,
+      status: 'rejected',
+      durationMs: 0,
+      stopWhenFull: false,
+    );
+  }
+  if (pumpActive && activeRequestId == requestId && requestId.isNotEmpty) {
+    return const PumpRunDecision(
+      start: false,
+      reject: false,
+      alreadyRunningSameCommand: true,
+      status: 'running',
+      durationMs: 0,
+      stopWhenFull: false,
+    );
+  }
+  if (pumpActive) {
+    return const PumpRunDecision(
+      start: false,
+      reject: true,
+      alreadyRunningSameCommand: false,
+      status: 'rejected',
+      durationMs: 0,
+      stopWhenFull: false,
+    );
+  }
+
+  if (isWaterPump && !bedIsFull) {
+    return const PumpRunDecision(
+      start: true,
+      reject: false,
+      alreadyRunningSameCommand: false,
+      status: 'running',
+      durationMs: 0,
+      stopWhenFull: true,
+    );
+  }
+
+  return PumpRunDecision(
+    start: true,
+    reject: false,
+    alreadyRunningSameCommand: false,
+    status: 'running',
+    durationMs: timedPumpDurationMs(actuator),
+    stopWhenFull: false,
+  );
+}
+
+/// Rollover-safe equivalent of `(long)(now - stopAt) >= 0` on 32-bit millis.
+bool millisDeadlineReached(int nowMs, int stopAtMs) {
+  final now = nowMs.toUnsigned(32);
+  final stopAt = stopAtMs.toUnsigned(32);
+  final delta = (now - stopAt).toUnsigned(32);
+  return delta < 0x80000000;
+}
