@@ -3937,6 +3937,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   // Track pending command requests to prevent duplicates and enable acknowledgment
   final Map<String, String> _pendingCommandIds = {}; // actuatorName -> commandId
   final Map<String, Timer> _commandTimeouts = {};
+  final Set<String> _commandsAcceptedOrRunning = {};
   final Set<String> _actuatorsSeenRunning = {};
   bool? _confirmedGrowLightState;
 
@@ -3950,6 +3951,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   double _minPhThreshold = 5.5;
   double _maxPhThreshold = 7.0;
+  bool _hasSharedPhThresholds = false;
 
   @override
   void initState() {
@@ -4044,6 +4046,21 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                     .inSeconds <=
                   _deviceHeartbeatGraceSeconds;
         final telemetry = HydrodeckTelemetry.fromJson(payload);
+        final settings = payload['settings'];
+        double? sharedMinPh;
+        double? sharedMaxPh;
+        if (settings is Map) {
+          final minValue = settings['minPh'];
+          final maxValue = settings['maxPh'];
+          if (minValue is num && maxValue is num) {
+            final candidateMin = minValue.toDouble();
+            final candidateMax = maxValue.toDouble();
+            if (candidateMin > 0 && candidateMin < candidateMax && candidateMax <= 14) {
+              sharedMinPh = candidateMin;
+              sharedMaxPh = candidateMax;
+            }
+          }
+        }
 
         if (!mounted) return;
         setState(() {
@@ -4076,12 +4093,67 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           }
 
         });
+        if (sharedMinPh != null && sharedMaxPh != null) {
+          await _applySharedPhThresholds(sharedMinPh, sharedMaxPh);
+        }
       }, onError: (_) {
         if (mounted) setState(_updateConnectionStatus);
       });
     } catch (_) {
       // Firebase is unavailable; telemetry will fall back to manual polling.
     }
+  }
+
+  Future<void> _applySharedPhThresholds(double minimum, double maximum) async {
+    _hasSharedPhThresholds = true;
+    final changed = minimum != _minPhThreshold || maximum != _maxPhThreshold;
+    if (!mounted) return;
+    if (changed) {
+      setState(() {
+        _minPhThreshold = minimum;
+        _maxPhThreshold = maximum;
+      });
+    }
+    await DatabaseHelper.instance.saveSettingsConfig(minimum, maximum);
+    if (_supportsBackgroundService) {
+      FlutterBackgroundService().invoke('updateLimits', {
+        'minPh': minimum,
+        'maxPh': maximum,
+      });
+    }
+    if (changed) {
+      unawaited(_postPhThresholdsToLocalEsp32(minimum, maximum).then((_) {}));
+    }
+  }
+
+  Future<bool> _postPhThresholdsToLocalEsp32(double minimum, double maximum) async {
+    var posted = false;
+    try {
+      try {
+        await WiFiForIoTPlugin.forceWifiUsage(true);
+      } catch (_) {}
+      for (final target in _localControlTargets()) {
+        try {
+          final response = await http
+              .get(
+                Uri.parse(
+                  'http://$target/settings?minPh=${minimum.toStringAsFixed(2)}&maxPh=${maximum.toStringAsFixed(2)}',
+                ),
+                headers: {'Connection': 'close'},
+              )
+              .timeout(const Duration(seconds: 2));
+          if (response.statusCode == 200) {
+            posted = true;
+            return true;
+          }
+        } catch (_) {}
+      }
+    } finally {
+      try {
+        await WiFiForIoTPlugin.forceWifiUsage(false);
+      } catch (_) {}
+    }
+    return posted;
   }
 
   void _subscribeToFirebaseConnection() {
@@ -4123,18 +4195,28 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         var changed = false;
         for (final pending in _pendingCommandIds.entries.toList()) {
           final status = acknowledgments[pending.value]?.toString();
-          if (status == 'running') {
+          if (status == 'accepted' || status == 'running') {
+            _commandsAcceptedOrRunning.add(pending.value);
+            _commandTimeouts.remove(pending.value)?.cancel();
             final busyKey = _getActuatorBusyKey(pending.key);
-            if (busyKey != null && _actuatorBusy[busyKey] != true) {
-              _actuatorBusy[busyKey] = true;
-              changed = true;
-            }
+            if (busyKey != null) _actuatorBusy[busyKey] = true;
+            final acceptedFallback = pending.key.startsWith('waterPump')
+                ? waterPumpAckTimeout
+                : commandAckTimeout;
+            _commandTimeouts[pending.value] = Timer(acceptedFallback, () {
+              if (_pendingCommandIds[pending.key] != pending.value) return;
+              _clearPendingCommand(pending.key, pending.value);
+              if (mounted) setState(() {});
+            });
+            changed = true;
             continue;
           }
           if (!isTerminalCommandAckStatus(status)) continue;
+          final wasAcceptedOrRunning = _commandsAcceptedOrRunning.remove(pending.value);
           _pendingCommandIds.remove(pending.key);
           _commandTimeouts.remove(pending.value)?.cancel();
           final busyKey = _getActuatorBusyKey(pending.key);
+          final actuatorWasSeen = busyKey != null && _actuatorsSeenRunning.remove(busyKey);
           if (busyKey != null) {
             if (pending.key == 'growLight') {
               final requestedState = _pendingActuatorStates[busyKey];
@@ -4148,12 +4230,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             _actuatorBusy[busyKey] = false;
             _pendingActuatorStates.remove(busyKey);
           }
-          if (status == 'rejected' || status == 'timed_out') {
+          if (status == 'rejected' ||
+              (status == 'timed_out' && !wasAcceptedOrRunning && !actuatorWasSeen)) {
             _showCommandMessage(
               pending.key,
               status == 'rejected'
                   ? 'The ESP32 rejected this command.'
-                  : 'The ESP32 did not confirm this command in time.',
+                  : 'The ESP32 did not accept or start this command in time.',
             );
           }
           changed = true;
@@ -4208,6 +4291,18 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     if (pendingId != null) {
       if (value) {
         _actuatorsSeenRunning.add(key);
+        _commandsAcceptedOrRunning.add(pendingId);
+        _commandTimeouts.remove(pendingId)?.cancel();
+        _commandTimeouts[pendingId] = Timer(
+          actuatorName.startsWith('waterPump')
+              ? waterPumpAckTimeout
+              : const Duration(seconds: 10),
+          () {
+            if (_pendingCommandIds[actuatorName] != pendingId) return;
+            _clearPendingCommand(actuatorName, pendingId);
+            if (mounted) setState(() {});
+          },
+        );
       } else if (_actuatorsSeenRunning.remove(key)) {
         _clearPendingCommand(actuatorName, pendingId);
       } else {
@@ -4390,8 +4485,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     if (mounted) {
       setState(() {
         _historyLogs = storedLogs;
-        _minPhThreshold = config['minPh'] ?? 5.5;
-        _maxPhThreshold = config['maxPh'] ?? 7.0;
+        if (!_hasSharedPhThresholds) {
+          _minPhThreshold = config['minPh'] ?? 5.5;
+          _maxPhThreshold = config['maxPh'] ?? 7.0;
+        }
         
         if (storedLogs.isNotEmpty) {
           _lastValidWaterStatus = storedLogs.first.waterLevel == "Water full" ? "full" : "low";
@@ -4664,32 +4761,63 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   void _clearPendingCommand(String actuatorName, String commandId) {
     if (_pendingCommandIds[actuatorName] != commandId) return;
     _pendingCommandIds.remove(actuatorName);
+    _commandsAcceptedOrRunning.remove(commandId);
     _commandTimeouts.remove(commandId)?.cancel();
     final key = _getActuatorBusyKey(actuatorName);
     if (key != null) {
+      _actuatorsSeenRunning.remove(key);
       _pendingActuatorStates.remove(key);
       _actuatorBusy[key] = false;
     }
   }
 
-  String _firebaseCommandFailureMessage(Object error) {
+  void _acceptLocalCommand(
+    String key,
+    String actuatorName,
+    String commandId, {
+    bool? growLightState,
+  }) {
+    _commandsAcceptedOrRunning.add(commandId);
+    _commandTimeouts.remove(commandId)?.cancel();
+    if (actuatorName == 'growLight') {
+      if (growLightState != null) {
+        _controlStates[key] = growLightState;
+        _confirmedGrowLightState = growLightState;
+      }
+      _clearPendingCommand(actuatorName, commandId);
+      if (mounted) setState(() {});
+      return;
+    }
+
+    final completionGrace = actuatorName.startsWith('waterPump')
+        ? waterPumpAckTimeout
+        : Duration(seconds: actuatorName.endsWith('1') ? 4 : 6);
+    _commandTimeouts[commandId] = Timer(completionGrace, () {
+      if (_pendingCommandIds[actuatorName] != commandId) return;
+      _clearPendingCommand(actuatorName, commandId);
+      if (mounted) setState(() {});
+    });
+    if (mounted) setState(() {});
+  }
+
+  String _firebaseWriteFailureMessage(Object error) {
     if (error is FirebaseException) {
       final code = error.code.toLowerCase().replaceFirst('database/', '');
       if (code == 'permission-denied') {
-        return 'Firebase denied this command. Check the deployed Realtime Database rules.';
+        return 'Firebase denied this write. Check the deployed Realtime Database rules.';
       }
       if (code == 'unavailable' || code == 'network-error') {
         return 'Firebase is unavailable right now.';
       }
       if (code == 'transaction-aborted') {
-        return 'Firebase could not update the command queue. Retry the command.';
+        return 'Firebase could not update the shared data. Retry the change.';
       }
-      return 'Firebase command write failed ($code).';
+      return 'Firebase write failed ($code).';
     }
     if (error is TimeoutException) {
-      return 'Firebase command write timed out.';
+      return 'Firebase write timed out.';
     }
-    return 'Firebase command write failed.';
+    return 'Firebase write failed.';
   }
 
   Future<void> _writeFirebaseCommand({
@@ -4765,9 +4893,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             }
             return null;
           }
-          lastFailure = response.statusCode == 409
-              ? 'ESP32 rejected the command: ${response.body}'
-              : 'ESP32 returned HTTP ${response.statusCode}.';
+          if (response.statusCode == 409) {
+            return 'ESP32 rejected the command: ${response.body}';
+          }
+          lastFailure = 'ESP32 returned HTTP ${response.statusCode}.';
         } catch (_) {
           lastFailure = 'ESP32 local HTTP request timed out or was unreachable.';
         }
@@ -4830,6 +4959,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           )) ??
           '';
       localQueued = localFailure.isEmpty;
+      if (localQueued) {
+        _acceptLocalCommand(
+          key,
+          actuatorName,
+          commandId,
+          growLightState: isGrowLight ? nextGrowLight : null,
+        );
+        return;
+      }
     }
 
     try {
@@ -4856,6 +4994,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           )) ??
           '';
       localQueued = localFailure.isEmpty;
+      if (localQueued) {
+        unawaited(commandRef.remove().catchError((_) {}));
+        _acceptLocalCommand(
+          key,
+          actuatorName,
+          commandId,
+          growLightState: isGrowLight ? nextGrowLight : null,
+        );
+        return;
+      }
     }
 
     if (!firebaseQueued && !localQueued) {
@@ -4863,7 +5011,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       unawaited(commandRef.remove().catchError((_) {}));
       final firebaseMessage = firebaseFailure == null
           ? 'Firebase was not reachable.'
-          : _firebaseCommandFailureMessage(firebaseFailure);
+          : _firebaseWriteFailureMessage(firebaseFailure);
       _showCommandMessage(
         actuatorName,
         '$firebaseMessage $localFailure',
@@ -5057,24 +5205,25 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   Future<void> _publishPhThresholds() async {
     try {
+      try {
+        await WiFiForIoTPlugin.forceWifiUsage(false);
+      } catch (_) {}
       final settingsRef = FirebaseDatabase.instanceFor(
         app: Firebase.app(),
         databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
       ).ref('hydrodeck/settings');
-      await Future.wait([
-        settingsRef.child('minPh').set(_minPhThreshold),
-        settingsRef.child('maxPh').set(_maxPhThreshold),
-      ]);
-    } catch (_) {}
-
-    for (final target in <String>{_esp32Ip.trim(), '192.168.4.1', 'hydrodeck.local'}..remove('')) {
-      try {
-        await http.get(Uri.parse(
-          'http://$target/settings?minPh=${_minPhThreshold.toStringAsFixed(2)}&maxPh=${_maxPhThreshold.toStringAsFixed(2)}',
-        )).timeout(const Duration(seconds: 2));
-        return;
-      } catch (_) {}
+      await settingsRef.update({
+        'minPh': _minPhThreshold,
+        'maxPh': _maxPhThreshold,
+      }).timeout(const Duration(seconds: 8));
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(_firebaseWriteFailureMessage(error))),
+        );
+      }
     }
+    await _postPhThresholdsToLocalEsp32(_minPhThreshold, _maxPhThreshold);
   }
 
   void _schedulePhThresholdPublish() {

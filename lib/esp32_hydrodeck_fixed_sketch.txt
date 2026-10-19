@@ -159,9 +159,8 @@ const unsigned long phInterval = 1000;
 float minPhThreshold = 5.5;
 float maxPhThreshold = 7.0;
 unsigned long lastPhLimitPoll = 0;
-const unsigned long phLimitPollInterval = 10000;
+const unsigned long phLimitPollInterval = 1000;
 bool phLimitRequestPending = false;
-int phLimitRequestIndex = 0;
 unsigned long waterLowSince1 = 0;
 unsigned long waterLowSince2 = 0;
 
@@ -590,7 +589,7 @@ void finishRemoteCommand(const String& previousStatus) {
     if (commandIsRunning) {
       publishCommandAck(requestId, "running");
     } else if (previousStatus == "accepted" || previousStatus == "running") {
-      publishCommandAck(requestId, "timed_out");
+      publishCommandAck(requestId, "completed");
     } else if (previousStatus == "failed") {
       publishCommandAck(requestId, "rejected");
     } else if (previousStatus == "completed" || previousStatus == "rejected" ||
@@ -622,22 +621,6 @@ void finishRemoteCommand(const String& previousStatus) {
   pendingRemoteCommandPath = "";
   remoteCommandPending = false;
   remoteCommandIndex = (remoteCommandIndex + 1) % 9;
-}
-
-void processRemoteCommandAckResult(AsyncResult& result) {
-  if (result.isError() || !result.available()) {
-    remoteCommandPending = false;
-    pendingRemoteActuator = "";
-    pendingRemoteCommandId = "";
-    pendingRemoteCommandValue = "";
-    pendingRemoteCommandPath = "";
-    result.clear();
-    return;
-  }
-  String previousStatus = result.to<RealtimeDatabaseResult>().to<String>();
-  if (previousStatus == "null") previousStatus = "";
-  finishRemoteCommand(previousStatus);
-  result.clear();
 }
 
 void processRemoteActuatorResult(AsyncResult& result) {
@@ -702,23 +685,12 @@ void processRemoteActuatorResult(AsyncResult& result) {
   pendingRemoteCommandValue = commandValue;
   pendingRemoteCommandPath = commandPath;
   const String previousStatus = consumedCommandStatus(requestId);
-  if (previousStatus.length() > 0) {
-    finishRemoteCommand(previousStatus);
-  } else {
-    remoteCommandPending = true;
-    Database.get(
-      aClient,
-      "/hydrodeck/commandAcks/" + requestId,
-      processRemoteCommandAckResult,
-      false,
-      "remoteCommandAck"
-    );
-  }
+  finishRemoteCommand(previousStatus);
   result.clear();
 }
 
 void requestRemoteActuatorCommand() {
-  if (!firebaseInitialized || !app.ready() || remoteCommandPending || phLimitRequestPending) return;
+  if (!firebaseInitialized || !app.ready() || remoteCommandPending) return;
 
   const String actuator = remoteActuatorNames[remoteCommandIndex];
   const String path = "/hydrodeck/commands/" + actuator;
@@ -729,28 +701,40 @@ void requestRemoteActuatorCommand() {
 void processPhLimitResult(AsyncResult& result) {
   phLimitRequestPending = false;
   if (!result.isError() && result.available()) {
-    const String rawValue = result.to<RealtimeDatabaseResult>().to<String>();
-    const float value = rawValue.toFloat();
-    if (rawValue.length() > 0 && rawValue != "null" && value > 0.0f && value <= 14.0f) {
-      if (phLimitRequestIndex == 0 && value < maxPhThreshold) {
-        minPhThreshold = value;
-        Serial.printf("pH minimum threshold updated to %.2f (maximum %.2f).\n", minPhThreshold, maxPhThreshold);
-      }
-      if (phLimitRequestIndex == 1 && value > minPhThreshold) {
-        maxPhThreshold = value;
-        Serial.printf("pH maximum threshold updated to %.2f (minimum %.2f).\n", maxPhThreshold, minPhThreshold);
+    const String payload = result.to<RealtimeDatabaseResult>().to<String>();
+    DynamicJsonDocument settingsDocument(512);
+    const DeserializationError parseError = deserializeJson(settingsDocument, payload);
+    if (!parseError && settingsDocument.is<JsonObject>()) {
+      JsonObject settings = settingsDocument.as<JsonObject>();
+      const JsonVariant minimumValue = settings["minPh"];
+      const JsonVariant maximumValue = settings["maxPh"];
+      const bool minimumIsNumber = minimumValue.is<float>() || minimumValue.is<int>();
+      const bool maximumIsNumber = maximumValue.is<float>() || maximumValue.is<int>();
+      if (minimumIsNumber && maximumIsNumber) {
+        const float minimum = minimumValue.as<float>();
+        const float maximum = maximumValue.as<float>();
+        if (minimum > 0.0f && minimum < maximum && maximum <= 14.0f &&
+            (minimum != minPhThreshold || maximum != maxPhThreshold)) {
+          minPhThreshold = minimum;
+          maxPhThreshold = maximum;
+          Serial.printf(
+            "pH thresholds updated min=%.2f max=%.2f; bed1 pH=%.2f bed2 pH=%.2f\n",
+            minPhThreshold,
+            maxPhThreshold,
+            currentPhValue1,
+            currentPhValue2
+          );
+        }
       }
     }
     result.clear();
   }
-  phLimitRequestIndex = (phLimitRequestIndex + 1) % 2;
 }
 
 void requestPhLimit() {
-  if (!firebaseInitialized || !app.ready() || remoteCommandPending || phLimitRequestPending) return;
-  const String key = phLimitRequestIndex == 0 ? "minPh" : "maxPh";
+  if (!firebaseInitialized || !app.ready() || phLimitRequestPending) return;
   phLimitRequestPending = true;
-  Database.get(aClient, "/hydrodeck/settings/" + key, processPhLimitResult, false, "phLimit");
+  Database.get(aClient, "/hydrodeck/settings", processPhLimitResult, false, "phLimits");
 }
 
 void processActiveBatchResult(AsyncResult& result) {
@@ -907,6 +891,13 @@ void handleSettings() {
   }
   minPhThreshold = minimum;
   maxPhThreshold = maximum;
+  Serial.printf(
+    "pH thresholds updated via local settings min=%.2f max=%.2f bed1 pH=%.2f bed2 pH=%.2f\n",
+    minPhThreshold,
+    maxPhThreshold,
+    currentPhValue1,
+    currentPhValue2
+  );
   server.send(200, "text/plain", "OK");
 }
 
@@ -1312,28 +1303,29 @@ void loop() {
   if (firebaseInitialized && app.ready() && now - lastFirebasePush >= firebaseInterval) {
     lastFirebasePush = now;
 
-    Database.set<float>(aClient, "/hydrodeck/tds1", currentTdsValue1);
-    Database.set<float>(aClient, "/hydrodeck/ph1", currentPhValue1);
-    Database.set<float>(aClient, "/hydrodeck/temp1", currentTemperature1);
-    Database.set<String>(aClient, "/hydrodeck/water1", digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low");
-    Database.set<float>(aClient, "/hydrodeck/tds2", currentTdsValue2);
-    Database.set<float>(aClient, "/hydrodeck/ph2", currentPhValue2);
-    Database.set<float>(aClient, "/hydrodeck/temp2", currentTemperature2);
-    Database.set<String>(aClient, "/hydrodeck/water2", digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low");
-    String actuatorStateJson = "{";
-    actuatorStateJson += "\"waterPump1\":" + String(digitalRead(waterPump1Pin) == PUMP_ON ? "true" : "false") + ",";
-    actuatorStateJson += "\"phUp1\":" + String(digitalRead(phUp1Pin) == PUMP_ON ? "true" : "false") + ",";
-    actuatorStateJson += "\"phDown1\":" + String(digitalRead(phDown1Pin) == PUMP_ON ? "true" : "false") + ",";
-    actuatorStateJson += "\"nutrient1\":" + String(digitalRead(nutrientPump1Pin) == PUMP_ON ? "true" : "false") + ",";
-    actuatorStateJson += "\"waterPump2\":" + String(digitalRead(waterPump2Pin) == PUMP_ON ? "true" : "false") + ",";
-    actuatorStateJson += "\"phUp2\":" + String(digitalRead(phUp2Pin) == PUMP_ON ? "true" : "false") + ",";
-    actuatorStateJson += "\"phDown2\":" + String(digitalRead(phDown2Pin) == PUMP_ON ? "true" : "false") + ",";
-    actuatorStateJson += "\"nutrient2\":" + String(digitalRead(nutrientPump2Pin) == PUMP_ON ? "true" : "false") + ",";
-    actuatorStateJson += "\"growLight\":" + String(digitalRead(growLightPin) == LIGHT_ON ? "true" : "false") + "}";
-    Database.set<object_t>(aClient, "/hydrodeck/actuators", object_t(actuatorStateJson.c_str()));
-    Database.set<bool>(aClient, "/hydrodeck/wifiConnected", true);
-    Database.set<bool>(aClient, "/hydrodeck/firebaseReady", true);
-    Database.set<object_t>(aClient, "/hydrodeck/lastSeen", object_t("{\".sv\":\"timestamp\"}"));
+    String liveTelemetryJson = "{";
+    liveTelemetryJson += "\"tds1\":" + String(currentTdsValue1, 0) + ",";
+    liveTelemetryJson += "\"ph1\":" + String(currentPhValue1, 2) + ",";
+    liveTelemetryJson += "\"temp1\":" + String(currentTemperature1, 1) + ",";
+    liveTelemetryJson += "\"water1\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\",";
+    liveTelemetryJson += "\"tds2\":" + String(currentTdsValue2, 0) + ",";
+    liveTelemetryJson += "\"ph2\":" + String(currentPhValue2, 2) + ",";
+    liveTelemetryJson += "\"temp2\":" + String(currentTemperature2, 1) + ",";
+    liveTelemetryJson += "\"water2\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\",";
+    liveTelemetryJson += "\"actuators\":{";
+    liveTelemetryJson += "\"waterPump1\":" + String(digitalRead(waterPump1Pin) == PUMP_ON ? "true" : "false") + ",";
+    liveTelemetryJson += "\"phUp1\":" + String(digitalRead(phUp1Pin) == PUMP_ON ? "true" : "false") + ",";
+    liveTelemetryJson += "\"phDown1\":" + String(digitalRead(phDown1Pin) == PUMP_ON ? "true" : "false") + ",";
+    liveTelemetryJson += "\"nutrient1\":" + String(digitalRead(nutrientPump1Pin) == PUMP_ON ? "true" : "false") + ",";
+    liveTelemetryJson += "\"waterPump2\":" + String(digitalRead(waterPump2Pin) == PUMP_ON ? "true" : "false") + ",";
+    liveTelemetryJson += "\"phUp2\":" + String(digitalRead(phUp2Pin) == PUMP_ON ? "true" : "false") + ",";
+    liveTelemetryJson += "\"phDown2\":" + String(digitalRead(phDown2Pin) == PUMP_ON ? "true" : "false") + ",";
+    liveTelemetryJson += "\"nutrient2\":" + String(digitalRead(nutrientPump2Pin) == PUMP_ON ? "true" : "false") + ",";
+    liveTelemetryJson += "\"growLight\":" + String(digitalRead(growLightPin) == LIGHT_ON ? "true" : "false") + "},";
+    liveTelemetryJson += "\"wifiConnected\":true,";
+    liveTelemetryJson += "\"firebaseReady\":true,";
+    liveTelemetryJson += "\"lastSeen\":{\".sv\":\"timestamp\"}}";
+    Database.update<object_t>(aClient, "/hydrodeck", object_t(liveTelemetryJson.c_str()));
 
     if (aClient.lastError().code() != 0) {
       Serial.print("Firebase update failed, code: ");
