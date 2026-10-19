@@ -36,6 +36,25 @@ int timedPumpDurationMs(String actuator) {
   return 0;
 }
 
+bool canStartActuatorAlongside(String actuator, Set<String> activeActuators) {
+  if (!validRemoteActuators.contains(actuator)) return false;
+  if (actuator == 'growLight') return true;
+  if (activeActuators.contains(actuator)) return false;
+
+  if (actuator == 'waterPump1') return !activeActuators.contains('waterPump2');
+  if (actuator == 'waterPump2') return !activeActuators.contains('waterPump1');
+
+  const chemicalActuators = {
+    'phUp1',
+    'phDown1',
+    'nutrient1',
+    'phUp2',
+    'phDown2',
+    'nutrient2',
+  };
+  return !activeActuators.any(chemicalActuators.contains);
+}
+
 class PumpRunDecision {
   final bool start;
   final bool reject;
@@ -63,6 +82,7 @@ PumpRunDecision decidePumpCommand({
   required String activeRequestId,
   required bool bedIsFull,
   required bool isWaterPump,
+  Set<String> activeActuators = const {},
 }) {
   if (!validRemoteActuators.contains(actuator) || actuator == 'growLight') {
     return const PumpRunDecision(
@@ -85,6 +105,16 @@ PumpRunDecision decidePumpCommand({
     );
   }
   if (pumpActive) {
+    return const PumpRunDecision(
+      start: false,
+      reject: true,
+      alreadyRunningSameCommand: false,
+      status: 'rejected',
+      durationMs: 0,
+      stopWhenFull: false,
+    );
+  }
+  if (!canStartActuatorAlongside(actuator, activeActuators)) {
     return const PumpRunDecision(
       start: false,
       reject: true,

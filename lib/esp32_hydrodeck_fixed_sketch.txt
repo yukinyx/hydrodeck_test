@@ -99,8 +99,8 @@ const char* remoteActuatorNames[] = {
 // Pump requests are one-shot values under /commands; actual state is reported separately.
 const unsigned long remoteCommandInterval = 100;
 unsigned long lastRemoteCommandPoll = 0;
-int remoteCommandIndex = 0;
 bool remoteCommandPending = false;
+unsigned int pendingCommandCleanupWrites = 0;
 String pendingRemoteActuator;
 String pendingRemoteCommandId;
 String pendingRemoteCommandValue;
@@ -127,7 +127,7 @@ String pendingIntervalSnapshotKey;
 String pendingIntervalSnapshotIdentity;
 String pendingIntervalSnapshotPath;
 String activeCommandIds[8];
-const unsigned long firebaseHeartbeatInterval = 5000;
+const unsigned long firebaseHeartbeatInterval = 2000;
 OneWire oneWire1(DS18B20_PIN1);
 DallasTemperature sensors1(&oneWire1);
 
@@ -153,13 +153,14 @@ float currentTdsValue2 = 0.0;
 unsigned long lastTempCheck = 0;
 unsigned long lastPhCheck = 0;
 unsigned long lastFirebasePush = 0;
+unsigned long lastFirebaseHeartbeat = 0;
 const unsigned long firebaseInterval = 5000;
 const unsigned long tempInterval = 1000;
 const unsigned long phInterval = 1000;
 float minPhThreshold = 5.5;
 float maxPhThreshold = 7.0;
 unsigned long lastPhLimitPoll = 0;
-const unsigned long phLimitPollInterval = 1000;
+const unsigned long phLimitPollInterval = 5000;
 bool phLimitRequestPending = false;
 unsigned long waterLowSince1 = 0;
 unsigned long waterLowSince2 = 0;
@@ -575,6 +576,24 @@ void servicePumpRuns() {
   }
 }
 
+void processCommandCleanupResult(AsyncResult& result) {
+  if (pendingCommandCleanupWrites > 0) pendingCommandCleanupWrites--;
+  if (result.isError()) {
+    Serial.print("Command queue cleanup failed, code: ");
+    Serial.println(result.error().code());
+  }
+  result.clear();
+}
+
+void removeQueuedCommandChild(const String& path) {
+  pendingCommandCleanupWrites++;
+  Database.remove(
+    aClient,
+    path,
+    processCommandCleanupResult,
+    "commandCleanup"
+  );
+}
 
 void finishRemoteCommand(const String& previousStatus) {
   const String requestId = pendingRemoteCommandId;
@@ -588,16 +607,15 @@ void finishRemoteCommand(const String& previousStatus) {
     }
     if (commandIsRunning) {
       publishCommandAck(requestId, "running");
-    } else if (previousStatus == "accepted" || previousStatus == "running") {
-      publishCommandAck(requestId, "completed");
-    } else if (previousStatus == "failed") {
-      publishCommandAck(requestId, "rejected");
-    } else if (previousStatus == "completed" || previousStatus == "rejected" ||
-               previousStatus == "timed_out") {
-      publishCommandAck(requestId, previousStatus);
     } else {
-      publishCommandAck(requestId, "rejected");
+      publishCommandAck(requestId, "completed");
     }
+    Serial.printf(
+      "Command requestId=%s actuator=%s result=%s duplicate=1 leftover_id_removed=1\n",
+      requestId.c_str(),
+      actuator.c_str(),
+      commandIsRunning ? "running" : "completed"
+    );
   } else {
     publishCommandAck(requestId, "accepted");
     if (actuator == "growLight") {
@@ -606,78 +624,61 @@ void finishRemoteCommand(const String& previousStatus) {
         setGrowLight(requestedState);
         publishActuatorState(actuator, requestedState);
         publishCommandAck(requestId, "completed");
+        Serial.printf(
+          "Command requestId=%s actuator=%s result=completed\n",
+          requestId.c_str(),
+          actuator.c_str()
+        );
       } else {
         publishCommandAck(requestId, "rejected");
+        Serial.printf(
+          "Command requestId=%s actuator=%s result=rejected reason=invalid_value\n",
+          requestId.c_str(),
+          actuator.c_str()
+        );
       }
-    } else if (commandValue != "1" || !executePumpRequest(actuator, true, requestId)) {
-      publishCommandAck(requestId, "rejected");
+    } else {
+      const int pumpNum = pumpNumberForActuator(actuator);
+      String rejectionReason;
+      const bool started = commandValue == "1" && executePumpRequest(actuator, true, requestId);
+      if (!started) {
+        rejectionReason = commandValue != "1"
+            ? "invalid_value"
+            : pumpStartRejectionReason(pumpNum);
+        if (rejectionReason.length() == 0) rejectionReason = "threshold_or_manual_safety";
+        publishCommandAck(requestId, "rejected");
+      }
+      Serial.printf(
+        "Command requestId=%s actuator=%s result=%s reason=%s\n",
+        requestId.c_str(),
+        actuator.c_str(),
+        started ? "accepted" : "rejected",
+        started ? "none" : rejectionReason.c_str()
+      );
     }
   }
 
-  Database.remove(aClient, pendingRemoteCommandPath);
+  removeQueuedCommandChild(pendingRemoteCommandPath);
   pendingRemoteActuator = "";
   pendingRemoteCommandId = "";
   pendingRemoteCommandValue = "";
   pendingRemoteCommandPath = "";
   remoteCommandPending = false;
-  remoteCommandIndex = (remoteCommandIndex + 1) % 9;
 }
 
-void processRemoteActuatorResult(AsyncResult& result) {
-  remoteCommandPending = false;
-  const String actuator = remoteActuatorNames[remoteCommandIndex];
-  if (result.isError() || !result.available()) {
-    remoteCommandIndex = (remoteCommandIndex + 1) % 9;
-    return;
-  }
-
-  String commandPath = "/hydrodeck/commands/" + actuator;
-  const String payload = result.to<RealtimeDatabaseResult>().to<String>();
-  String requestId;
-  String commandValue;
-  bool queuedRecord = false;
-  bool foundCommand = false;
-
-  DynamicJsonDocument commandDocument(1024);
-  const DeserializationError parseError = deserializeJson(commandDocument, payload);
-  if (!parseError && commandDocument.is<JsonObject>()) {
-    JsonObject commandMap = commandDocument.as<JsonObject>();
-    if (!commandMap.isNull() && commandMap.size() > 0) {
-      JsonPair command = *commandMap.begin();
-      requestId = command.key().c_str();
-      if (command.value().is<const char*>()) {
-        commandValue = command.value().as<const char*>();
-      }
-      commandPath += "/" + requestId;
-      queuedRecord = true;
-      foundCommand = true;
-    }
-  }
-
-  if (!queuedRecord && payload.length() > 0 && payload != "null") {
-    foundCommand = true;
-    if (actuator == "growLight") {
-      const int separator = payload.lastIndexOf('|');
-      if (separator > 0) {
-        requestId = payload.substring(0, separator);
-        commandValue = payload.substring(separator + 1);
-      }
-    } else {
-      requestId = payload;
-      commandValue = "1";
-    }
-  }
-
-  if (!foundCommand) {
-    remoteCommandIndex = (remoteCommandIndex + 1) % 9;
-    result.clear();
-    return;
-  }
+bool processQueuedCommand(
+    const String& actuator,
+    const String& requestId,
+    const String& commandValue,
+    const String& commandPath) {
   if (!isValidCommandRequestId(requestId)) {
-    Database.remove(aClient, commandPath);
-    remoteCommandIndex = (remoteCommandIndex + 1) % 9;
-    result.clear();
-    return;
+    removeQueuedCommandChild(commandPath);
+    Serial.printf(
+      "Command requestId=%s actuator=%s result=removed reason=invalid_id\n",
+      requestId.c_str(),
+      actuator.c_str()
+    );
+    return true;
   }
 
   pendingRemoteActuator = actuator;
@@ -686,16 +687,74 @@ void processRemoteActuatorResult(AsyncResult& result) {
   pendingRemoteCommandPath = commandPath;
   const String previousStatus = consumedCommandStatus(requestId);
   finishRemoteCommand(previousStatus);
+  return previousStatus.length() > 0;
+}
+
+void processRemoteActuatorResult(AsyncResult& result) {
+  remoteCommandPending = false;
+  if (result.isError() || !result.available()) {
+    return;
+  }
+
+  const String payload = result.to<RealtimeDatabaseResult>().to<String>();
+  DynamicJsonDocument commandDocument(2048);
+  const DeserializationError parseError = deserializeJson(commandDocument, payload);
+  if (!parseError && commandDocument.is<JsonObject>()) {
+    JsonObject allActuatorQueues = commandDocument.as<JsonObject>();
+    for (JsonPair actuatorEntry : allActuatorQueues) {
+      const String actuator = actuatorEntry.key().c_str();
+      bool knownActuator = false;
+      for (int index = 0; index < 9; index++) {
+        if (actuator == remoteActuatorNames[index]) knownActuator = true;
+      }
+      if (!knownActuator) continue;
+
+      const String queuePath = "/hydrodeck/commands/" + actuator;
+      JsonVariant queueValue = actuatorEntry.value();
+      if (queueValue.is<JsonObject>()) {
+        JsonObject commandMap = queueValue.as<JsonObject>();
+        for (JsonPair command : commandMap) {
+          const String requestId = command.key().c_str();
+          String commandValue;
+          if (command.value().is<const char*>()) {
+            commandValue = command.value().as<const char*>();
+          }
+          const String commandPath = queuePath + "/" + requestId;
+          const bool continueDraining = processQueuedCommand(
+            actuator,
+            requestId,
+            commandValue,
+            commandPath
+          );
+          if (!continueDraining) break;
+        }
+      } else if (queueValue.is<const char*>()) {
+        const String legacyValue = queueValue.as<const char*>();
+        if (legacyValue.length() == 0 || legacyValue == "null") continue;
+        String requestId;
+        String commandValue;
+        if (actuator == "growLight") {
+          const int separator = legacyValue.lastIndexOf('|');
+          if (separator > 0) {
+            requestId = legacyValue.substring(0, separator);
+            commandValue = legacyValue.substring(separator + 1);
+          }
+        } else {
+          requestId = legacyValue;
+          commandValue = "1";
+        }
+        processQueuedCommand(actuator, requestId, commandValue, queuePath);
+      }
+    }
+  }
   result.clear();
 }
 
 void requestRemoteActuatorCommand() {
   if (!firebaseInitialized || !app.ready() || remoteCommandPending) return;
 
-  const String actuator = remoteActuatorNames[remoteCommandIndex];
-  const String path = "/hydrodeck/commands/" + actuator;
   remoteCommandPending = true;
-  Database.get(aClient, path, processRemoteActuatorResult, false, "remoteCommand");
+  Database.get(aClient, "/hydrodeck/commands", processRemoteActuatorResult, false, "remoteCommands");
 }
 
 void processPhLimitResult(AsyncResult& result) {
@@ -1191,16 +1250,28 @@ void loop() {
     requestRemoteActuatorCommand();
   }
 
-  if (now - lastPhLimitPoll >= phLimitPollInterval) {
-    lastPhLimitPoll = now;
-    requestPhLimit();
-  }
+  if (!remoteCommandPending && pendingCommandCleanupWrites == 0) {
+    if (now - lastPhLimitPoll >= phLimitPollInterval) {
+      lastPhLimitPoll = now;
+      requestPhLimit();
+    }
 
-  if (now - lastActiveBatchPoll >= activeBatchPollInterval) {
-    lastActiveBatchPoll = now;
-    requestActiveBatchNumber();
+    if (now - lastActiveBatchPoll >= activeBatchPollInterval) {
+      lastActiveBatchPoll = now;
+      requestActiveBatchNumber();
+    }
+    requestIntervalSnapshot();
+
+    if (firebaseInitialized && app.ready() &&
+        now - lastFirebaseHeartbeat >= firebaseHeartbeatInterval) {
+      lastFirebaseHeartbeat = now;
+      Database.set<object_t>(
+        aClient,
+        "/hydrodeck/lastSeen",
+        object_t("{\".sv\":\"timestamp\"}")
+      );
+    }
   }
-  requestIntervalSnapshot();
 
   // Sampling TDS Sensor 1 & Sensor 2
   static unsigned long sampleTime = 0;
@@ -1300,7 +1371,9 @@ void loop() {
   }
 
   // Syncing with Firebase Realtime Database
-  if (firebaseInitialized && app.ready() && now - lastFirebasePush >= firebaseInterval) {
+    if (firebaseInitialized && app.ready() && !remoteCommandPending &&
+      pendingCommandCleanupWrites == 0 &&
+      now - lastFirebasePush >= firebaseInterval) {
     lastFirebasePush = now;
 
     String liveTelemetryJson = "{";
@@ -1323,12 +1396,12 @@ void loop() {
     liveTelemetryJson += "\"nutrient2\":" + String(digitalRead(nutrientPump2Pin) == PUMP_ON ? "true" : "false") + ",";
     liveTelemetryJson += "\"growLight\":" + String(digitalRead(growLightPin) == LIGHT_ON ? "true" : "false") + "},";
     liveTelemetryJson += "\"wifiConnected\":true,";
-    liveTelemetryJson += "\"firebaseReady\":true,";
-    liveTelemetryJson += "\"lastSeen\":{\".sv\":\"timestamp\"}}";
+    liveTelemetryJson += "\"firebaseReady\":true";
+    liveTelemetryJson += "}";
     Database.update<object_t>(aClient, "/hydrodeck", object_t(liveTelemetryJson.c_str()));
 
     if (aClient.lastError().code() != 0) {
-      Serial.print("Firebase update failed, code: ");
+      Serial.print("Firebase live telemetry update failed, code: ");
       Serial.println(aClient.lastError().code());
     } else {
       Serial.println("Firebase update sent for dual sensor sets and actuators.");

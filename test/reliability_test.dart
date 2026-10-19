@@ -133,6 +133,24 @@ void main() {
       expect(conflicting.status, 'rejected');
     });
 
+    test('allows water and grow light alongside one chemical pulse', () {
+      final water = decidePumpCommand(
+        actuator: 'waterPump2',
+        requestId: 'cmd_water_2',
+        pumpActive: false,
+        activeRequestId: '',
+        bedIsFull: true,
+        isWaterPump: true,
+        activeActuators: {'phUp1'},
+      );
+
+      expect(water.start, isTrue);
+      expect(water.durationMs, growBed2PumpDurationMs);
+      expect(canStartActuatorAlongside('growLight', {'phUp1', 'waterPump2'}), isTrue);
+      expect(canStartActuatorAlongside('waterPump1', {'waterPump2'}), isFalse);
+      expect(canStartActuatorAlongside('phDown1', {'phUp1'}), isFalse);
+    });
+
     test('pump deadline comparison survives millis rollover', () {
       expect(millisDeadlineReached(0xfffffffe, 4), isFalse);
       expect(millisDeadlineReached(4, 4), isTrue);

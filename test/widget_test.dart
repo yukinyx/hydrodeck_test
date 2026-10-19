@@ -4,6 +4,18 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:hydrodeck_test/main.dart';
 
 void main() {
+  test('active persisted session skips the Start Planting route', () {
+    expect(
+      shouldShowStartPlantingScreen(
+        ActivePlantingSession(
+          batchNumber: 4,
+          startDate: DateTime(2026, 10, 20),
+        ),
+      ),
+      isFalse,
+    );
+    expect(shouldShowStartPlantingScreen(null), isTrue);
+  });
   test('telemetry recognizes the firmware actuator identifiers', () {
     final telemetry = HydrodeckTelemetry.fromJson({
       'actuators': {

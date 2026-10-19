@@ -32,7 +32,7 @@ bool get _supportsBackgroundService =>
 int? _cachedServerTimeOffsetMs;
 DateTime? _serverClockAnchorUtc;
 Stopwatch? _serverClockStopwatch;
-const int _deviceHeartbeatGraceSeconds = 7;
+const int _deviceHeartbeatGraceSeconds = 10;
 
 DateTime _philippineTime(DateTime timestamp) => manilaDateTime(timestamp);
 
@@ -877,6 +877,12 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     }
   } catch (_) {}
 
+  backgroundActive = isPlantingActive || await hasPendingCloudRecords();
+  if (!backgroundActive) {
+    service.stopSelf();
+    return;
+  }
+
   service.on('setPlantingState').listen((event) async {
     if (event != null && event['active'] != null) {
       isPlantingActive = event['active'] as bool;
@@ -1098,9 +1104,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
           lastWater = lastBed2.waterFull ? 'full' : 'low';
           firebaseConnected = true;
           final lastSeen = data['lastSeen'];
-          final heartbeatMillis = lastSeen is num
-              ? lastSeen.toInt()
-              : int.tryParse(lastSeen?.toString() ?? '');
+            final heartbeatMillis = _parseHeartbeatMillis(lastSeen);
           final heartbeatFresh = heartbeatMillis != null &&
               DateTime.now().difference(
                 DateTime.fromMillisecondsSinceEpoch(heartbeatMillis),
@@ -2400,6 +2404,9 @@ class ActivePlantingSession {
   const ActivePlantingSession({required this.batchNumber, required this.startDate});
 }
 
+bool shouldShowStartPlantingScreen(ActivePlantingSession? activeSession) =>
+    activeSession == null;
+
 class CloudHistory {
   final List<PlantingRecord> runs;
   final List<HistoricalData> logs;
@@ -3394,8 +3401,6 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
   bool _isLoading = true;
 
   bool _isPlantingActive = false;
-  bool _showContinuePrompt = false;
-  bool _dashboardOpen = false;
   DateTime? _plantingStartDate;
   int? _activeBatchNumber;
   List<PlantingRecord> _pastPlantingRuns = [];
@@ -3468,7 +3473,6 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
         _plantingStartDate = activeSession?.startDate;
         _activeBatchNumber = activeSession?.batchNumber;
         _isPlantingActive = activeSession != null;
-        _showContinuePrompt = activeSession != null;
         _isLoading = false;
       });
     }
@@ -3517,10 +3521,6 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
             _isPlantingActive = true;
             _plantingStartDate = start;
             _activeBatchNumber = batch;
-            if (isNewSession) {
-              _showContinuePrompt = true;
-              _dashboardOpen = false;
-            }
           });
           if (isNewSession && _supportsBackgroundService) {
             await initializeBackgroundService();
@@ -3550,8 +3550,6 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
           if (!mounted) return;
           setState(() {
             _isPlantingActive = false;
-            _showContinuePrompt = false;
-            _dashboardOpen = false;
             _plantingStartDate = null;
             _activeBatchNumber = null;
           });
@@ -3586,16 +3584,6 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
       _plantingStartDate = activeSession.startDate;
       _activeBatchNumber = activeSession.batchNumber;
       _isPlantingActive = true;
-      _showContinuePrompt = false;
-      _dashboardOpen = true;
-    });
-  }
-
-  void _continuePlanting() {
-    unawaited(publishActiveBatchNumber(_activeBatchNumber));
-    setState(() {
-      _showContinuePrompt = false;
-      _dashboardOpen = true;
     });
   }
 
@@ -3630,8 +3618,6 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     setState(() {
       _pastPlantingRuns.add(newRecord);
       _isPlantingActive = false;
-      _showContinuePrompt = false;
-      _dashboardOpen = false;
       _plantingStartDate = null;
       _activeBatchNumber = null;
     });
@@ -3647,22 +3633,25 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
       );
     }
 
-    if (!_isPlantingActive || (_showContinuePrompt && !_dashboardOpen)) {
+    final activeSession = _isPlantingActive &&
+            _plantingStartDate != null &&
+            _activeBatchNumber != null
+        ? ActivePlantingSession(
+            batchNumber: _activeBatchNumber!,
+            startDate: _plantingStartDate!,
+          )
+        : null;
+    if (shouldShowStartPlantingScreen(activeSession)) {
       return StartPlantingScreen(
         onStart: _startPlanting,
-        onContinue: _continuePlanting,
-        activeSession: _isPlantingActive && _plantingStartDate != null && _activeBatchNumber != null
-            ? ActivePlantingSession(
-                batchNumber: _activeBatchNumber!,
-                startDate: _plantingStartDate!,
-              )
-            : null,
+        onContinue: _startPlanting,
+        activeSession: activeSession,
         history: _pastPlantingRuns,
       );
     }
     return HydroponicsDashboard(
-      startDate: _plantingStartDate!,
-      batchNumber: _activeBatchNumber,
+      startDate: activeSession!.startDate,
+      batchNumber: activeSession.batchNumber,
       onEndPlanting: _endPlanting,
       initialIp: _activeEsp32Ip,
     );
@@ -3939,6 +3928,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   final Map<String, Timer> _commandTimeouts = {};
   final Set<String> _commandsAcceptedOrRunning = {};
   final Set<String> _actuatorsSeenRunning = {};
+  final Map<String, Timer> _actuatorTelemetryTimeouts = {};
   bool? _confirmedGrowLightState;
 
   List<HistoricalData> _historyLogs = [];
@@ -4014,6 +4004,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     _firebaseCommandsSub?.cancel();
     _connectionTimer?.cancel();
     _thresholdPublishTimer?.cancel();
+    for (final timer in _commandTimeouts.values) {
+      timer.cancel();
+    }
+    for (final timer in _actuatorTelemetryTimeouts.values) {
+      timer.cancel();
+    }
     _ipController.dispose();
     _wifiSsidController.dispose();
     _wifiPasswordController.dispose();
@@ -4037,9 +4033,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
         final payload = Map<String, dynamic>.from(value);
         final lastSeen = payload['lastSeen'];
-        final heartbeatMillis = lastSeen is num
-            ? lastSeen.toInt()
-            : int.tryParse(lastSeen?.toString() ?? '');
+        final heartbeatMillis = _parseHeartbeatMillis(lastSeen);
         final heartbeatFresh = heartbeatMillis != null &&
             DateTime.now()
                     .difference(DateTime.fromMillisecondsSinceEpoch(heartbeatMillis))
@@ -4200,10 +4194,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             _commandTimeouts.remove(pending.value)?.cancel();
             final busyKey = _getActuatorBusyKey(pending.key);
             if (busyKey != null) _actuatorBusy[busyKey] = true;
-            final acceptedFallback = pending.key.startsWith('waterPump')
-                ? waterPumpAckTimeout
-                : commandAckTimeout;
-            _commandTimeouts[pending.value] = Timer(acceptedFallback, () {
+            _commandTimeouts[pending.value] = Timer(_actuatorPulseGrace(pending.key), () {
               if (_pendingCommandIds[pending.key] != pending.value) return;
               _clearPendingCommand(pending.key, pending.value);
               if (mounted) setState(() {});
@@ -4215,6 +4206,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           final wasAcceptedOrRunning = _commandsAcceptedOrRunning.remove(pending.value);
           _pendingCommandIds.remove(pending.key);
           _commandTimeouts.remove(pending.value)?.cancel();
+          unawaited(_removeFirebaseCommandRecord(pending.key, pending.value));
           final busyKey = _getActuatorBusyKey(pending.key);
           final actuatorWasSeen = busyKey != null && _actuatorsSeenRunning.remove(busyKey);
           if (busyKey != null) {
@@ -4287,22 +4279,24 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   void _updateActuatorFromFirebase(String key, String actuatorName, Map<String, dynamic> actuators) {
     if (!actuators.containsKey(actuatorName)) return;
     final value = HydrodeckTelemetry._readBoolLike(actuators, [actuatorName]);
+    if (actuatorName == 'growLight') {
+      _applyGrowLightTelemetry(value);
+      _actuatorBusy[key] = _pendingCommandIds.containsKey(actuatorName);
+      return;
+    }
     final pendingId = _pendingCommandIds[actuatorName];
     if (pendingId != null) {
       if (value) {
-        _actuatorsSeenRunning.add(key);
-        _commandsAcceptedOrRunning.add(pendingId);
-        _commandTimeouts.remove(pendingId)?.cancel();
-        _commandTimeouts[pendingId] = Timer(
-          actuatorName.startsWith('waterPump')
-              ? waterPumpAckTimeout
-              : const Duration(seconds: 10),
-          () {
+        if (_actuatorsSeenRunning.add(key)) {
+          _commandsAcceptedOrRunning.add(pendingId);
+          _commandTimeouts.remove(pendingId)?.cancel();
+          _actuatorBusy[key] = true;
+          _commandTimeouts[pendingId] = Timer(_actuatorPulseGrace(actuatorName), () {
             if (_pendingCommandIds[actuatorName] != pendingId) return;
             _clearPendingCommand(actuatorName, pendingId);
             if (mounted) setState(() {});
-          },
-        );
+          });
+        }
       } else if (_actuatorsSeenRunning.remove(key)) {
         _clearPendingCommand(actuatorName, pendingId);
       } else {
@@ -4312,11 +4306,20 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     }
 
     _controlStates[key] = value;
-    _actuatorBusy[key] = value;
     if (value) {
-      _actuatorsSeenRunning.add(key);
+      if (_actuatorsSeenRunning.add(key)) {
+        _actuatorBusy[key] = true;
+        _actuatorTelemetryTimeouts[key]?.cancel();
+        _actuatorTelemetryTimeouts[key] = Timer(_actuatorPulseGrace(actuatorName), () {
+          if (_pendingCommandIds.containsKey(actuatorName)) return;
+          _actuatorBusy[key] = false;
+          if (mounted) setState(() {});
+        });
+      }
     } else {
       _actuatorsSeenRunning.remove(key);
+      _actuatorTelemetryTimeouts.remove(key)?.cancel();
+      _actuatorBusy[key] = false;
     }
   }
 
@@ -4414,9 +4417,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           final snapshot = await database.ref('hydrodeck/lastSeen')
               .get()
               .timeout(const Duration(seconds: 2));
-          final heartbeatMillis = snapshot.value is num
-              ? (snapshot.value as num).toInt()
-              : int.tryParse(snapshot.value?.toString() ?? '');
+            final heartbeatMillis = _parseHeartbeatMillis(snapshot.value);
           freshDeviceHeartbeat = heartbeatMillis != null &&
               DateTime.now()
                       .difference(DateTime.fromMillisecondsSinceEpoch(heartbeatMillis))
@@ -4742,18 +4743,24 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     _pendingActuatorStates[key] = true;
     _actuatorBusy[key] = true;
     _actuatorsSeenRunning.remove(key);
+    _actuatorTelemetryTimeouts.remove(key)?.cancel();
     _commandTimeouts[commandId]?.cancel();
     final timeout = actuatorName.startsWith('waterPump')
       ? waterPumpAckTimeout
       : commandAckTimeout;
     _commandTimeouts[commandId] = Timer(timeout, () {
       if (_pendingCommandIds[actuatorName] != commandId) return;
+      final wasAcceptedOrSeen = _commandsAcceptedOrRunning.remove(commandId) ||
+          _actuatorsSeenRunning.remove(key);
       _pendingCommandIds.remove(actuatorName);
       _commandTimeouts.remove(commandId);
+      unawaited(_removeFirebaseCommandRecord(actuatorName, commandId));
       _pendingActuatorStates.remove(key);
       _actuatorBusy[key] = false;
       unawaited(commandRef.remove().catchError((_) {}));
-      _showCommandMessage(actuatorName, 'The ESP32 did not confirm this command in time.');
+      if (!wasAcceptedOrSeen) {
+        _showCommandMessage(actuatorName, 'The ESP32 did not accept or start this command in time.');
+      }
       if (mounted) setState(() {});
     });
   }
@@ -4765,10 +4772,26 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     _commandTimeouts.remove(commandId)?.cancel();
     final key = _getActuatorBusyKey(actuatorName);
     if (key != null) {
+      _actuatorTelemetryTimeouts.remove(key)?.cancel();
       _actuatorsSeenRunning.remove(key);
       _pendingActuatorStates.remove(key);
       _actuatorBusy[key] = false;
     }
+  }
+
+  Duration _actuatorPulseGrace(String actuatorName) {
+    if (actuatorName == 'waterPump1' && !_bed1.waterFull) return waterPumpAckTimeout;
+    if (actuatorName == 'waterPump2' && !_bed2.waterFull) return waterPumpAckTimeout;
+    return Duration(seconds: actuatorName.endsWith('1') ? 4 : 6);
+  }
+
+  Future<void> _removeFirebaseCommandRecord(String actuatorName, String commandId) async {
+    try {
+      await FirebaseDatabase.instanceFor(
+        app: Firebase.app(),
+        databaseURL: 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
+      ).ref('hydrodeck/commands/$actuatorName/$commandId').remove();
+    } catch (_) {}
   }
 
   void _acceptLocalCommand(
@@ -4789,9 +4812,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       return;
     }
 
-    final completionGrace = actuatorName.startsWith('waterPump')
-        ? waterPumpAckTimeout
-        : Duration(seconds: actuatorName.endsWith('1') ? 4 : 6);
+    final completionGrace = _actuatorPulseGrace(actuatorName);
     _commandTimeouts[commandId] = Timer(completionGrace, () {
       if (_pendingCommandIds[actuatorName] != commandId) return;
       _clearPendingCommand(actuatorName, commandId);
@@ -4910,12 +4931,21 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   Future<void> _toggleActuator(String key, String actuatorName) async {
-    if (_pendingCommandIds.containsKey(actuatorName) || _actuatorBusy[key] == true) return;
-    if (_otherWaterPumpIsRunning(actuatorName)) return;
+    if (_pendingCommandIds.containsKey(actuatorName) || _actuatorBusy[key] == true) {
+      _showCommandMessage(actuatorName, 'Already running. Wait for this pulse to finish.');
+      return;
+    }
+    if (_otherWaterPumpIsRunning(actuatorName)) {
+      _showCommandMessage(actuatorName, 'The other water pump is still running.');
+      return;
+    }
     final isChemicalPump = actuatorName.startsWith('phUp') ||
         actuatorName.startsWith('phDown') ||
         actuatorName.startsWith('nutrient');
-    if (isChemicalPump && _chemicalPumpBusy) return;
+    if (isChemicalPump && _chemicalPumpBusy) {
+      _showCommandMessage(actuatorName, 'Another dosing pump is still running.');
+      return;
+    }
     if ((key == 'bed1_ph_down' && _bed1.ph < _minPhThreshold) ||
         (key == 'bed1_ph_up' && _bed1.ph > _maxPhThreshold) ||
         (key == 'bed2_ph_down' && _bed2.ph < _minPhThreshold) ||
@@ -6198,4 +6228,16 @@ class SnapshotDetailScreen extends StatelessWidget {
       ),
     );
   }
+}
+
+int? _parseHeartbeatMillis(dynamic value) {
+  if (value is num) return value.toInt();
+  if (value is String) return int.tryParse(value);
+  if (value is Map) {
+    for (final key in const ['timestamp', 'millis', 'value', '.sv']) {
+      final parsed = _parseHeartbeatMillis(value[key]);
+      if (parsed != null) return parsed;
+    }
+  }
+  return null;
 }
