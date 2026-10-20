@@ -1,6 +1,14 @@
 ﻿#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/md.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <atomic>
+#include <cstring>
 
 // FirebaseClient 2.x enables services through compile-time feature flags.
 #define ENABLE_USER_AUTH
@@ -35,6 +43,97 @@ const char* RAIN_TOKEN = "15c7068b34aa4c8103371012c769b18feb98878a948fba5c89786b
 const unsigned long RAIN_NODE_TIMEOUT_MS = 3000UL;
 const unsigned long RAIN_START_CONFIRM_TIMEOUT_MS = 3000UL;
 const unsigned long RAIN_MAX_RUN_MS = 300000UL;
+const unsigned long RAIN_COMMAND_RETRY_MS = 250UL;
+const unsigned long RAIN_BEACON_INTERVAL_MS = 500UL;
+const uint16_t ESPNOW_MAGIC = 0x4859;
+const uint8_t ESPNOW_VERSION = 1;
+const uint8_t DEVICE_MAIN = 1;
+const uint8_t DEVICE_RAIN = 2;
+const uint8_t MSG_RAIN_HELLO = 1;
+const uint8_t MSG_MAIN_BEACON = 2;
+const uint8_t MSG_RAIN_STATUS = 3;
+const uint8_t MSG_PUMP_COMMAND = 4;
+const uint8_t MSG_COMMAND_ACK = 5;
+const uint8_t PUMP1_ID = 1;
+const uint8_t PUMP2_ID = 2;
+const uint8_t ACK_ACCEPTED = 1;
+const uint8_t ACK_REJECTED = 2;
+const uint8_t ACK_DUPLICATE = 3;
+const uint8_t FAULT_NONE = 0;
+const uint8_t FAULT_SENSOR_CONFLICT = 1;
+const uint8_t FAULT_PUMP_CONFLICT = 2;
+const uint8_t FAULT_RESERVOIR_LOW = 3;
+const uint8_t FAULT_MAX_RUN = 4;
+const uint8_t FAULT_STALE_COMMAND = 5;
+const uint8_t FAULT_INVALID_COMMAND = 6;
+const size_t ESPNOW_PACKET_MAX = 64;
+const uint8_t ESPNOW_BROADCAST_MAC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+#pragma pack(push, 1)
+struct PacketHeader {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t type;
+  uint8_t sender;
+  uint8_t payloadSize;
+  uint16_t sequence;
+};
+
+struct RainStatusPacket {
+  PacketHeader header;
+  uint32_t bootId;
+  uint32_t uptimeMs;
+  uint32_t activeCommandId;
+  uint8_t currentChannel;
+  uint8_t midWet;
+  uint8_t fullWet;
+  uint8_t pumpMask;
+  uint8_t activePump;
+  uint8_t fault;
+  uint16_t crc;
+  uint8_t authTag[8];
+};
+
+struct MainBeaconPacket {
+  PacketHeader header;
+  uint32_t bootId;
+  uint8_t currentChannel;
+  uint16_t crc;
+  uint8_t authTag[8];
+};
+
+struct PumpCommandPacket {
+  PacketHeader header;
+  uint32_t mainBootId;
+  uint32_t commandId;
+  uint32_t remainingMs;
+  uint8_t pump;
+  uint8_t requestedOn;
+  uint16_t crc;
+  uint8_t authTag[8];
+};
+
+struct CommandAckPacket {
+  PacketHeader header;
+  uint32_t rainBootId;
+  uint32_t commandId;
+  uint8_t pump;
+  uint8_t result;
+  uint8_t reason;
+  uint16_t crc;
+  uint8_t authTag[8];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(RainStatusPacket) <= ESP_NOW_MAX_DATA_LEN, "RAIN status packet exceeds ESP-NOW v1 limit");
+static_assert(sizeof(PumpCommandPacket) <= ESP_NOW_MAX_DATA_LEN, "Pump command packet exceeds ESP-NOW v1 limit");
+static_assert(sizeof(CommandAckPacket) <= ESP_NOW_MAX_DATA_LEN, "Command ACK exceeds ESP-NOW v1 limit");
+
+struct ReceivedPacket {
+  uint8_t mac[6];
+  uint8_t length;
+  uint8_t bytes[ESPNOW_PACKET_MAX];
+};
 
 // --- PIN DEFINITIONS ---
 // Sensors Set 1
@@ -79,7 +178,13 @@ Preferences commandPreferences;
 bool firebaseInitialized = false;
 bool wifiConnectInProgress = false;
 bool mdnsStarted = false;
+bool firebaseHeartbeatPending = false;
+bool lastLoggedFirebaseReady = false;
 unsigned long lastWifiRetry = 0;
+unsigned long lastFirebaseInitAttemptAt = 0;
+unsigned long lastFirebaseHeartbeatSuccessAt = 0;
+unsigned long firebaseHeartbeatStartedAt = 0;
+unsigned long lastConnectionDiagnosticAt = 0;
 unsigned long wifiConnectStarted = 0;
 unsigned long lastHotspotAttempt = 0;
 unsigned long lastActiveBatchPoll = 0;
@@ -87,6 +192,15 @@ const unsigned long wifiRetryInterval = 10000;
 const unsigned long wifiConnectTimeout = 30000;
 const unsigned long hotspotRetryInterval = 5000;
 const unsigned long activeBatchPollInterval = 10000;
+const unsigned long firebaseInitRetryInterval = 10000UL;
+const unsigned long connectionDiagnosticInterval = 10000UL;
+
+struct WifiDiagnosticEvent {
+  uint8_t kind;
+  uint16_t disconnectReason;
+};
+
+QueueHandle_t wifiDiagnosticQueue = nullptr;
 
 static const char* AP_SSID = "ESP32-HYDRODECK";
 static const char* AP_PASSWORD = "hydrodeck";
@@ -181,6 +295,26 @@ unsigned long lastRainSeenAt = 0;
 unsigned long lastAutoRefillOfflineLogAt = 0;
 bool rainDesiredPump1On = false;
 bool rainDesiredPump2On = false;
+bool espNowReady = false;
+bool rainMacKnown = false;
+uint8_t rainMac[6] = {};
+QueueHandle_t espNowReceiveQueue = nullptr;
+std::atomic<uint32_t> espNowQueueDrops{0};
+uint32_t reportedEspNowQueueDrops = 0;
+uint32_t mainBootId = 0;
+uint32_t remoteCommandCounter = 0;
+uint32_t remotePumpCommandIds[2] = {};
+uint32_t lastRainBootId = 0;
+uint16_t espNowSequence = 0;
+uint16_t lastRainSequence = 0;
+bool lastRainSequenceKnown = false;
+unsigned long lastRainCommandSentAt[2] = {};
+unsigned long lastBeaconSentAt = 0;
+unsigned long lastEspNowRetryAt = 0;
+unsigned long lastLoggedRainChannelChangeAt = 0;
+int lastLoggedRainChannel = 0;
+uint32_t rainAcknowledgedCommandId[2] = {};
+uint8_t rainAcknowledgedResult[2] = {};
 
 // Variables for 1-minute delay automatic pH control
 unsigned long bed1PhLowSince = 0;
@@ -251,18 +385,170 @@ float readPhSensor(int pin, float sensorSlope) {
   return ph;
 }
 
+uint16_t packetCrc(const uint8_t* bytes, size_t length) {
+  uint16_t crc = 0xffff;
+  for (size_t index = 0; index < length; index++) {
+    crc ^= bytes[index];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 1) ? (crc >> 1) ^ 0xa001 : crc >> 1;
+    }
+  }
+  return crc;
+}
+
+template <typename Packet>
+void preparePacket(Packet& packet, uint8_t type, uint8_t sender) {
+  packet.header.magic = ESPNOW_MAGIC;
+  packet.header.version = ESPNOW_VERSION;
+  packet.header.type = type;
+  packet.header.sender = sender;
+  packet.header.payloadSize =
+      sizeof(Packet) - sizeof(PacketHeader) - sizeof(packet.crc) -
+      sizeof(packet.authTag);
+  packet.header.sequence = ++espNowSequence;
+}
+
+template <typename Packet>
+bool finalizePacket(Packet& packet) {
+  packet.crc = packetCrc(
+      reinterpret_cast<const uint8_t*>(&packet), offsetof(Packet, crc));
+  uint8_t digest[32];
+  const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (md == nullptr || mbedtls_md_hmac(
+      md,
+      reinterpret_cast<const unsigned char*>(RAIN_TOKEN), strlen(RAIN_TOKEN),
+      reinterpret_cast<const unsigned char*>(&packet), offsetof(Packet, authTag),
+      digest) != 0) {
+    return false;
+  }
+  memcpy(packet.authTag, digest, sizeof(packet.authTag));
+  return true;
+}
+
+template <typename Packet>
+bool packetValid(const Packet& packet, size_t length, uint8_t type, uint8_t sender) {
+  if (length != sizeof(Packet) || packet.header.magic != ESPNOW_MAGIC ||
+      packet.header.version != ESPNOW_VERSION || packet.header.type != type ||
+      packet.header.sender != sender ||
+      packet.header.payloadSize !=
+          sizeof(Packet) - sizeof(PacketHeader) - sizeof(packet.crc) -
+          sizeof(packet.authTag)) {
+    return false;
+  }
+  if (packet.crc != packetCrc(
+      reinterpret_cast<const uint8_t*>(&packet), offsetof(Packet, crc))) {
+    return false;
+  }
+  uint8_t digest[32];
+  const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (md == nullptr || mbedtls_md_hmac(
+      md,
+      reinterpret_cast<const unsigned char*>(RAIN_TOKEN), strlen(RAIN_TOKEN),
+      reinterpret_cast<const unsigned char*>(&packet), offsetof(Packet, authTag),
+      digest) != 0) {
+    return false;
+  }
+  return memcmp(packet.authTag, digest, sizeof(packet.authTag)) == 0;
+}
+
+bool sequenceIsNewer(uint16_t sequence, uint16_t previous) {
+  return static_cast<int16_t>(sequence - previous) > 0;
+}
+
+void derivePeerKey(const char* purpose, uint8_t output[16]) {
+  String input = String(purpose) + ":" + RAIN_TOKEN;
+  uint8_t digest[32];
+  mbedtls_sha256(
+      reinterpret_cast<const unsigned char*>(input.c_str()),
+      input.length(),
+      digest,
+      0);
+  memcpy(output, digest, 16);
+}
+
+bool addEspNowPeer(const uint8_t mac[6], bool encrypted) {
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = 0;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = encrypted;
+  if (encrypted) derivePeerKey("HYDRODECK-RAIN-LMK-v1", peer.lmk);
+  const esp_err_t result = esp_now_add_peer(&peer);
+  if (result == ESP_OK || result == ESP_ERR_ESPNOW_EXIST) return true;
+  Serial.printf("ESP-NOW peer add failed mac=%02X:%02X:%02X:%02X:%02X:%02X err=%d channel=%d\n",
+      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], result, WiFi.channel());
+  return false;
+}
+
+bool sendEspNowPacket(const uint8_t mac[6], const void* packet, size_t length) {
+  if (!espNowReady) return false;
+  const esp_err_t result = esp_now_send(
+      mac, reinterpret_cast<const uint8_t*>(packet), length);
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW send enqueue failed err=%d channel=%d\n",
+        result, WiFi.channel());
+    return false;
+  }
+  return true;
+}
+
+void onEspNowReceive(
+    const esp_now_recv_info_t* info,
+    const uint8_t* data,
+    int length) {
+  if (info == nullptr || info->src_addr == nullptr || data == nullptr ||
+      length <= 0 || length > static_cast<int>(ESPNOW_PACKET_MAX) ||
+      espNowReceiveQueue == nullptr) return;
+  ReceivedPacket packet = {};
+  memcpy(packet.mac, info->src_addr, sizeof(packet.mac));
+  packet.length = static_cast<uint8_t>(length);
+  memcpy(packet.bytes, data, length);
+  if (xQueueSend(espNowReceiveQueue, &packet, 0) != pdTRUE) {
+    espNowQueueDrops.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 // Actuator control functions
 bool isRemoteWaterPump(int pumpNum) {
   return pumpNum == 1 || pumpNum == 5;
 }
 
+void setRemoteWaterPumpDesired(int pumpNum, bool turnOn) {
+  const int index = pumpNum == 1 ? 0 : 1;
+  bool& desired = index == 0 ? rainDesiredPump1On : rainDesiredPump2On;
+  if (desired == turnOn) return;
+  desired = turnOn;
+  uint32_t& commandId = remotePumpCommandIds[index];
+  commandId = ++remoteCommandCounter;
+  if (commandId == 0) commandId = ++remoteCommandCounter;
+  lastRainCommandSentAt[index] = 0;
+  rainAcknowledgedCommandId[index] = 0;
+  Serial.printf("ESP-NOW pump command queued pump=%s command=%lu state=%u\n",
+      remoteActuatorNames[pumpNum - 1],
+      static_cast<unsigned long>(commandId), turnOn ? 1 : 0);
+}
+
+void queueFreshRainSafetyStops() {
+  rainDesiredPump1On = false;
+  rainDesiredPump2On = false;
+  for (int index = 0; index < 2; index++) {
+    remoteCommandCounter++;
+    if (remoteCommandCounter == 0) remoteCommandCounter++;
+    remotePumpCommandIds[index] = remoteCommandCounter;
+    rainAcknowledgedCommandId[index] = 0;
+    rainAcknowledgedResult[index] = 0;
+    lastRainCommandSentAt[index] = 0;
+  }
+  Serial.println("ESP-NOW queued fresh OFF commands after RAIN recovery");
+}
+
 void setPump(int pumpNum, bool turnOn) {
   if (pumpNum == 1) {
-    rainDesiredPump1On = turnOn;
+    setRemoteWaterPumpDesired(pumpNum, turnOn);
     return;
   }
   if (pumpNum == 5) {
-    rainDesiredPump2On = turnOn;
+    setRemoteWaterPumpDesired(pumpNum, turnOn);
     return;
   }
 
@@ -780,86 +1066,300 @@ void serviceRainNodeHealth(unsigned long now) {
   }
 }
 
-void handleRainSync() {
-  if (!server.hasArg("token") || server.arg("token") != RAIN_TOKEN) {
-    server.send(403, "application/json", "{\"ok\":false}");
+const char* rainFaultName(uint8_t fault) {
+  switch (fault) {
+    case FAULT_SENSOR_CONFLICT: return "sensor_conflict";
+    case FAULT_PUMP_CONFLICT: return "pump_conflict";
+    case FAULT_RESERVOIR_LOW: return "reservoir_low";
+    case FAULT_MAX_RUN: return "max_run";
+    case FAULT_STALE_COMMAND: return "stale_command";
+    case FAULT_INVALID_COMMAND: return "invalid_command";
+    default: return "";
+  }
+}
+
+void sendMainBeacon() {
+  if (!espNowReady) return;
+  MainBeaconPacket packet = {};
+  preparePacket(packet, MSG_MAIN_BEACON, DEVICE_MAIN);
+  packet.bootId = mainBootId;
+  const int currentChannel = WiFi.channel();
+  packet.currentChannel = static_cast<uint8_t>(currentChannel > 0 ? currentChannel : 0);
+  if (!finalizePacket(packet)) {
+    Serial.println("ESP-NOW beacon authentication failed");
     return;
   }
-  for (const char* field : {"p1", "p2", "mid", "full", "up"}) {
-    if (!server.hasArg(field)) {
-      server.send(400, "application/json", "{\"ok\":false}");
-      return;
-    }
+  sendEspNowPacket(ESPNOW_BROADCAST_MAC, &packet, sizeof(packet));
+}
+
+unsigned long remotePumpRemainingMs(int pumpNum, unsigned long now) {
+  const PumpRunState& run = pumpRuns[pumpNum - 1];
+  if (!run.active || !run.hasDeadline || run.stopRequested) return 0;
+  if ((long)(now - run.stopAt) >= 0) return 1;
+  return min(run.stopAt - now, RAIN_MAX_RUN_MS);
+}
+
+void sendRemotePumpCommand(int pumpNum, unsigned long now) {
+  if (!espNowReady || !rainMacKnown || pumpNum != 1 && pumpNum != 5) return;
+  const int index = pumpNum == 1 ? 0 : 1;
+    if (rainAcknowledgedCommandId[index] == remotePumpCommandIds[index] &&
+      rainAcknowledgedResult[index] >= ACK_ACCEPTED &&
+      rainAcknowledgedResult[index] <= ACK_DUPLICATE) return;
+  if (lastRainCommandSentAt[index] != 0 &&
+      now - lastRainCommandSentAt[index] < RAIN_COMMAND_RETRY_MS) return;
+  lastRainCommandSentAt[index] = now;
+  PumpCommandPacket packet = {};
+  preparePacket(packet, MSG_PUMP_COMMAND, DEVICE_MAIN);
+  packet.mainBootId = mainBootId;
+  packet.commandId = remotePumpCommandIds[index];
+  packet.remainingMs = remotePumpRemainingMs(pumpNum, now);
+  packet.pump = index == 0 ? PUMP1_ID : PUMP2_ID;
+  packet.requestedOn = index == 0
+      ? (rainDesiredPump1On ? 1 : 0)
+      : (rainDesiredPump2On ? 1 : 0);
+  if (!finalizePacket(packet)) {
+    Serial.printf("ESP-NOW command authentication failed pump=%u\n",
+        packet.pump);
+    return;
   }
-  const String p1Value = server.arg("p1");
-  const String p2Value = server.arg("p2");
-  const String midValue = server.arg("mid");
-  const String fullValue = server.arg("full");
-  if ((p1Value != "0" && p1Value != "1") ||
-      (p2Value != "0" && p2Value != "1") ||
-      (midValue != "0" && midValue != "1") ||
-      (fullValue != "0" && fullValue != "1")) {
-    server.send(400, "application/json", "{\"ok\":false}");
+  if (!sendEspNowPacket(rainMac, &packet, sizeof(packet)) &&
+      (!rainNodeOnline || now - lastRainCommandSentAt[index] >= 2000UL)) {
+    Serial.printf("ESP-NOW command retry pending pump=%u command=%lu\n",
+        packet.pump, static_cast<unsigned long>(packet.commandId));
+  }
+}
+
+void adoptRainPeer(const uint8_t mac[6]) {
+  if (rainMacKnown && memcmp(rainMac, mac, sizeof(rainMac)) == 0) return;
+  if (rainNodeOnline && rainMacKnown) {
+    Serial.println("ESP-NOW packet from an unexpected RAIN MAC rejected");
+    return;
+  }
+  if (rainMacKnown) esp_now_del_peer(rainMac);
+  rainMacKnown = false;
+  memcpy(rainMac, mac, sizeof(rainMac));
+  if (!addEspNowPeer(rainMac, true)) return;
+  rainMacKnown = true;
+  Serial.printf("ESP-NOW RAIN peer paired mac=%02X:%02X:%02X:%02X:%02X:%02X channel=%d\n",
+      rainMac[0], rainMac[1], rainMac[2], rainMac[3], rainMac[4], rainMac[5],
+      WiFi.channel());
+}
+
+void processRainStatus(const ReceivedPacket& received,
+    const RainStatusPacket& report, unsigned long now) {
+  const bool pumpMaskValid = report.pumpMask <= 3 && report.pumpMask != 3;
+  const bool activePumpValid =
+      (report.pumpMask == 0 && report.activePump == 0) ||
+      (report.pumpMask == 1 && report.activePump == PUMP1_ID) ||
+      (report.pumpMask == 2 && report.activePump == PUMP2_ID);
+  if (report.bootId == 0 || report.midWet > 1 || report.fullWet > 1 ||
+      !pumpMaskValid || !activePumpValid || report.fault > FAULT_INVALID_COMMAND ||
+      report.currentChannel < 1 || report.currentChannel > 13 ||
+      (report.pumpMask == 0 && report.activeCommandId != 0) ||
+      (report.pumpMask != 0 && report.activeCommandId == 0)) {
+    Serial.println("ESP-NOW RAIN packet rejected: invalid field values");
+    return;
+  }
+  if (rainMacKnown && memcmp(rainMac, received.mac, sizeof(rainMac)) != 0 &&
+      rainNodeOnline) {
+    Serial.println("ESP-NOW status from unexpected RAIN peer rejected");
+    return;
+  }
+  adoptRainPeer(received.mac);
+  if (!rainMacKnown) return;
+
+  const bool rainBootChanged =
+      lastRainBootId != 0 && lastRainBootId != report.bootId;
+  if (rainBootChanged) {
+    Serial.printf("RAIN boot changed boot=%08lX; clearing old pump requests\n",
+        static_cast<unsigned long>(report.bootId));
+    for (const int pumpNum : {1, 5}) {
+      PumpRunState& run = pumpRuns[pumpNum - 1];
+      if (!run.active) {
+        setPump(pumpNum, false);
+      } else if (run.awaitingStartConfirmation) {
+        rejectUnconfirmedRemotePumpStart(pumpNum);
+      } else {
+        finishRemotePumpFault(pumpNum, "rain_node_rebooted");
+      }
+    }
+    lastRainSequenceKnown = false;
+  }
+  if (lastRainBootId == report.bootId && lastRainSequenceKnown &&
+      !sequenceIsNewer(report.header.sequence, lastRainSequence)) {
+    Serial.printf("ESP-NOW stale RAIN packet rejected seq=%u\n",
+        report.header.sequence);
     return;
   }
 
-  const unsigned long now = millis();
   const bool wasOnline = rainNodeOnline;
+  const String oldLevel = reservoirLevel;
   const bool previousMid = reservoirMidWet;
   const bool previousFull = reservoirFullWet;
-  const String previousLevel = reservoirLevel;
   const bool previousPump1Known = rainPumpStateKnown1;
   const bool previousPump2Known = rainPumpStateKnown2;
-  rainNodeOnline = true;
+  if (!wasOnline || rainBootChanged) queueFreshRainSafetyStops();
+  lastRainBootId = report.bootId;
+  lastRainSequence = report.header.sequence;
+  lastRainSequenceKnown = true;
   lastRainSeenAt = now;
-  reservoirMidWet = midValue == "1";
-  reservoirFullWet = fullValue == "1";
+  rainNodeOnline = true;
+  reservoirMidWet = report.midWet != 0;
+  reservoirFullWet = report.fullWet != 0;
   reservoirLevel = reservoirLevelFromSensors(reservoirMidWet, reservoirFullWet);
-  rainFaultCode = server.hasArg("fault") ? server.arg("fault") : "";
-  if (!wasOnline) Serial.println("RAIN node online");
-  if (previousLevel != reservoirLevel || previousMid != reservoirMidWet ||
+  rainFaultCode = rainFaultName(report.fault);
+  if (!wasOnline) {
+    Serial.printf("RAIN ESP-NOW online channel=%u\n", report.currentChannel);
+  }
+  if (lastLoggedRainChannel != report.currentChannel) {
+    lastLoggedRainChannel = report.currentChannel;
+    Serial.printf("ESP-NOW channel active=%u\n", lastLoggedRainChannel);
+  }
+  if (oldLevel != reservoirLevel || previousMid != reservoirMidWet ||
       previousFull != reservoirFullWet) {
-    Serial.printf(
-      "Reservoir level changed level=%s mid=%d full=%d\n",
-      reservoirLevel.c_str(),
-      reservoirMidWet ? 1 : 0,
-      reservoirFullWet ? 1 : 0
-    );
+    Serial.printf("Reservoir changed level=%s mid=%u full=%u\n",
+        reservoirLevel.c_str(), reservoirMidWet ? 1 : 0,
+        reservoirFullWet ? 1 : 0);
   }
-  if (rainFaultCode.length() > 0) {
-    Serial.printf("RAIN node fault=%s\n", rainFaultCode.c_str());
+  if (report.fault != FAULT_NONE) {
+    Serial.printf("RAIN fault=%s\n", rainFaultName(report.fault));
   }
-  if (rainFaultCode == "max_run" || rainFaultCode == "reservoir_low") {
-    if (p1Value == "0") finishRemotePumpFault(1, rainFaultCode);
-    if (p2Value == "0") finishRemotePumpFault(5, rainFaultCode);
+  if ((report.fault == FAULT_MAX_RUN ||
+       report.fault == FAULT_RESERVOIR_LOW) && (report.pumpMask & 1) == 0) {
+    finishRemotePumpFault(1, rainFaultName(report.fault));
   }
-  publishReportedRemotePumpState(1, p1Value == "1", previousPump1Known);
-  publishReportedRemotePumpState(5, p2Value == "1", previousPump2Known);
+  if ((report.fault == FAULT_MAX_RUN ||
+       report.fault == FAULT_RESERVOIR_LOW) && (report.pumpMask & 2) == 0) {
+    finishRemotePumpFault(5, rainFaultName(report.fault));
+  }
+  publishReportedRemotePumpState(1, (report.pumpMask & 1) != 0,
+      previousPump1Known);
+  publishReportedRemotePumpState(5, (report.pumpMask & 2) != 0,
+      previousPump2Known);
+}
 
-  const unsigned long remaining1 = pumpRuns[0].active &&
-          pumpRuns[0].hasDeadline && rainDesiredPump1On &&
-          (long)(now - pumpRuns[0].stopAt) < 0
-      ? pumpRuns[0].stopAt - now
-      : 0;
-  const unsigned long remaining2 = pumpRuns[4].active &&
-          pumpRuns[4].hasDeadline && rainDesiredPump2On &&
-          (long)(now - pumpRuns[4].stopAt) < 0
-      ? pumpRuns[4].stopAt - now
-      : 0;
-  StaticJsonDocument<512> response;
-  response["ok"] = true;
-  JsonObject pump1 = response.createNestedObject("p1");
-  pump1["on"] = rainDesiredPump1On;
-  pump1["id"] = activeCommandIds[0];
-  pump1["remainingMs"] = remaining1;
-  JsonObject pump2 = response.createNestedObject("p2");
-  pump2["on"] = rainDesiredPump2On;
-  pump2["id"] = activeCommandIds[4];
-  pump2["remainingMs"] = remaining2;
-  response["maxRunMs"] = RAIN_MAX_RUN_MS;
-  String responseJson;
-  serializeJson(response, responseJson);
-  server.send(200, "application/json", responseJson);
+void processRainAck(const ReceivedPacket& received,
+    const CommandAckPacket& ack) {
+  if (!rainMacKnown || memcmp(rainMac, received.mac, sizeof(rainMac)) != 0 ||
+      ack.rainBootId == 0 || ack.rainBootId != lastRainBootId ||
+      ack.commandId == 0 || ack.result < ACK_ACCEPTED ||
+      ack.result > ACK_DUPLICATE || ack.reason > FAULT_INVALID_COMMAND ||
+      (ack.result != ACK_REJECTED && ack.reason != FAULT_NONE) ||
+      (ack.result == ACK_REJECTED && ack.reason == FAULT_NONE)) {
+    Serial.println("ESP-NOW ACK rejected: invalid peer, session, or fields");
+    return;
+  }
+  const int index = ack.pump == PUMP1_ID ? 0 :
+      (ack.pump == PUMP2_ID ? 1 : -1);
+  if (index < 0 || ack.commandId != remotePumpCommandIds[index]) return;
+  rainAcknowledgedCommandId[index] = ack.commandId;
+  rainAcknowledgedResult[index] = ack.result;
+  Serial.printf("ESP-NOW command ACK pump=%u command=%lu result=%u reason=%s\n",
+      ack.pump, static_cast<unsigned long>(ack.commandId), ack.result,
+      rainFaultName(ack.reason));
+  if (ack.result == ACK_REJECTED) {
+    const String reason = rainFaultName(ack.reason);
+    if (reason.length() > 0) {
+      finishRemotePumpFault(index == 0 ? 1 : 5, reason);
+    }
+  } else if (ack.result == ACK_ACCEPTED || ack.result == ACK_DUPLICATE) {
+    lastRainCommandSentAt[index] = 0;
+  }
+}
+
+void processEspNowPackets() {
+  if (espNowReceiveQueue == nullptr) return;
+  const uint32_t queueDrops = espNowQueueDrops.load(std::memory_order_relaxed);
+  if (queueDrops != reportedEspNowQueueDrops) {
+    reportedEspNowQueueDrops = queueDrops;
+    Serial.printf("ESP-NOW receive queue overflow drops=%lu\n",
+        static_cast<unsigned long>(queueDrops));
+  }
+  ReceivedPacket received;
+  while (xQueueReceive(espNowReceiveQueue, &received, 0) == pdTRUE) {
+    if (received.length < sizeof(PacketHeader) + sizeof(uint16_t)) continue;
+    PacketHeader header;
+    memcpy(&header, received.bytes, sizeof(header));
+    if (header.magic != ESPNOW_MAGIC || header.version != ESPNOW_VERSION ||
+        header.sender != DEVICE_RAIN) {
+      Serial.println("ESP-NOW packet rejected: invalid header/version/sender");
+      continue;
+    }
+    if (header.type == MSG_RAIN_HELLO || header.type == MSG_RAIN_STATUS) {
+      RainStatusPacket report;
+      memcpy(&report, received.bytes, sizeof(report));
+      if (!packetValid(report, received.length, header.type, DEVICE_RAIN)) {
+        Serial.println("ESP-NOW RAIN packet rejected: size/CRC");
+        continue;
+      }
+      processRainStatus(received, report, millis());
+    } else if (header.type == MSG_COMMAND_ACK) {
+      CommandAckPacket ack;
+      memcpy(&ack, received.bytes, sizeof(ack));
+      if (!packetValid(ack, received.length, MSG_COMMAND_ACK, DEVICE_RAIN)) {
+        Serial.println("ESP-NOW ACK rejected: size/CRC");
+        continue;
+      }
+      processRainAck(received, ack);
+    } else {
+      Serial.printf("ESP-NOW unsupported RAIN packet type=%u\n", header.type);
+    }
+  }
+}
+
+bool initializeEspNow() {
+  if (espNowReady) return true;
+  if (espNowReceiveQueue == nullptr) {
+    espNowReceiveQueue = xQueueCreate(8, sizeof(ReceivedPacket));
+  }
+  if (espNowReceiveQueue == nullptr) {
+    Serial.println("ESP-NOW unavailable: receive queue is not allocated");
+    return false;
+  }
+  const esp_err_t initResult = esp_now_init();
+  if (initResult != ESP_OK) {
+    Serial.printf("ESP-NOW init failed err=%d channel=%d; retrying\n",
+        initResult, WiFi.channel());
+    return false;
+  }
+  uint8_t pmk[16];
+  derivePeerKey("HYDRODECK-RAIN-PMK-v1", pmk);
+  const esp_err_t pmkResult = esp_now_set_pmk(pmk);
+  if (pmkResult != ESP_OK ||
+      !addEspNowPeer(ESPNOW_BROADCAST_MAC, false) ||
+      esp_now_register_recv_cb(onEspNowReceive) != ESP_OK) {
+    Serial.printf("ESP-NOW setup incomplete pmkErr=%d\n", pmkResult);
+    esp_now_deinit();
+    return false;
+  }
+  espNowReady = true;
+  Serial.printf("ESP-NOW ready role=MAIN staMac=%s apMac=%s channel=%d\n",
+      WiFi.macAddress().c_str(), WiFi.softAPmacAddress().c_str(),
+      WiFi.channel());
+  return true;
+}
+
+void serviceEspNow(unsigned long now) {
+  processEspNowPackets();
+  if (!espNowReady && now - lastEspNowRetryAt >= 2000UL) {
+    lastEspNowRetryAt = now;
+    initializeEspNow();
+  }
+  if (!espNowReady) return;
+  if (now - lastBeaconSentAt >= RAIN_BEACON_INTERVAL_MS) {
+    lastBeaconSentAt = now;
+    sendMainBeacon();
+  }
+  sendRemotePumpCommand(1, now);
+  sendRemotePumpCommand(5, now);
+  if (now - lastLoggedRainChannelChangeAt >= 2000UL) {
+    lastLoggedRainChannelChangeAt = now;
+    const int channel = WiFi.channel();
+    if (channel != lastLoggedRainChannel) {
+      lastLoggedRainChannel = channel;
+      Serial.printf("MAIN ESP-NOW/AP+STA channel now=%d\n", channel);
+    }
+  }
 }
 
 void servicePumpRuns() {
@@ -1179,15 +1679,15 @@ void processIntervalSnapshotCheck(AsyncResult& result) {
   snapshotJson += "\"bed1\":{\"temp\":" + String(currentTemperature1, 1) + ",";
   snapshotJson += "\"ph\":" + String(currentPhValue1, 2) + ",";
   snapshotJson += "\"tds\":" + String(currentTdsValue1, 0) + ",";
-  snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\",";
-  snapshotJson += "\"reservoir\":\"" + reservoirLevel + "\",";
-  snapshotJson += "\"rainNodeOnline\":" + String(rainNodeOnline ? "true" : "false") + "},";
+  snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\"},";
   snapshotJson += "\"bed2\":{\"temp\":" + String(currentTemperature2, 1) + ",";
   snapshotJson += "\"ph\":" + String(currentPhValue2, 2) + ",";
   snapshotJson += "\"tds\":" + String(currentTdsValue2, 0) + ",";
-  snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\",";
-  snapshotJson += "\"reservoir\":\"" + reservoirLevel + "\",";
-  snapshotJson += "\"rainNodeOnline\":" + String(rainNodeOnline ? "true" : "false") + "}}";
+  snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\"},";
+  snapshotJson += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"mid\":" +
+      String(reservoirMidWet ? "true" : "false") + ",\"full\":" +
+      String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
+      String(rainNodeOnline ? "true" : "false") + "}}";
 
   snapshotWritePending = true;
   Database.set<object_t>(
@@ -1275,6 +1775,11 @@ void handleSettings() {
 }
 
 void handleCombinedStatus() {
+  const unsigned long now = millis();
+  const bool heartbeatKnown = lastFirebaseHeartbeatSuccessAt != 0;
+  const unsigned long heartbeatAge = heartbeatKnown
+      ? now - lastFirebaseHeartbeatSuccessAt : 0;
+  const bool heartbeatFresh = heartbeatKnown && heartbeatAge <= 10000UL;
   String json = "{";
   json += "\"reservoir\":\"" + reservoirLevel + "\",";
   json += "\"reservoirMid\":" + String(reservoirMidWet ? 1 : 0) + ",";
@@ -1298,7 +1803,10 @@ void handleCombinedStatus() {
   json += "\"waterPump2\":" + String(rainPump2On ? 1 : 0) + ",";
   json += "\"growLight\":" + String(digitalRead(growLightPin) == LIGHT_ON ? 1 : 0) + ",";
   json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-  json += "\"firebaseReady\":" + String(firebaseInitialized && app.ready() ? "true" : "false");
+  json += "\"firebaseReady\":" + String(firebaseInitialized && app.ready() ? "true" : "false") + ",";
+  json += "\"firebaseHeartbeatFresh\":" + String(heartbeatFresh ? "true" : "false") + ",";
+  json += "\"firebaseHeartbeatAgeMs\":" +
+      (heartbeatKnown ? String(heartbeatAge) : String(-1));
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -1415,6 +1923,7 @@ void processFirebaseResult(AsyncResult& firebaseResult) {
     Serial.print("Firebase error code: ");
     Serial.print(firebaseResult.error().code());
     Serial.println();
+    firebaseInitialized = false;
   }
   if (firebaseResult.isEvent()) {
     Serial.println("Firebase event received.");
@@ -1422,6 +1931,54 @@ void processFirebaseResult(AsyncResult& firebaseResult) {
   if (firebaseResult.isDebug()) {
     Serial.println("Firebase debug event received.");
   }
+}
+
+void onMainWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (wifiDiagnosticQueue == nullptr) return;
+  WifiDiagnosticEvent diagnostic = {};
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    diagnostic.kind = 1;
+    diagnostic.disconnectReason = info.wifi_sta_disconnected.reason;
+  } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+    diagnostic.kind = 2;
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    diagnostic.kind = 3;
+  } else {
+    return;
+  }
+  xQueueSend(wifiDiagnosticQueue, &diagnostic, 0);
+}
+
+void processMainWifiDiagnostics() {
+  if (wifiDiagnosticQueue == nullptr) return;
+  WifiDiagnosticEvent diagnostic;
+  while (xQueueReceive(wifiDiagnosticQueue, &diagnostic, 0) == pdTRUE) {
+    if (diagnostic.kind == 1) {
+      const wifi_err_reason_t reason =
+          static_cast<wifi_err_reason_t>(diagnostic.disconnectReason);
+      Serial.printf("MAIN Wi-Fi disconnected reason=%u (%s) channel=%d\n",
+          diagnostic.disconnectReason,
+          WiFi.disconnectReasonName(reason), WiFi.channel());
+      firebaseInitialized = false;
+    } else if (diagnostic.kind == 2) {
+      Serial.printf("MAIN Wi-Fi associated channel=%d\n", WiFi.channel());
+    } else if (diagnostic.kind == 3) {
+      Serial.printf("MAIN Wi-Fi got IP channel=%d RSSI=%d\n",
+          WiFi.channel(), WiFi.RSSI());
+    }
+  }
+}
+
+void processFirebaseHeartbeatResult(AsyncResult& result) {
+  firebaseHeartbeatPending = false;
+  if (result.isError()) {
+    Serial.printf("Firebase heartbeat failed code=%d\n", result.error().code());
+  } else {
+    lastFirebaseHeartbeatSuccessAt = millis();
+    Serial.printf("Firebase heartbeat succeeded uptimeMs=%lu\n",
+        lastFirebaseHeartbeatSuccessAt);
+  }
+  result.clear();
 }
 
 void configureSafeOutput(int pin, int safeState) {
@@ -1432,6 +1989,10 @@ void configureSafeOutput(int pin, int safeState) {
 
 void initializeFirebase() {
   if (firebaseInitialized || WiFi.status() != WL_CONNECTED) return;
+  const unsigned long now = millis();
+  if (lastFirebaseInitAttemptAt != 0 &&
+      now - lastFirebaseInitAttemptAt < firebaseInitRetryInterval) return;
+  lastFirebaseInitAttemptAt = now;
   ssl_client.useBuiltinCACertBundle();
   ssl_client.setConnectionTimeout(1000);
   ssl_client.setHandshakeTimeout(5);
@@ -1443,11 +2004,40 @@ void initializeFirebase() {
   app.getApp<RealtimeDatabase>(Database);
   Database.url(DATABASE_URL);
   firebaseInitialized = true;
-  Serial.println("Firebase authentication starting...");
+  Serial.printf("Firebase initialization started channel=%d RSSI=%d\n",
+      WiFi.channel(), WiFi.RSSI());
+}
+
+void serviceConnectionDiagnostics(unsigned long now) {
+  const bool firebaseReady = firebaseInitialized && app.ready();
+  if (firebaseReady != lastLoggedFirebaseReady) {
+    lastLoggedFirebaseReady = firebaseReady;
+    Serial.printf("Firebase readiness changed ready=%u wifi=%u\n",
+        firebaseReady ? 1 : 0, WiFi.status() == WL_CONNECTED ? 1 : 0);
+  }
+  if (now - lastConnectionDiagnosticAt < connectionDiagnosticInterval) return;
+  lastConnectionDiagnosticAt = now;
+  const unsigned long heartbeatAge = lastFirebaseHeartbeatSuccessAt == 0
+      ? 0 : now - lastFirebaseHeartbeatSuccessAt;
+  Serial.printf(
+      "MAIN diagnostics wifi=%s channel=%d RSSI=%d firebase=%s heartbeatAgeMs=%lu RAIN=%s RAINChannel=%d\n",
+      WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
+      WiFi.channel(),
+      WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
+      firebaseReady ? "ready" : "not_ready",
+      heartbeatAge,
+      rainNodeOnline ? "online" : "offline",
+      lastLoggedRainChannel);
 }
 
 void setup() {
   Serial.begin(115200);
+  wifiDiagnosticQueue = xQueueCreate(8, sizeof(WifiDiagnosticEvent));
+  if (wifiDiagnosticQueue == nullptr) {
+    Serial.println("Wi-Fi diagnostic event queue allocation failed");
+  } else {
+    WiFi.onEvent(onMainWifiEvent);
+  }
 
   // Initialize Actuators (Default OFF)
   configureSafeOutput(phUp1Pin, PUMP_OFF);
@@ -1505,6 +2095,17 @@ void setup() {
   savedPassword.toCharArray(password, sizeof(password));
   maintainProvisioningHotspot();
 
+  mainBootId = esp_random();
+  if (mainBootId == 0) mainBootId = 1;
+  remoteCommandCounter = esp_random();
+  remotePumpCommandIds[0] = ++remoteCommandCounter;
+  remotePumpCommandIds[1] = ++remoteCommandCounter;
+  espNowReceiveQueue = xQueueCreate(8, sizeof(ReceivedPacket));
+  if (espNowReceiveQueue == nullptr) {
+    Serial.println("ESP-NOW queue allocation failed; RAIN node unavailable");
+  }
+  initializeEspNow();
+
   WiFi.begin(ssid, password);
   wifiConnectInProgress = true;
   wifiConnectStarted = millis();
@@ -1514,7 +2115,6 @@ void setup() {
   server.on("/provision", HTTP_GET, handleProvision);
   server.on("/settings", HTTP_GET, handleSettings);
   server.on("/status", HTTP_GET, handleCombinedStatus);
-  server.on("/rain/sync", HTTP_GET, handleRainSync);
   server.on("/control", HTTP_GET, handleControl); // Control via URL e.g. /control?actuator=phUp1&state=1 OR /control?command=PH_ADJUST:1:UP
   server.begin();
 }
@@ -1523,10 +2123,13 @@ void loop() {
   app.loop();
   server.handleClient();
   unsigned long now = millis();
+  processMainWifiDiagnostics();
+  serviceConnectionDiagnostics(now);
   serviceRainNodeHealth(now);
   serviceRemotePumpFeedback(now);
 
   maintainProvisioningHotspot();
+  serviceEspNow(now);
   if (WiFi.status() == WL_CONNECTED && !mdnsStarted) {
     mdnsStarted = MDNS.begin("hydrodeck");
     if (mdnsStarted) Serial.println("mDNS: hydrodeck.local");
@@ -1588,15 +2191,25 @@ void loop() {
     }
     requestIntervalSnapshot();
 
-    if (firebaseInitialized && app.ready() &&
+    if (firebaseInitialized && app.ready() && !firebaseHeartbeatPending &&
         now - lastFirebaseHeartbeat >= firebaseHeartbeatInterval) {
       lastFirebaseHeartbeat = now;
+      firebaseHeartbeatStartedAt = now;
+      firebaseHeartbeatPending = true;
       Database.set<object_t>(
         aClient,
         "/hydrodeck/lastSeen",
-        object_t("{\".sv\":\"timestamp\"}")
+        object_t("{\".sv\":\"timestamp\"}"),
+        processFirebaseHeartbeatResult,
+        "deviceHeartbeat"
       );
     }
+  }
+
+  if (firebaseHeartbeatPending &&
+      now - firebaseHeartbeatStartedAt >= firebaseHeartbeatInterval * 3UL) {
+    firebaseHeartbeatPending = false;
+    Serial.println("Firebase heartbeat callback timed out; retrying");
   }
 
   // Sampling TDS Sensor 1 & Sensor 2
@@ -1749,8 +2362,12 @@ void loop() {
       String(reservoirMidWet ? "true" : "false") + ",\"full\":" +
       String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
       String(rainNodeOnline ? "true" : "false") + "},";
-    liveTelemetryJson += "\"wifiConnected\":true,";
-    liveTelemetryJson += "\"firebaseReady\":true";
+    liveTelemetryJson += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+    liveTelemetryJson += "\"firebaseReady\":" + String(firebaseInitialized && app.ready() ? "true" : "false") + ",";
+    const bool firebaseHeartbeatFresh = lastFirebaseHeartbeatSuccessAt != 0 &&
+      now - lastFirebaseHeartbeatSuccessAt <= 10000UL;
+    liveTelemetryJson += "\"firebaseHeartbeatFresh\":" +
+      String(firebaseHeartbeatFresh ? "true" : "false");
     liveTelemetryJson += "}";
     Database.update<object_t>(aClient, "/hydrodeck", object_t(liveTelemetryJson.c_str()));
 

@@ -95,7 +95,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 9,
+      version: 10,
       onCreate: _createDB,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -145,6 +145,14 @@ class DatabaseHelper {
         }
         if (oldVersion < 9) {
           await _migrateScheduledHistoryIdentities(db);
+        }
+        if (oldVersion < 10) {
+          await db.execute(
+            'ALTER TABLE historical_logs ADD COLUMN reservoir TEXT',
+          );
+          await db.execute(
+            'ALTER TABLE historical_logs ADD COLUMN rainNodeOnline INTEGER',
+          );
         }
       },
     );
@@ -223,7 +231,9 @@ class DatabaseHelper {
         intervalKey TEXT,
         recordType TEXT NOT NULL DEFAULT 'scheduled',
         recordId TEXT NOT NULL,
-        source TEXT NOT NULL DEFAULT 'app'
+        source TEXT NOT NULL DEFAULT 'app',
+        reservoir TEXT,
+        rainNodeOnline INTEGER
       )
     ''');
     await db.execute(
@@ -328,6 +338,8 @@ class DatabaseHelper {
       'recordType': log.recordType,
       'recordId': log.identity,
       'source': log.source,
+      'reservoir': log.reservoir.level,
+      'rainNodeOnline': log.reservoir.online ? 1 : 0,
     };
   }
 
@@ -390,20 +402,30 @@ class DatabaseHelper {
     return false;
   }
 
-  HistoricalData _logFromRow(Map<String, Object?> row) => HistoricalData(
-    timestamp: DateTime.parse(row['timestamp'] as String),
-    pH: (row['pH'] as num).toDouble(),
-    temperature: row['temperature'] as String,
-    waterLevel: row['waterLevel'] as String,
-    tds: (row['tds'] as num?)?.toDouble() ?? 0.0,
-    batchNumber: row['batchNumber'] as int?,
-    bed1: _decodeBedData(row['bed1'] as String?),
-    bed2: _decodeBedData(row['bed2'] as String?),
-    intervalKey: row['intervalKey'] as String?,
-    recordType: (row['recordType'] as String?) ?? scheduledSnapshotRecordType,
-    recordId: row['recordId'] as String?,
-    source: (row['source'] as String?) ?? 'app',
-  );
+  HistoricalData _logFromRow(Map<String, Object?> row) {
+    final bed1 = _decodeBedData(row['bed1'] as String?);
+    final bed2 = _decodeBedData(row['bed2'] as String?);
+    return HistoricalData(
+      timestamp: DateTime.parse(row['timestamp'] as String),
+      pH: (row['pH'] as num).toDouble(),
+      temperature: row['temperature'] as String,
+      waterLevel: row['waterLevel'] as String,
+      tds: (row['tds'] as num?)?.toDouble() ?? 0.0,
+      batchNumber: row['batchNumber'] as int?,
+      bed1: bed1,
+      bed2: bed2,
+      reservoir: ReservoirReading.fromSources(
+        shared: row['reservoir'],
+        online: row['rainNodeOnline'],
+        bed1: row['bed1'] as String?,
+        bed2: row['bed2'] as String?,
+      ),
+      intervalKey: row['intervalKey'] as String?,
+      recordType: (row['recordType'] as String?) ?? scheduledSnapshotRecordType,
+      recordId: row['recordId'] as String?,
+      source: (row['source'] as String?) ?? 'app',
+    );
+  }
 
   Future<HistoricalData?> getNextUnsyncedLog() async {
     final db = await instance.database;
@@ -694,21 +716,77 @@ class NotificationHelper {
   }
 }
 
+class ReservoirReading {
+  final String level;
+  final bool online;
+
+  const ReservoirReading({this.level = 'unknown', this.online = false});
+
+  static const unknown = ReservoirReading();
+
+  Map<String, dynamic> toMap() => {'level': level, 'online': online};
+
+  static ReservoirReading fromSources({
+    dynamic shared,
+    dynamic online,
+    dynamic bed1,
+    dynamic bed2,
+  }) {
+    Map<String, dynamic>? asMap(dynamic value) {
+      if (value is Map) return Map<String, dynamic>.from(value);
+      if (value is String && value.trim().isNotEmpty) {
+        try {
+          final decoded = jsonDecode(value);
+          if (decoded is Map) return Map<String, dynamic>.from(decoded);
+        } catch (_) {}
+      }
+      return null;
+    }
+
+    bool? asBool(dynamic value) {
+      if (value is bool) return value;
+      if (value is num) return value != 0;
+      if (value is String) {
+        final normalized = value.toLowerCase();
+        if (normalized == 'true' || normalized == 'on' || normalized == '1') {
+          return true;
+        }
+        if (normalized == 'false' || normalized == 'off' || normalized == '0') {
+          return false;
+        }
+      }
+      return null;
+    }
+
+    final sharedMap = asMap(shared);
+    final legacyBed1 = asMap(bed1);
+    final legacyBed2 = asMap(bed2);
+    final sharedLevel =
+        sharedMap?['level'] ?? (shared is String ? shared : null);
+    final legacyLevel = legacyBed1?['reservoir'] ?? legacyBed2?['reservoir'];
+    final sharedOnline = asBool(sharedMap?['online'] ?? online);
+    final legacyOnline = asBool(
+      legacyBed1?['rainNodeOnline'] ?? legacyBed2?['rainNodeOnline'],
+    );
+
+    return ReservoirReading(
+      level: (sharedLevel ?? legacyLevel ?? 'unknown').toString(),
+      online: sharedOnline ?? legacyOnline ?? false,
+    );
+  }
+}
+
 class GrowBedReading {
   final double temperature;
   final double ph;
   final double tds;
   final bool waterFull;
-  final String reservoir;
-  final bool rainNodeOnline;
 
   const GrowBedReading({
     required this.temperature,
     required this.ph,
     required this.tds,
     required this.waterFull,
-    this.reservoir = 'unknown',
-    this.rainNodeOnline = false,
   });
 
   factory GrowBedReading.empty() => const GrowBedReading(
@@ -735,22 +813,11 @@ class GrowBedReading {
       String s => s.toLowerCase() == 'full' || s == '1' || s == 'on',
       _ => false,
     };
-    final onlineValue = map['rainNodeOnline'];
-    final rainNodeOnline = switch (onlineValue) {
-      bool b => b,
-      num n => n != 0,
-      String s =>
-        s.toLowerCase() == 'true' || s == '1' || s.toLowerCase() == 'on',
-      _ => false,
-    };
-
     return GrowBedReading(
       temperature: temperature,
       ph: ph,
       tds: tds,
       waterFull: waterFull,
-      reservoir: (map['reservoir'] ?? 'unknown').toString(),
-      rainNodeOnline: rainNodeOnline,
     );
   }
 
@@ -759,8 +826,6 @@ class GrowBedReading {
     'ph': ph,
     'tds': tds,
     'water': waterFull ? 'full' : 'low',
-    'reservoir': reservoir,
-    'rainNodeOnline': rainNodeOnline,
   };
 }
 
@@ -771,6 +836,13 @@ String reservoirLabel(String level) => switch (level) {
   _ => 'Unknown',
 };
 
+String reservoirStatusLabel(ReservoirReading reservoir) =>
+    reservoir.level == 'unknown'
+    ? 'Unknown'
+    : reservoir.online
+    ? 'RAIN NODE ONLINE'
+    : 'RAIN NODE OFFLINE';
+
 Color reservoirColor(String level) => switch (level) {
   'full' || 'above_50' => const Color(0xFF2E7D32),
   '50_or_below' => Colors.orange,
@@ -780,12 +852,20 @@ Color reservoirColor(String level) => switch (level) {
 class HydrodeckTelemetry {
   final GrowBedReading bed1;
   final GrowBedReading bed2;
+  final ReservoirReading reservoir;
+  final bool? wifiConnected;
+  final bool? firebaseReady;
+  final bool? firebaseHeartbeatFresh;
   final bool growLightOn;
   final Map<String, bool> actuatorStates;
 
   const HydrodeckTelemetry({
     required this.bed1,
     required this.bed2,
+    this.reservoir = ReservoirReading.unknown,
+    this.wifiConnected,
+    this.firebaseReady,
+    this.firebaseHeartbeatFresh,
     required this.growLightOn,
     required this.actuatorStates,
   });
@@ -837,19 +917,11 @@ class HydrodeckTelemetry {
 
   factory HydrodeckTelemetry.fromJson(Map<String, dynamic> json) {
     final wireMap = Map<String, dynamic>.from(json);
-    final reservoirMap = wireMap['reservoir'] is Map
-        ? Map<String, dynamic>.from(wireMap['reservoir'] as Map)
-        : <String, dynamic>{};
-    final reservoir =
-        (reservoirMap['level'] ??
-                (wireMap['reservoir'] is String
-                    ? wireMap['reservoir']
-                    : null) ??
-                'unknown')
-            .toString();
-    final rainNodeOnline = _readBoolLike(
-      {'online': reservoirMap['online'] ?? wireMap['rainNodeOnline']},
-      const ['online'],
+    final reservoir = ReservoirReading.fromSources(
+      shared: wireMap['reservoir'],
+      online: wireMap['rainNodeOnline'],
+      bed1: wireMap['bed1'],
+      bed2: wireMap['bed2'],
     );
 
     final bed1Map = {
@@ -873,8 +945,6 @@ class HydrodeckTelemetry {
           wireMap['bed1']?['water'] ??
           wireMap['set1']?['water'] ??
           'low',
-      'reservoir': wireMap['bed1']?['reservoir'] ?? reservoir,
-      'rainNodeOnline': wireMap['bed1']?['rainNodeOnline'] ?? rainNodeOnline,
     };
 
     final bed2Map = {
@@ -898,8 +968,6 @@ class HydrodeckTelemetry {
           wireMap['bed2']?['water'] ??
           wireMap['set2']?['water'] ??
           'low',
-      'reservoir': wireMap['bed2']?['reservoir'] ?? reservoir,
-      'rainNodeOnline': wireMap['bed2']?['rainNodeOnline'] ?? rainNodeOnline,
     };
 
     final bed1 = GrowBedReading(
@@ -907,8 +975,6 @@ class HydrodeckTelemetry {
       ph: _readDouble(bed1Map, 'ph', fallback: 6.0),
       tds: _readDouble(bed1Map, 'tds', fallback: 0.0),
       waterFull: _readWaterFlag(bed1Map, 'water'),
-      reservoir: bed1Map['reservoir'].toString(),
-      rainNodeOnline: _readBoolLike(bed1Map, const ['rainNodeOnline']),
     );
 
     final bed2 = GrowBedReading(
@@ -916,8 +982,6 @@ class HydrodeckTelemetry {
       ph: _readDouble(bed2Map, 'ph', fallback: 6.0),
       tds: _readDouble(bed2Map, 'tds', fallback: 0.0),
       waterFull: _readWaterFlag(bed2Map, 'water'),
-      reservoir: bed2Map['reservoir'].toString(),
-      rainNodeOnline: _readBoolLike(bed2Map, const ['rainNodeOnline']),
     );
 
     final actuatorMap = Map<String, dynamic>.from(
@@ -940,6 +1004,16 @@ class HydrodeckTelemetry {
     return HydrodeckTelemetry(
       bed1: bed1,
       bed2: bed2,
+      reservoir: reservoir,
+      wifiConnected: wireMap['wifiConnected'] is bool
+          ? wireMap['wifiConnected'] as bool
+          : null,
+      firebaseReady: wireMap['firebaseReady'] is bool
+          ? wireMap['firebaseReady'] as bool
+          : null,
+      firebaseHeartbeatFresh: wireMap['firebaseHeartbeatFresh'] is bool
+          ? wireMap['firebaseHeartbeatFresh'] as bool
+          : null,
       growLightOn: growLightOn,
       actuatorStates: actuatorStates,
     );
@@ -1013,6 +1087,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   bool lastGrowLight = false;
   GrowBedReading lastBed1 = GrowBedReading.empty();
   GrowBedReading lastBed2 = GrowBedReading.empty();
+  ReservoirReading lastReservoir = ReservoirReading.unknown;
 
   bool isAppClosed = false;
   bool isPlantingActive = false;
@@ -1044,6 +1119,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     final logs = await DatabaseHelper.instance.getLogs();
     if (logs.isNotEmpty) {
       lastPh = logs.first.pH;
+      lastReservoir = logs.first.reservoir;
       lastBed2 = GrowBedReading(
         temperature:
             double.tryParse(
@@ -1144,33 +1220,25 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   }
 
   Map<String, dynamic> normalizeStatusPayload(Map<String, dynamic> data) {
-    final reservoirData = data['reservoir'] is Map
-        ? Map<String, dynamic>.from(data['reservoir'] as Map)
-        : <String, dynamic>{};
-    final reservoirLevel =
-        (reservoirData['level'] ??
-                (data['reservoir'] is String ? data['reservoir'] : null) ??
-                'unknown')
-            .toString();
-    final rainNodeOnline = HydrodeckTelemetry._readBoolLike(
-      {'online': reservoirData['online'] ?? data['rainNodeOnline']},
-      const ['online'],
+    final reservoir = ReservoirReading.fromSources(
+      shared: data['reservoir'],
+      online: data['rainNodeOnline'],
+      bed1: data['bed1'],
+      bed2: data['bed2'],
     );
+    final reservoirLevel = reservoir.level;
+    final rainNodeOnline = reservoir.online;
     final bed1 = {
       'temp': data['temp1'] ?? data['bed1']?['temp'] ?? 25.0,
       'ph': data['ph1'] ?? data['bed1']?['ph'] ?? 6.0,
       'tds': data['tds1'] ?? data['bed1']?['tds'] ?? 0.0,
       'water': data['water1'] ?? data['bed1']?['water'] ?? 'low',
-      'reservoir': data['bed1']?['reservoir'] ?? reservoirLevel,
-      'rainNodeOnline': data['bed1']?['rainNodeOnline'] ?? rainNodeOnline,
     };
     final bed2 = {
       'temp': data['temp2'] ?? data['bed2']?['temp'] ?? 25.0,
       'ph': data['ph2'] ?? data['bed2']?['ph'] ?? 6.0,
       'tds': data['tds2'] ?? data['bed2']?['tds'] ?? 0.0,
       'water': data['water2'] ?? data['bed2']?['water'] ?? 'low',
-      'reservoir': data['bed2']?['reservoir'] ?? reservoirLevel,
-      'rainNodeOnline': data['bed2']?['rainNodeOnline'] ?? rainNodeOnline,
     };
 
     final bed2Ph = bed2['ph'] is num ? (bed2['ph'] as num).toDouble() : 6.0;
@@ -1191,8 +1259,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     return {
       'bed1': bed1,
       'bed2': bed2,
-      'reservoir': reservoirLevel,
-      'rainNodeOnline': rainNodeOnline,
+      'reservoir': {'level': reservoirLevel, 'online': rainNodeOnline},
       'growLight': growLightFlag,
       'actuators': {
         for (final name in const [
@@ -1242,6 +1309,9 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
       lastBed1 = bed1;
       lastBed2 = bed2;
+      lastReservoir = ReservoirReading.fromSources(
+        shared: normalized['reservoir'],
+      );
       lastGrowLight = HydrodeckTelemetry._readBoolLike(
         {'growLight': normalized['growLight']},
         const ['growLight'],
@@ -1260,7 +1330,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         'tds': lastTds,
         'bed1': bed1.toMap(),
         'bed2': bed2.toMap(),
-        'reservoir': {'level': bed1.reservoir, 'online': bed1.rainNodeOnline},
+        'reservoir': lastReservoir.toMap(),
         'growLight': normalized['growLight'] ?? false,
         'actuators': normalized['actuators'],
         'source': 'local',
@@ -1303,6 +1373,9 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
           lastBed1 = bed1;
           lastBed2 = bed2;
+          lastReservoir = ReservoirReading.fromSources(
+            shared: normalized['reservoir'],
+          );
           lastGrowLight = HydrodeckTelemetry._readBoolLike(
             {'growLight': normalized['growLight']},
             const ['growLight'],
@@ -1321,10 +1394,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
             'tds': lastTds,
             'bed1': bed1.toMap(),
             'bed2': bed2.toMap(),
-            'reservoir': {
-              'level': bed1.reservoir,
-              'online': bed1.rainNodeOnline,
-            },
+            'reservoir': lastReservoir.toMap(),
             'growLight': normalized['growLight'] ?? false,
             'actuators': normalized['actuators'],
             'source': 'local',
@@ -1358,6 +1428,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
           final telemetry = HydrodeckTelemetry.fromJson(data);
           lastBed1 = telemetry.bed1;
           lastBed2 = telemetry.bed2;
+          lastReservoir = telemetry.reservoir;
           lastGrowLight = telemetry.growLightOn;
           lastPh = lastBed2.ph;
           lastTemp = '${lastBed2.temperature.toStringAsFixed(1)}°C';
@@ -1391,7 +1462,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
     final monitoringTime = DateTime.now();
     if (found &&
-      lastBed1.reservoir == '50_or_below' &&
+        lastReservoir.level == '50_or_below' &&
         previousReservoirLevel != '50_or_below' &&
         (lastReservoirAlertAt == null ||
             monitoringTime.difference(lastReservoirAlertAt!).inHours >= 1)) {
@@ -1403,9 +1474,9 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       );
       lastReservoirAlertAt = monitoringTime;
     }
-    previousReservoirLevel = lastBed1.reservoir;
+    previousReservoirLevel = lastReservoir.level;
 
-    if (lastBed1.rainNodeOnline) {
+    if (lastReservoir.online) {
       rainNodeOfflineSince = null;
       rainNodeOfflineAlertSent = false;
     } else if (found) {
@@ -1462,10 +1533,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       'tds': lastTds,
       'bed1': lastBed1.toMap(),
       'bed2': lastBed2.toMap(),
-      'reservoir': {
-        'level': lastBed1.reservoir,
-        'online': lastBed1.rainNodeOnline,
-      },
+      'reservoir': lastReservoir.toMap(),
       'growLight': lastGrowLight,
     });
 
@@ -1509,6 +1577,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         'waterLevel': snapshot.waterLevel,
         'tds': snapshot.tds,
         'batchNumber': snapshot.batchNumber,
+        'reservoir': snapshot.reservoir.toMap(),
         'bed1': snapshot.bed1?.toMap(),
         'bed2': snapshot.bed2?.toMap(),
         'intervalKey': snapshot.intervalKey,
@@ -2929,6 +2998,7 @@ class HistoricalData {
   final int? batchNumber;
   final GrowBedReading? bed1;
   final GrowBedReading? bed2;
+  final ReservoirReading reservoir;
   final String? intervalKey;
   final String recordType;
   final String? recordId;
@@ -2943,6 +3013,7 @@ class HistoricalData {
     this.batchNumber,
     this.bed1,
     this.bed2,
+    this.reservoir = ReservoirReading.unknown,
     this.intervalKey,
     this.recordType = scheduledSnapshotRecordType,
     this.recordId,
@@ -2977,6 +3048,7 @@ class HistoricalData {
     'tds': tds,
     'bed1': bed1?.toMap(),
     'bed2': bed2?.toMap(),
+    'reservoir': reservoir.toMap(),
   };
 }
 
@@ -3164,6 +3236,11 @@ Future<CloudHistory> downloadCloudHistory() async {
               batchNumber: batch,
               bed1: _decodeBedData(map['bed1']),
               bed2: _decodeBedData(map['bed2']),
+              reservoir: ReservoirReading.fromSources(
+                shared: map['reservoir'],
+                bed1: map['bed1'],
+                bed2: map['bed2'],
+              ),
               intervalKey: intervalKey,
               recordType:
                   map['recordType']?.toString() ?? scheduledSnapshotRecordType,
@@ -3240,6 +3317,11 @@ Future<CloudHistory> downloadCloudHistory() async {
                 batchNumber: logBatch,
                 bed1: _decodeBedData(map['bed1']),
                 bed2: _decodeBedData(map['bed2']),
+                reservoir: ReservoirReading.fromSources(
+                  shared: map['reservoir'],
+                  bed1: map['bed1'],
+                  bed2: map['bed2'],
+                ),
               ),
             );
           }
@@ -3268,6 +3350,7 @@ HistoricalData buildScheduledSnapshot({
   required DateTime at,
   required GrowBedReading bed1,
   required GrowBedReading bed2,
+  ReservoirReading reservoir = ReservoirReading.unknown,
   String source = 'app',
 }) {
   final intervalKey = manilaIntervalKey(at);
@@ -3281,6 +3364,7 @@ HistoricalData buildScheduledSnapshot({
     batchNumber: batchNumber,
     bed1: bed1,
     bed2: bed2,
+    reservoir: reservoir,
     intervalKey: intervalKey,
     recordType: scheduledSnapshotRecordType,
     recordId: scheduledSnapshotRecordId(
@@ -3380,6 +3464,11 @@ Future<HistoricalData?> _readAuthoritativeEsp32Snapshot(
       at: utcFromManilaIntervalKey(intervalKey) ?? DateTime.now().toUtc(),
       bed1: bed1,
       bed2: bed2,
+      reservoir: ReservoirReading.fromSources(
+        shared: map['reservoir'],
+        bed1: map['bed1'],
+        bed2: map['bed2'],
+      ),
       source: 'esp32',
     );
   } catch (_) {
@@ -4723,9 +4812,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   String _connectionStatus = "Fetching...";
   bool _firebaseConnected = false;
+  bool? _mainWifiConnected;
+  bool? _mainFirebaseReady;
+  bool? _mainFirebaseHeartbeatFresh;
 
   GrowBedReading _bed1 = GrowBedReading.empty();
   GrowBedReading _bed2 = GrowBedReading.empty();
+  ReservoirReading _reservoir = ReservoirReading.unknown;
   final Map<String, bool> _controlStates = {
     'bed1_water': false,
     'bed1_ph_up': false,
@@ -4903,6 +4996,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
           if (!mounted) return;
           setState(() {
+            _reservoir = telemetry.reservoir;
+            _mainWifiConnected = telemetry.wifiConnected;
+            _mainFirebaseReady = telemetry.firebaseReady;
+            _mainFirebaseHeartbeatFresh = heartbeatFresh;
             if (heartbeatFresh) {
               _lastFirebaseTelemetryAt = DateTime.now();
             }
@@ -5322,6 +5419,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         setState(() {
           _bed1 = result.value.bed1;
           _bed2 = result.value.bed2;
+          _reservoir = result.value.reservoir;
+          _mainWifiConnected = result.value.wifiConnected;
+          _mainFirebaseReady = result.value.firebaseReady;
+          _mainFirebaseHeartbeatFresh = result.value.firebaseHeartbeatFresh;
           _applyGrowLightTelemetry(result.value.growLightOn);
           _updateActuatorStates(result.value.actuatorStates);
           _esp32Ip = result.key;
@@ -5339,6 +5440,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         } catch (_) {}
         var firebaseReachable = false;
         var freshDeviceHeartbeat = false;
+        var statusData = <String, dynamic>{};
         try {
           final database = FirebaseDatabase.instanceFor(
             app: Firebase.app(),
@@ -5351,10 +5453,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               .timeout(const Duration(seconds: 2));
           firebaseReachable = connection.value == true;
           final snapshot = await database
-              .ref('hydrodeck/lastSeen')
+              .ref('hydrodeck')
               .get()
               .timeout(const Duration(seconds: 2));
-          final heartbeatMillis = _parseHeartbeatMillis(snapshot.value);
+          statusData = snapshot.value is Map
+              ? Map<String, dynamic>.from(snapshot.value as Map)
+              : <String, dynamic>{};
+          final heartbeatMillis = _parseHeartbeatMillis(statusData['lastSeen']);
           freshDeviceHeartbeat =
               heartbeatMillis != null &&
               DateTime.now()
@@ -5372,6 +5477,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           setState(() {
             _firebaseConnected = firebaseReachable;
             _lastLocalTelemetryAt = null;
+            _mainWifiConnected = statusData['wifiConnected'] is bool
+                ? statusData['wifiConnected'] as bool
+                : null;
+            _mainFirebaseReady = statusData['firebaseReady'] is bool
+                ? statusData['firebaseReady'] as bool
+                : null;
+            _mainFirebaseHeartbeatFresh = freshDeviceHeartbeat;
             if (!freshDeviceHeartbeat &&
                 (_lastFirebaseTelemetryAt == null ||
                     DateTime.now()
@@ -5399,18 +5511,25 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   void _updateConnectionStatus() {
+    // Local HTTP freshness means this app can reach MAIN directly.
+    // Firebase connection and MAIN's fresh Firebase heartbeat are separate.
+    // RAIN freshness is reported by MAIN's ESP-NOW heartbeat, not Firebase.
     final localTelemetryFresh =
         _lastLocalTelemetryAt != null &&
         DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <= 10;
 
     if (localTelemetryFresh) {
-      _connectionStatus = 'Connected locally';
+      _connectionStatus = _firebaseConnected
+          ? 'Connected locally'
+          : 'Connected locally · Firebase unavailable';
     } else if (_hasFreshFirebaseTelemetry) {
-      _connectionStatus = 'Connected';
+      _connectionStatus = _firebaseConnected
+          ? 'Connected'
+          : 'Firebase heartbeat recently received';
     } else if (_firebaseConnected) {
-      _connectionStatus = 'ESP32 Offline';
+      _connectionStatus = 'MAIN offline (Firebase connected)';
     } else {
-      _connectionStatus = 'ESP32 Offline';
+      _connectionStatus = 'MAIN unreachable; Firebase unavailable';
     }
   }
 
@@ -5430,6 +5549,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     if (mounted) {
       setState(() {
         _historyLogs = storedLogs;
+        if (storedLogs.isNotEmpty) {
+          _reservoir = storedLogs.first.reservoir;
+        }
         if (!_hasSharedPhThresholds) {
           _minPhThreshold = config['minPh'] ?? 5.5;
           _maxPhThreshold = config['maxPh'] ?? 7.0;
@@ -5545,6 +5667,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                       (map['batchNumber'] as num?)?.toInt() ?? batchNumber,
                   bed1: _decodeBedData(map['bed1']),
                   bed2: _decodeBedData(map['bed2']),
+                  reservoir: ReservoirReading.fromSources(
+                    shared: map['reservoir'],
+                    bed1: map['bed1'],
+                    bed2: map['bed2'],
+                  ),
                   intervalKey: intervalKey,
                   recordType:
                       map['recordType']?.toString() ??
@@ -5590,12 +5717,17 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               if (event['isConnected'] == true) {
                 _lastFirebaseTelemetryAt = DateTime.now();
               }
-              _firebaseConnected = true;
+              _firebaseConnected = event['firebaseConnected'] == true;
             }
             _updateConnectionStatus();
             if (event['bed1'] != null) {
               _bed1 = GrowBedReading.fromMap(
                 Map<String, dynamic>.from(event['bed1'] as Map),
+              );
+            }
+            if (event['reservoir'] is Map) {
+              _reservoir = ReservoirReading.fromSources(
+                shared: event['reservoir'],
               );
             }
             if (event['bed2'] != null) {
@@ -5671,6 +5803,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             tds: (event['tds'] as num?)?.toDouble() ?? 0.0,
             bed1: _decodeBedData(event['bed1']),
             bed2: _decodeBedData(event['bed2']),
+            reservoir: ReservoirReading.fromSources(
+              shared: event['reservoir'],
+              bed1: event['bed1'],
+              bed2: event['bed2'],
+            ),
             intervalKey: event['intervalKey']?.toString(),
             recordType:
                 event['recordType']?.toString() ?? scheduledSnapshotRecordType,
@@ -5964,8 +6101,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   Future<void> _toggleActuator(String key, String actuatorName) async {
-    if ((actuatorName == 'waterPump1' && !_bed1.rainNodeOnline) ||
-        (actuatorName == 'waterPump2' && !_bed2.rainNodeOnline)) {
+    if (actuatorName.startsWith('waterPump') && !_reservoir.online) {
       _showCommandMessage(actuatorName, 'Rainwater unit offline.');
       return;
     }
@@ -6025,7 +6161,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         _lastLocalTelemetryAt != null &&
         DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <= 10;
     final localFirst =
-        localTelemetryFresh || _connectionStatus == 'Connected locally';
+        localTelemetryFresh ||
+        _connectionStatus.startsWith('Connected locally');
     var localTried = false;
     var localFailure = 'ESP32 local HTTP was not attempted.';
     var localQueued = false;
@@ -6159,6 +6296,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         _lastLocalTelemetryAt = DateTime.now();
         _bed1 = telemetry.bed1;
         _bed2 = telemetry.bed2;
+        _reservoir = telemetry.reservoir;
         _hotspotStatus = 'Connected to ESP32 hotspot for local control.';
         _updateConnectionStatus();
       });
@@ -6531,16 +6669,29 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         _connectionStatus.startsWith('Connected') ||
         _connectionStatus == 'System Online';
     final statusColor = isOnline ? Colors.green : Colors.orange;
-    final statusText = _connectionStatus == 'Connected'
+    final baseStatusText = _connectionStatus == 'Connected'
         ? 'System Online'
         : _connectionStatus;
+    final mainTelemetryFresh =
+        (_lastLocalTelemetryAt != null &&
+            DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <=
+                10) ||
+        _hasFreshFirebaseTelemetry;
+    final localHttpFresh =
+        _lastLocalTelemetryAt != null &&
+        DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <= 10;
+    final statusText =
+        mainTelemetryFresh &&
+            _reservoir.level != 'unknown' &&
+            !_reservoir.online
+        ? '$baseStatusText · RAIN offline'
+        : baseStatusText;
     final isBed1Warning =
         _bed1.ph < _minPhThreshold || _bed1.ph > _maxPhThreshold;
     final isBed2Warning =
         _bed2.ph < _minPhThreshold || _bed2.ph > _maxPhThreshold;
     final hasPhWarning = isBed1Warning || isBed2Warning;
-    final lowReservoir =
-        _bed1.reservoir == '50_or_below' || _bed2.reservoir == '50_or_below';
+    final lowReservoir = _reservoir.level == '50_or_below';
     final currentDayCount = _getElapsedPlantingDay(
       _serverNow ?? DateTime.now(),
     );
@@ -6601,6 +6752,49 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   fontWeight: FontWeight.bold,
                   fontSize: 13,
                 ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 12,
+            runSpacing: 5,
+            children: [
+              Text(
+                'MAIN HTTP: ${localHttpFresh ? 'Reachable' : 'Unreachable'}',
+                style: const TextStyle(fontSize: 11),
+              ),
+              Text(
+                'MAIN Wi-Fi: ${_mainWifiConnected == null
+                    ? 'Unknown'
+                    : _mainWifiConnected!
+                    ? 'Connected'
+                    : 'Disconnected'}',
+                style: const TextStyle(fontSize: 11),
+              ),
+              Text(
+                'MAIN Firebase: ${_mainFirebaseReady == null
+                    ? 'Unknown'
+                    : _mainFirebaseReady!
+                    ? 'Ready'
+                    : 'Not ready'}',
+                style: const TextStyle(fontSize: 11),
+              ),
+              Text(
+                'MAIN Firebase heartbeat: ${_mainFirebaseHeartbeatFresh == null
+                    ? 'Unknown'
+                    : _mainFirebaseHeartbeatFresh!
+                    ? 'Fresh'
+                    : 'Stale'}',
+                style: const TextStyle(fontSize: 11),
+              ),
+              Text(
+                'RAIN ESP-NOW: ${!mainTelemetryFresh
+                    ? 'Unknown'
+                    : _reservoir.online
+                    ? 'Fresh'
+                    : 'Stale'}',
+                style: const TextStyle(fontSize: 11),
               ),
             ],
           ),
@@ -6777,6 +6971,20 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           ),
           const SizedBox(height: 12),
           _buildGrowBedMetrics('Grow Bed 2', _bed2),
+          const SizedBox(height: 24),
+          _buildCleanCard(
+            'RESERVOIR',
+            reservoirLabel(_reservoir.level),
+            reservoirStatusLabel(_reservoir),
+            _reservoir.online &&
+                    (_reservoir.level == 'full' ||
+                        _reservoir.level == 'above_50')
+                ? const Color(0xFFE8F7ED)
+                : const Color(0xFFFFF3E0),
+            !_reservoir.online || _reservoir.level == 'unknown'
+                ? reservoirColor('unknown')
+                : reservoirColor(_reservoir.level),
+          ),
         ],
       ),
     );
@@ -6788,19 +6996,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         data.ph >= _minPhThreshold && data.ph <= _maxPhThreshold;
     final isTdsOptimal = data.tds < 900;
     final waterLabel = data.waterFull ? 'Water full' : 'Needs water';
-    final reservoirOptimal =
-        data.reservoir == 'full' || data.reservoir == 'above_50';
-    final reservoirBadge = !data.rainNodeOnline
-        ? 'Offline'
-        : data.reservoir == '50_or_below'
-        ? 'Warning'
-        : reservoirOptimal
-        ? 'Optimal'
-        : 'Unknown';
-    final reservoirBackground = reservoirOptimal && data.rainNodeOnline
-        ? const Color(0xFFE8F7ED)
-        : const Color(0xFFFFF3E0);
-
     return Column(
       children: [
         Row(
@@ -6853,16 +7048,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               ),
             ),
           ],
-        ),
-        const SizedBox(height: 16),
-        _buildCleanCard(
-          'RESERVOIR',
-          reservoirLabel(data.reservoir),
-          reservoirBadge,
-          reservoirBackground,
-          !data.rainNodeOnline || data.reservoir == 'unknown'
-              ? reservoirColor('unknown')
-              : reservoirColor(data.reservoir),
         ),
       ],
     );
@@ -6971,9 +7156,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           ? (bedIndex == 1 ? 'nutrient1' : 'nutrient2')
           : (bedIndex == 1 ? 'waterPump1' : 'waterPump2');
       final needsWater = bedIndex == 1 ? !_bed1.waterFull : !_bed2.waterFull;
-      final rainNodeOnline = bedIndex == 1
-          ? _bed1.rainNodeOnline
-          : _bed2.rainNodeOnline;
+      final rainNodeOnline = _reservoir.online;
       final otherWaterPumpRunning =
           !nutrient && _otherWaterPumpIsRunning(actuator);
       return Column(
@@ -7068,22 +7251,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               children: [
                 Expanded(
                   child: Text(
-                    'Reservoir: ${reservoirLabel(_bed1.reservoir)}',
+                    'Reservoir: ${reservoirLabel(_reservoir.level)}',
                     style: const TextStyle(fontSize: 12, color: Colors.black54),
                   ),
                 ),
                 Text(
-                  _bed1.rainNodeOnline ? 'Online' : 'Offline',
+                  _reservoir.online ? 'Online' : 'Offline',
                   style: TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
-                    color: _bed1.rainNodeOnline ? Colors.green : Colors.orange,
+                    color: _reservoir.online ? Colors.green : Colors.orange,
                   ),
                 ),
               ],
             ),
           ),
-          if (_bed1.reservoir == '50_or_below')
+          if (_reservoir.level == '50_or_below')
             Container(
               width: double.infinity,
               margin: const EdgeInsets.only(bottom: 8),
@@ -7284,6 +7467,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                               fontSize: 13,
                               color: Colors.black87,
                             ),
+                          ),
+                          subtitle: Text(
+                            'Reservoir ${reservoirLabel(log.reservoir.level)} · ${reservoirStatusLabel(log.reservoir)}',
+                            style: const TextStyle(fontSize: 11),
                           ),
                           trailing: const Icon(
                             Icons.chevron_right,
@@ -7723,13 +7910,11 @@ class _BatchHistoryScreenState extends State<BatchHistoryScreen> {
             itemCount: logs.length,
             itemBuilder: (context, index) {
               final log = logs[index];
-              final reservoir =
-                  log.bed1?.reservoir ?? log.bed2?.reservoir ?? 'unknown';
               return Card(
                 child: ListTile(
                   title: Text(_formatDateTime(log.timestamp)),
                   subtitle: Text(
-                    'pH ${log.pH.toStringAsFixed(2)}  |  ${log.temperature}  |  ${log.waterLevel}  |  TDS ${log.tds.toStringAsFixed(1)}  |  Reservoir ${reservoirLabel(reservoir)}',
+                    'pH ${log.pH.toStringAsFixed(2)}  |  ${log.temperature}  |  ${log.waterLevel}  |  TDS ${log.tds.toStringAsFixed(1)}  |  Reservoir ${reservoirLabel(log.reservoir.level)}  |  RAIN ${log.reservoir.online ? 'online' : 'offline'}',
                   ),
                   onTap: () => Navigator.push(
                     context,
@@ -7826,6 +8011,27 @@ class SnapshotDetailScreen extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             _buildStaticGrid(bed2, bed2WaterFull, bed2PhOptimal),
+            const SizedBox(height: 24),
+            const Text(
+              'Shared Reservoir',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            _buildStaticCard(
+              'RESERVOIR',
+              reservoirLabel(data.reservoir.level),
+              reservoirStatusLabel(data.reservoir),
+              bgOverride:
+                  data.reservoir.online &&
+                      (data.reservoir.level == 'full' ||
+                          data.reservoir.level == 'above_50')
+                  ? const Color(0xFFE8F7ED)
+                  : const Color(0xFFFFF3E0),
+              textOverride:
+                  !data.reservoir.online || data.reservoir.level == 'unknown'
+                  ? reservoirColor('unknown')
+                  : reservoirColor(data.reservoir.level),
+            ),
           ],
         ),
       ),
@@ -7891,26 +8097,6 @@ class SnapshotDetailScreen extends StatelessWidget {
               ),
             ),
           ],
-        ),
-        const SizedBox(height: 16),
-        _buildStaticCard(
-          'RESERVOIR',
-          reservoirLabel(bed.reservoir),
-            bed.reservoir == 'unknown'
-              ? 'Unknown'
-              : !bed.rainNodeOnline
-                ? 'Offline'
-                : bed.reservoir == '50_or_below'
-              ? 'Warning'
-              : bed.reservoir == 'full' || bed.reservoir == 'above_50'
-              ? 'Optimal'
-              : 'Unknown',
-          bgOverride:
-              bed.rainNodeOnline &&
-                  (bed.reservoir == 'full' || bed.reservoir == 'above_50')
-              ? const Color(0xFFE8F7ED)
-              : const Color(0xFFFFF3E0),
-          textOverride: reservoirColor(bed.reservoir),
         ),
       ],
     );

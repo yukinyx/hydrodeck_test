@@ -32,26 +32,46 @@ void main() {
     expect(telemetry.actuatorStates['nutrient2'], isTrue);
   });
 
-  test(
-    'grow bed reservoir fields round-trip and default for older records',
-    () {
-      final current = GrowBedReading.fromMap({
-        'temp': 24.5,
-        'ph': 6.2,
-        'tds': 700,
-        'water': 'full',
-        'reservoir': 'above_50',
-        'rainNodeOnline': true,
-      });
-      expect(current.toMap()['reservoir'], 'above_50');
-      expect(current.toMap()['rainNodeOnline'], isTrue);
+  test('telemetry keeps MAIN readiness and heartbeat separate', () {
+    final telemetry = HydrodeckTelemetry.fromJson({
+      'wifiConnected': true,
+      'firebaseReady': false,
+      'firebaseHeartbeatFresh': true,
+      'rainNodeOnline': false,
+    });
 
-      final legacy = GrowBedReading.fromMap({'temp': 24.5, 'ph': 6.2});
-      expect(legacy.reservoir, 'unknown');
-      expect(legacy.rainNodeOnline, isFalse);
-      expect(legacy.toMap()['reservoir'], 'unknown');
-    },
-  );
+    expect(telemetry.wifiConnected, isTrue);
+    expect(telemetry.firebaseReady, isFalse);
+    expect(telemetry.firebaseHeartbeatFresh, isTrue);
+    expect(telemetry.reservoir.online, isFalse);
+  });
+
+  test('reservoir model prefers shared data and reads legacy bed fields', () {
+    final shared = ReservoirReading.fromSources(
+      shared: {'level': 'full', 'online': true},
+      bed1: {'reservoir': '50_or_below', 'rainNodeOnline': false},
+    );
+    expect(shared.level, 'full');
+    expect(shared.online, isTrue);
+
+    final legacy = ReservoirReading.fromSources(
+      bed1: {'reservoir': 'above_50', 'rainNodeOnline': true},
+    );
+    expect(legacy.level, 'above_50');
+    expect(legacy.online, isTrue);
+
+    final legacyBed2 = ReservoirReading.fromSources(
+      bed2: {'reservoir': 'full', 'rainNodeOnline': true},
+    );
+    expect(legacyBed2.level, 'full');
+    expect(legacyBed2.online, isTrue);
+
+    final legacySqlite = ReservoirReading.fromSources(
+      bed1: '{"reservoir":"50_or_below","rainNodeOnline":true}',
+    );
+    expect(legacySqlite.level, '50_or_below');
+    expect(legacySqlite.online, isTrue);
+  });
 
   test('scheduled cloud snapshots retain reservoir fields for both beds', () {
     const bed = GrowBedReading(
@@ -59,18 +79,19 @@ void main() {
       ph: 6.2,
       tds: 700,
       waterFull: true,
-      reservoir: 'full',
-      rainNodeOnline: true,
     );
     final snapshot = buildScheduledSnapshot(
       batchNumber: 3,
       at: DateTime.utc(2026, 10, 20, 2, 30),
       bed1: bed,
       bed2: bed,
+      reservoir: const ReservoirReading(level: 'full', online: true),
     );
     final cloudMap = snapshot.toCloudMap();
-    expect((cloudMap['bed1'] as Map)['reservoir'], 'full');
-    expect((cloudMap['bed2'] as Map)['rainNodeOnline'], isTrue);
+    expect((cloudMap['reservoir'] as Map)['level'], 'full');
+    expect((cloudMap['reservoir'] as Map)['online'], isTrue);
+    expect((cloudMap['bed1'] as Map).containsKey('reservoir'), isFalse);
+    expect((cloudMap['bed2'] as Map).containsKey('rainNodeOnline'), isFalse);
   });
 
   test(
@@ -84,21 +105,23 @@ void main() {
           'online': true,
         },
       });
-      expect(current.bed1.reservoir, 'full');
-      expect(current.bed2.reservoir, 'full');
-      expect(current.bed1.rainNodeOnline, isTrue);
-      expect(current.bed2.rainNodeOnline, isTrue);
+      expect(current.reservoir.level, 'full');
+      expect(current.reservoir.online, isTrue);
 
       final localStatus = HydrodeckTelemetry.fromJson({
         'reservoir': 'above_50',
         'rainNodeOnline': true,
       });
-      expect(localStatus.bed1.reservoir, 'above_50');
-      expect(localStatus.bed2.rainNodeOnline, isTrue);
+      expect(localStatus.reservoir.level, 'above_50');
+      expect(localStatus.reservoir.online, isTrue);
 
-      final legacy = HydrodeckTelemetry.fromJson({'ph1': 6.2, 'ph2': 6.4});
-      expect(legacy.bed1.reservoir, 'unknown');
-      expect(legacy.bed2.rainNodeOnline, isFalse);
+      final legacy = HydrodeckTelemetry.fromJson({
+        'ph1': 6.2,
+        'ph2': 6.4,
+        'bed1': {'reservoir': 'above_50', 'rainNodeOnline': true},
+      });
+      expect(legacy.reservoir.level, 'above_50');
+      expect(legacy.reservoir.online, isTrue);
     },
   );
 
@@ -144,9 +167,18 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Home'), findsOneWidget);
+    expect(find.textContaining('MAIN HTTP:'), findsOneWidget);
+    expect(find.textContaining('MAIN Wi-Fi:'), findsOneWidget);
+    expect(find.textContaining('MAIN Firebase:'), findsOneWidget);
+    expect(find.textContaining('MAIN Firebase heartbeat:'), findsOneWidget);
+    expect(find.textContaining('RAIN ESP-NOW:'), findsOneWidget);
     expect(find.text('Grow Bed 1 Metrics'), findsOneWidget);
     expect(find.text('Grow Bed 2 Metrics'), findsOneWidget);
-    expect(find.text('RESERVOIR'), findsNWidgets(2));
+    expect(find.text('RESERVOIR'), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.text('RESERVOIR')).dy,
+      greaterThan(tester.getTopLeft(find.text('Grow Bed 2 Metrics')).dy),
+    );
 
     await tester.tap(find.text('CONTROLS'));
     await tester.pumpAndSettle();
@@ -173,5 +205,43 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Connect to ESP32 Hotspot'), findsOneWidget);
     expect(find.text('Send Wi-Fi to ESP32'), findsOneWidget);
+  });
+
+  testWidgets('historical detail shows one shared reservoir card', (
+    WidgetTester tester,
+  ) async {
+    const reading = GrowBedReading(
+      temperature: 24.5,
+      ph: 6.2,
+      tds: 700,
+      waterFull: true,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SnapshotDetailScreen(
+          data: HistoricalData(
+            timestamp: DateTime.utc(2026, 10, 20),
+            pH: 6.2,
+            temperature: '24.5°C',
+            waterLevel: 'Water full',
+            tds: 700,
+            bed1: reading,
+            bed2: reading,
+            reservoir: const ReservoirReading(level: 'full', online: true),
+          ),
+          formattedTime: 'October 20, 2026',
+        ),
+      ),
+    );
+
+    expect(find.text('RESERVOIR'), findsOneWidget);
+    expect(find.text('Grow Bed 1 (Historical Metrics)'), findsOneWidget);
+    expect(find.text('Grow Bed 2 (Historical Metrics)'), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.text('RESERVOIR')).dy,
+      greaterThan(
+        tester.getTopLeft(find.text('Grow Bed 2 (Historical Metrics)')).dy,
+      ),
+    );
   });
 }

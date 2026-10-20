@@ -1,13 +1,18 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <ArduinoJson.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/md.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <atomic>
+#include <cstring>
 
 // Replace this placeholder with the same private token in the MAIN sketch.
 const char* RAIN_TOKEN = "15c7068b34aa4c8103371012c769b18feb98878a948fba5c89786b32f7caaea9";
-const char* MAIN_SSID = "ESP32-HYDRODECK";
-const char* MAIN_PASSWORD = "hydrodeck";
-const char* MAIN_SYNC_URL = "http://192.168.4.1/rain/sync";
+const uint8_t ESPNOW_BROADCAST_MAC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 #define PUMP_ON HIGH
 #define PUMP_OFF LOW
@@ -23,8 +28,131 @@ const unsigned long RESERVOIR_DEBOUNCE_MS = 1000UL;
 const unsigned long MAIN_TIMEOUT_MS = 3000UL;
 const unsigned long NORMAL_POLL_INTERVAL_MS = 500UL;
 const unsigned long PENDING_POLL_INTERVAL_MS = 250UL;
-const unsigned long WIFI_RETRY_INTERVAL_MS = 5000UL;
 const unsigned long LOCAL_MAX_RUN_MS = 300000UL;
+const unsigned long STATUS_INTERVAL_MS = 500UL;
+const unsigned long FAST_STATUS_INTERVAL_MS = 250UL;
+const unsigned long FAST_STATUS_WINDOW_MS = 1500UL;
+const unsigned long DISCOVERY_CHANNEL_DWELL_MS = 450UL;
+const unsigned long ESPNOW_INIT_RETRY_MS = 2000UL;
+const uint8_t FIRST_DISCOVERY_CHANNEL = 1;
+const uint8_t LAST_DISCOVERY_CHANNEL = 13;
+const unsigned long MAIN_BEACON_TIMEOUT_MS = 3000UL;
+const uint16_t ESPNOW_MAGIC = 0x4859;
+const uint8_t ESPNOW_VERSION = 1;
+const uint8_t DEVICE_MAIN = 1;
+const uint8_t DEVICE_RAIN = 2;
+const uint8_t MSG_RAIN_HELLO = 1;
+const uint8_t MSG_MAIN_BEACON = 2;
+const uint8_t MSG_RAIN_STATUS = 3;
+const uint8_t MSG_PUMP_COMMAND = 4;
+const uint8_t MSG_COMMAND_ACK = 5;
+const uint8_t PUMP1_ID = 1;
+const uint8_t PUMP2_ID = 2;
+const uint8_t ACK_ACCEPTED = 1;
+const uint8_t ACK_REJECTED = 2;
+const uint8_t ACK_DUPLICATE = 3;
+const uint8_t FAULT_NONE = 0;
+const uint8_t FAULT_SENSOR_CONFLICT = 1;
+const uint8_t FAULT_PUMP_CONFLICT = 2;
+const uint8_t FAULT_RESERVOIR_LOW = 3;
+const uint8_t FAULT_MAX_RUN = 4;
+const uint8_t FAULT_STALE_COMMAND = 5;
+const uint8_t FAULT_INVALID_COMMAND = 6;
+const size_t ESPNOW_PACKET_MAX = 64;
+
+#pragma pack(push, 1)
+struct PacketHeader {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t type;
+  uint8_t sender;
+  uint8_t payloadSize;
+  uint16_t sequence;
+};
+
+struct RainStatusPacket {
+  PacketHeader header;
+  uint32_t bootId;
+  uint32_t uptimeMs;
+  uint32_t activeCommandId;
+  uint8_t currentChannel;
+  uint8_t midWet;
+  uint8_t fullWet;
+  uint8_t pumpMask;
+  uint8_t activePump;
+  uint8_t fault;
+  uint16_t crc;
+  uint8_t authTag[8];
+};
+
+struct MainBeaconPacket {
+  PacketHeader header;
+  uint32_t bootId;
+  uint8_t currentChannel;
+  uint16_t crc;
+  uint8_t authTag[8];
+};
+
+struct PumpCommandPacket {
+  PacketHeader header;
+  uint32_t mainBootId;
+  uint32_t commandId;
+  uint32_t remainingMs;
+  uint8_t pump;
+  uint8_t requestedOn;
+  uint16_t crc;
+  uint8_t authTag[8];
+};
+
+struct CommandAckPacket {
+  PacketHeader header;
+  uint32_t rainBootId;
+  uint32_t commandId;
+  uint8_t pump;
+  uint8_t result;
+  uint8_t reason;
+  uint16_t crc;
+  uint8_t authTag[8];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(RainStatusPacket) <= ESP_NOW_MAX_DATA_LEN, "RAIN status packet exceeds ESP-NOW v1 limit");
+static_assert(sizeof(PumpCommandPacket) <= ESP_NOW_MAX_DATA_LEN, "Pump command packet exceeds ESP-NOW v1 limit");
+static_assert(sizeof(CommandAckPacket) <= ESP_NOW_MAX_DATA_LEN, "Command ACK exceeds ESP-NOW v1 limit");
+
+struct ReceivedPacket {
+  uint8_t mac[6];
+  uint8_t length;
+  uint8_t bytes[ESPNOW_PACKET_MAX];
+};
+
+QueueHandle_t receivedPackets = nullptr;
+uint8_t mainMac[6] = {};
+bool mainPeerKnown = false;
+bool espNowReady = false;
+bool mainSessionKnown = false;
+bool requireFreshOffCommand = true;
+uint32_t mainBootId = 0;
+uint32_t rainBootId = 0;
+uint32_t lastMainSeenAt = 0;
+uint32_t fastStatusUntil = 0;
+uint32_t lastStatusSentAt = 0;
+uint32_t lastCommandId[2] = {};
+uint32_t activeCommandId[2] = {};
+uint32_t localStopAt[2] = {};
+uint32_t localMaxRunAt[2] = {};
+uint32_t commandSequence = 0;
+uint16_t packetSequence = 0;
+uint16_t lastMainBeaconSequence = 0;
+uint16_t lastMainCommandSequence = 0;
+bool mainBeaconSequenceKnown = false;
+bool mainCommandSequenceKnown = false;
+std::atomic<uint32_t> receiveQueueDrops{0};
+uint32_t reportedReceiveQueueDrops = 0;
+uint32_t lastEspNowRetryAt = 0;
+uint32_t lastDiscoveryChannelChangeAt = 0;
+uint8_t nextDiscoveryChannel = FIRST_DISCOVERY_CHANNEL;
+uint32_t discoveryAttemptCount = 0;
 
 bool pump1On = false;
 bool pump2On = false;
@@ -60,6 +188,147 @@ bool reservoirFullCandidate = false;
 unsigned long reservoirMidCandidateAt = 0;
 unsigned long reservoirFullCandidateAt = 0;
 
+uint16_t packetCrc(const uint8_t* bytes, size_t length) {
+  uint16_t crc = 0xffff;
+  for (size_t index = 0; index < length; index++) {
+    crc ^= bytes[index];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 1) ? (crc >> 1) ^ 0xa001 : crc >> 1;
+    }
+  }
+  return crc;
+}
+
+template <typename Packet>
+void preparePacket(Packet& packet, uint8_t type, uint8_t sender) {
+  packet.header.magic = ESPNOW_MAGIC;
+  packet.header.version = ESPNOW_VERSION;
+  packet.header.type = type;
+  packet.header.sender = sender;
+  packet.header.payloadSize =
+      sizeof(Packet) - sizeof(PacketHeader) - sizeof(packet.crc) -
+      sizeof(packet.authTag);
+  packet.header.sequence = ++packetSequence;
+}
+
+template <typename Packet>
+bool finalizePacket(Packet& packet) {
+  packet.crc = packetCrc(
+      reinterpret_cast<const uint8_t*>(&packet), offsetof(Packet, crc));
+  uint8_t digest[32];
+  const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (md == nullptr || mbedtls_md_hmac(
+      md,
+      reinterpret_cast<const unsigned char*>(RAIN_TOKEN), strlen(RAIN_TOKEN),
+      reinterpret_cast<const unsigned char*>(&packet), offsetof(Packet, authTag),
+      digest) != 0) {
+    return false;
+  }
+  memcpy(packet.authTag, digest, sizeof(packet.authTag));
+  return true;
+}
+
+template <typename Packet>
+bool packetValid(const Packet& packet, size_t length, uint8_t type, uint8_t sender) {
+  if (length != sizeof(Packet) || packet.header.magic != ESPNOW_MAGIC ||
+      packet.header.version != ESPNOW_VERSION || packet.header.type != type ||
+      packet.header.sender != sender ||
+      packet.header.payloadSize !=
+          sizeof(Packet) - sizeof(PacketHeader) - sizeof(packet.crc) -
+          sizeof(packet.authTag)) {
+    return false;
+  }
+  if (packet.crc != packetCrc(
+      reinterpret_cast<const uint8_t*>(&packet), offsetof(Packet, crc))) {
+    return false;
+  }
+  uint8_t digest[32];
+  const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (md == nullptr || mbedtls_md_hmac(
+      md,
+      reinterpret_cast<const unsigned char*>(RAIN_TOKEN), strlen(RAIN_TOKEN),
+      reinterpret_cast<const unsigned char*>(&packet), offsetof(Packet, authTag),
+      digest) != 0) {
+    return false;
+  }
+  return memcmp(packet.authTag, digest, sizeof(packet.authTag)) == 0;
+}
+
+bool sequenceIsNewer(uint16_t sequence, uint16_t previous) {
+  return static_cast<int16_t>(sequence - previous) > 0;
+}
+
+bool commandIdIsNewer(uint32_t commandId, uint32_t previous) {
+  return static_cast<int32_t>(commandId - previous) > 0;
+}
+
+void derivePeerKey(const char* purpose, uint8_t output[16]) {
+  String input = String(purpose) + ":" + RAIN_TOKEN;
+  uint8_t digest[32];
+  mbedtls_sha256(
+      reinterpret_cast<const unsigned char*>(input.c_str()),
+      input.length(),
+      digest,
+      0);
+  memcpy(output, digest, 16);
+}
+
+bool addPeer(const uint8_t mac[6], bool encrypted) {
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = 0;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = encrypted;
+  if (encrypted) derivePeerKey("HYDRODECK-RAIN-LMK-v1", peer.lmk);
+  const esp_err_t result = esp_now_add_peer(&peer);
+  if (result == ESP_OK || result == ESP_ERR_ESPNOW_EXIST) return true;
+  Serial.printf("ESP-NOW peer add failed mac=%02X:%02X:%02X:%02X:%02X:%02X err=%d\n",
+      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], result);
+  return false;
+}
+
+bool sendPacket(const uint8_t mac[6], const void* packet, size_t length) {
+  if (!espNowReady) return false;
+  const esp_err_t result = esp_now_send(
+      mac, reinterpret_cast<const uint8_t*>(packet), length);
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW send enqueue failed err=%d channel=%d\n",
+        result, WiFi.channel());
+    return false;
+  }
+  return true;
+}
+
+void onEspNowReceive(
+    const esp_now_recv_info_t* info,
+    const uint8_t* data,
+    int length) {
+  if (info == nullptr || info->src_addr == nullptr || data == nullptr ||
+      length <= 0 || length > static_cast<int>(ESPNOW_PACKET_MAX) ||
+      receivedPackets == nullptr) return;
+  ReceivedPacket packet = {};
+  memcpy(packet.mac, info->src_addr, sizeof(packet.mac));
+  packet.length = static_cast<uint8_t>(length);
+  memcpy(packet.bytes, data, length);
+  if (xQueueSend(receivedPackets, &packet, 0) != pdTRUE) {
+    receiveQueueDrops.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+uint8_t currentFaultCode() {
+  if (reservoirFullWet && !reservoirMidWet) return FAULT_SENSOR_CONFLICT;
+  if (pump1MaxRunLocked || pump2MaxRunLocked || faultCode == "max_run") {
+    return FAULT_MAX_RUN;
+  }
+  if (faultCode == "reservoir_low") return FAULT_RESERVOIR_LOW;
+  if (faultCode == "pump_conflict") return FAULT_PUMP_CONFLICT;
+  return FAULT_NONE;
+}
+
+void updateFastStatusWindow(unsigned long now) {
+  fastStatusUntil = now + FAST_STATUS_WINDOW_MS;
+}
+
 void configureSafeOutput(int pin, int safeState) {
   digitalWrite(pin, safeState);
   pinMode(pin, OUTPUT);
@@ -76,6 +345,7 @@ String reservoirLevel() {
 String reportedFault() {
   if (reservoirFullWet && !reservoirMidWet) return "sensor_conflict";
   if (pump1MaxRunLocked || pump2MaxRunLocked) return "max_run";
+  if (faultCode == "invalid_command") return "invalid_command";
   if (faultCode.length() > 0) return faultCode;
   return "";
 }
@@ -176,21 +446,8 @@ void stopPumpForMaxRun(int pumpNumber) {
 }
 
 void servicePumpSafety(unsigned long now) {
-  if (!hasValidMainReply || now - lastMainReplyAt >= MAIN_TIMEOUT_MS) {
-    if (pump1On || pump2On) Serial.println("MAIN poll timeout; both water pumps forced OFF");
-    digitalWrite(WATER_PUMP1_PIN, PUMP_OFF);
-    digitalWrite(WATER_PUMP2_PIN, PUMP_OFF);
-    pump1On = false;
-    pump2On = false;
-    desiredPump1On = false;
-    desiredPump2On = false;
-    pump1HasMainDeadline = false;
-    pump2HasMainDeadline = false;
-    pump1MainDeadlineExpired = false;
-    pump2MainDeadlineExpired = false;
-    pump1ActiveCommandId = "";
-    pump2ActiveCommandId = "";
-    commandPending = false;
+  if (!mainSessionKnown || now - lastMainSeenAt >= MAIN_BEACON_TIMEOUT_MS) {
+    if (pump1On || pump2On) stopAllPumpsForRecovery(now);
     return;
   }
 
@@ -213,110 +470,387 @@ void servicePumpSafety(unsigned long now) {
   commandPending = pump1On != desiredPump1On || pump2On != desiredPump2On;
 }
 
-unsigned long boundedRunLimit(JsonVariantConst value) {
-  const unsigned long requested = value.is<unsigned long>()
-      ? value.as<unsigned long>()
-      : LOCAL_MAX_RUN_MS;
-  if (requested == 0) return LOCAL_MAX_RUN_MS;
-  return requested < LOCAL_MAX_RUN_MS ? requested : LOCAL_MAX_RUN_MS;
+void sendCommandAck(const uint8_t mac[6], uint32_t commandId, uint8_t pump,
+    uint8_t result, uint8_t reason) {
+  CommandAckPacket packet = {};
+  preparePacket(packet, MSG_COMMAND_ACK, DEVICE_RAIN);
+  packet.rainBootId = rainBootId;
+  packet.commandId = commandId;
+  packet.pump = pump;
+  packet.result = result;
+  packet.reason = reason;
+  if (!finalizePacket(packet)) {
+    Serial.printf("ESP-NOW ACK authentication failed command=%lu pump=%u\n",
+        static_cast<unsigned long>(commandId), pump);
+    return;
+  }
+  if (!sendPacket(mac, &packet, sizeof(packet))) {
+    Serial.printf("ESP-NOW ACK send failed command=%lu pump=%u\n",
+        static_cast<unsigned long>(commandId), pump);
+  }
 }
 
-void applyPumpCommand(
-    int pumpNumber,
-    JsonObjectConst command,
-    unsigned long maxRunMs,
-    unsigned long now) {
-  const bool requestedOn = command["on"] | false;
-  const String requestId = command["id"] | "";
-  const unsigned long remainingMs = command["remainingMs"] | 0UL;
-  if (pumpNumber == 1) {
-    desiredPump1On = requestedOn;
-    pump1CommandId = requestId;
-    if (!requestedOn) {
+void sendRainStatus(bool broadcast) {
+  RainStatusPacket packet = {};
+  preparePacket(packet, broadcast ? MSG_RAIN_HELLO : MSG_RAIN_STATUS,
+      DEVICE_RAIN);
+  packet.bootId = rainBootId;
+  packet.uptimeMs = millis();
+  packet.activeCommandId = pump1On ? activeCommandId[0] :
+      (pump2On ? activeCommandId[1] : 0);
+  const int currentChannel = WiFi.channel();
+  packet.currentChannel = static_cast<uint8_t>(currentChannel > 0 ? currentChannel : 0);
+  packet.midWet = reservoirMidWet ? 1 : 0;
+  packet.fullWet = reservoirFullWet ? 1 : 0;
+  packet.pumpMask = (pump1On ? 1 : 0) | (pump2On ? 2 : 0);
+  packet.activePump = pump1On ? PUMP1_ID : (pump2On ? PUMP2_ID : 0);
+  packet.fault = currentFaultCode();
+  if (!finalizePacket(packet)) {
+    Serial.println("ESP-NOW status authentication failed");
+    return;
+  }
+  const uint8_t* destination = broadcast ? ESPNOW_BROADCAST_MAC : mainMac;
+  if (!sendPacket(destination, &packet, sizeof(packet))) {
+    Serial.printf("ESP-NOW status send failed broadcast=%u channel=%d\n",
+        broadcast ? 1 : 0, WiFi.channel());
+  }
+}
+
+void stopAllPumpsForRecovery(unsigned long now) {
+  digitalWrite(WATER_PUMP1_PIN, PUMP_OFF);
+  digitalWrite(WATER_PUMP2_PIN, PUMP_OFF);
+  pump1On = false;
+  pump2On = false;
+  desiredPump1On = false;
+  desiredPump2On = false;
+  pump1HasMainDeadline = false;
+  pump2HasMainDeadline = false;
+  pump1MainDeadlineExpired = false;
+  pump2MainDeadlineExpired = false;
+  pump1ActiveCommandId = "";
+  pump2ActiveCommandId = "";
+  commandPending = false;
+  mainSessionKnown = false;
+  requireFreshOffCommand = true;
+  if (mainPeerKnown) esp_now_del_peer(mainMac);
+  mainPeerKnown = false;
+  mainBeaconSequenceKnown = false;
+  mainCommandSequenceKnown = false;
+  lastMainSeenAt = now;
+  Serial.println("RAIN safety: MAIN heartbeat lost; pumps OFF, awaiting fresh OFF commands");
+}
+
+void processPumpCommand(const ReceivedPacket& received,
+    const PumpCommandPacket& command, unsigned long now) {
+  const uint8_t pump = command.pump;
+  if (pump != PUMP1_ID && pump != PUMP2_ID) {
+    sendCommandAck(received.mac, command.commandId, pump, ACK_REJECTED,
+        FAULT_INVALID_COMMAND);
+    Serial.printf("ESP-NOW command rejected reason=invalid_pump pump=%u\n", pump);
+    return;
+  }
+  const uint8_t index = pump == PUMP1_ID ? 0 : 1;
+  const bool pumpOn = index == 0 ? pump1On : pump2On;
+  const uint32_t currentId = lastCommandId[index];
+
+  if (!mainSessionKnown) {
+    Serial.printf("ESP-NOW command deferred until authenticated MAIN beacon pump=%u\n",
+        pump);
+    return;
+  }
+  if (command.mainBootId != mainBootId ||
+      memcmp(received.mac, mainMac, sizeof(mainMac)) != 0) {
+    sendCommandAck(received.mac, command.commandId, pump, ACK_REJECTED,
+        FAULT_STALE_COMMAND);
+    Serial.printf("ESP-NOW command rejected reason=stale_session pump=%u\n", pump);
+    return;
+  }
+  if (command.requestedOn > 1 || command.remainingMs > LOCAL_MAX_RUN_MS) {
+    sendCommandAck(received.mac, command.commandId, pump, ACK_REJECTED,
+        FAULT_INVALID_COMMAND);
+    Serial.printf("ESP-NOW command rejected reason=invalid_fields pump=%u\n", pump);
+    return;
+  }
+  if (command.commandId == 0) {
+    sendCommandAck(received.mac, command.commandId, pump, ACK_REJECTED,
+        FAULT_INVALID_COMMAND);
+    Serial.printf("ESP-NOW command rejected reason=zero_command_id pump=%u\n", pump);
+    return;
+  }
+
+  lastMainSeenAt = now;
+  if (command.commandId == currentId && currentId != 0) {
+    const uint8_t result = pumpOn == (command.requestedOn != 0)
+        ? ACK_DUPLICATE : ACK_REJECTED;
+    sendCommandAck(received.mac, command.commandId, pump, result,
+        result == ACK_DUPLICATE ? FAULT_NONE : FAULT_STALE_COMMAND);
+    if (result == ACK_DUPLICATE) Serial.printf(
+        "ESP-NOW duplicate command ACKed without restart command=%lu pump=%u\n",
+        static_cast<unsigned long>(command.commandId), pump);
+    return;
+  }
+  if (currentId != 0 && !commandIdIsNewer(command.commandId, currentId)) {
+    sendCommandAck(received.mac, command.commandId, pump, ACK_REJECTED,
+        FAULT_STALE_COMMAND);
+    Serial.printf("ESP-NOW stale command rejected command=%lu pump=%u\n",
+        static_cast<unsigned long>(command.commandId), pump);
+    return;
+  }
+
+  if (command.requestedOn == 0) {
+    requireFreshOffCommand = false;
+    faultCode = "";
+    lastCommandId[index] = command.commandId;
+    if (index == 0) {
+      desiredPump1On = false;
       pump1MaxRunLocked = false;
-      pump1HasMainDeadline = false;
       pump1MainDeadlineExpired = false;
-    } else if (pump1On && pump1ActiveCommandId == requestId && remainingMs > 0) {
-      pump1MainStopAt = now + (remainingMs < maxRunMs ? remainingMs : maxRunMs);
-      pump1HasMainDeadline = true;
-    } else if (!pump1On && remainingMs > 0) {
-      pump1MainStopAt = now + (remainingMs < maxRunMs ? remainingMs : maxRunMs);
-      pump1HasMainDeadline = true;
-    }
-  } else {
-    desiredPump2On = requestedOn;
-    pump2CommandId = requestId;
-    if (!requestedOn) {
+      pump1HasMainDeadline = false;
+    } else {
+      desiredPump2On = false;
       pump2MaxRunLocked = false;
-      pump2HasMainDeadline = false;
       pump2MainDeadlineExpired = false;
-    } else if (pump2On && pump2ActiveCommandId == requestId && remainingMs > 0) {
-      pump2MainStopAt = now + (remainingMs < maxRunMs ? remainingMs : maxRunMs);
-      pump2HasMainDeadline = true;
-    } else if (!pump2On && remainingMs > 0) {
-      pump2MainStopAt = now + (remainingMs < maxRunMs ? remainingMs : maxRunMs);
-      pump2HasMainDeadline = true;
+      pump2HasMainDeadline = false;
+    }
+    setPumpRelays(desiredPump1On, desiredPump2On, now);
+    activeCommandId[index] = 0;
+    sendCommandAck(received.mac, command.commandId, pump, ACK_ACCEPTED,
+        FAULT_NONE);
+    updateFastStatusWindow(now);
+    Serial.printf("ESP-NOW stop accepted pump=%u command=%lu\n", pump,
+        static_cast<unsigned long>(command.commandId));
+    return;
+  }
+
+  if (requireFreshOffCommand) {
+    sendCommandAck(received.mac, command.commandId, pump, ACK_REJECTED,
+        FAULT_STALE_COMMAND);
+    Serial.printf("ESP-NOW start rejected reason=recovery_requires_fresh_off pump=%u\n", pump);
+    return;
+  }
+
+  if (pumpOn) {
+    sendCommandAck(received.mac, command.commandId, pump, ACK_REJECTED,
+        FAULT_PUMP_CONFLICT);
+    Serial.printf("ESP-NOW new command rejected while pump already on pump=%u\n", pump);
+    return;
+  }
+
+  const uint32_t boundedRemaining = command.remainingMs;
+  if ((pump == PUMP1_ID ? pump2On : pump1On) ||
+      (pump == PUMP1_ID ? pump1MaxRunLocked : pump2MaxRunLocked)) {
+    const uint8_t reason = (pump1MaxRunLocked || pump2MaxRunLocked)
+        ? FAULT_MAX_RUN : FAULT_PUMP_CONFLICT;
+    sendCommandAck(received.mac, command.commandId, pump, ACK_REJECTED, reason);
+    Serial.printf("ESP-NOW start rejected pump=%u reason=%u\n", pump, reason);
+    return;
+  }
+  if (BLOCK_PUMP_WHEN_RESERVOIR_LOW &&
+      reservoirLevel() == "50_or_below") {
+    faultCode = "reservoir_low";
+    sendCommandAck(received.mac, command.commandId, pump, ACK_REJECTED,
+        FAULT_RESERVOIR_LOW);
+    Serial.printf("ESP-NOW start rejected pump=%u reason=reservoir_low\n", pump);
+    return;
+  }
+
+  lastCommandId[index] = command.commandId;
+  activeCommandId[index] = command.commandId;
+  if (index == 0) {
+    desiredPump1On = true;
+    pump1HasMainDeadline = boundedRemaining > 0;
+    pump1MainStopAt = now + boundedRemaining;
+  } else {
+    desiredPump2On = true;
+    pump2HasMainDeadline = boundedRemaining > 0;
+    pump2MainStopAt = now + boundedRemaining;
+  }
+  faultCode = "";
+  setPumpRelays(desiredPump1On, desiredPump2On, now);
+  if (index == 0) {
+    pump1ActiveCommandId = command.commandId;
+    pump1HasMainDeadline = boundedRemaining > 0;
+  } else {
+    pump2ActiveCommandId = command.commandId;
+    pump2HasMainDeadline = boundedRemaining > 0;
+  }
+  if (!(index == 0 ? pump1On : pump2On)) {
+    const uint8_t reason = faultCode == "reservoir_low"
+        ? FAULT_RESERVOIR_LOW : FAULT_PUMP_CONFLICT;
+    sendCommandAck(received.mac, command.commandId, pump, ACK_REJECTED, reason);
+    return;
+  }
+  sendCommandAck(received.mac, command.commandId, pump, ACK_ACCEPTED, FAULT_NONE);
+  updateFastStatusWindow(now);
+  Serial.printf("ESP-NOW pump accepted pump=%u command=%lu remainingMs=%lu\n",
+      pump, static_cast<unsigned long>(command.commandId),
+      static_cast<unsigned long>(boundedRemaining));
+}
+
+void processMainBeacon(const ReceivedPacket& received,
+    const MainBeaconPacket& beacon, unsigned long now) {
+  if (beacon.bootId == 0 || beacon.currentChannel < FIRST_DISCOVERY_CHANNEL ||
+      beacon.currentChannel > LAST_DISCOVERY_CHANNEL) {
+    Serial.println("ESP-NOW beacon rejected: invalid boot ID or channel");
+    return;
+  }
+  const bool newSession = mainBootId != 0 && mainBootId != beacon.bootId;
+  if (newSession) {
+    stopAllPumpsForRecovery(now);
+    lastCommandId[0] = 0;
+    lastCommandId[1] = 0;
+    mainBeaconSequenceKnown = false;
+    mainCommandSequenceKnown = false;
+    Serial.printf("MAIN session changed boot=%08lX; stale pumps cleared\n",
+        static_cast<unsigned long>(beacon.bootId));
+  } else if (mainBeaconSequenceKnown &&
+      !sequenceIsNewer(beacon.header.sequence, lastMainBeaconSequence)) {
+    return;
+  }
+
+  const bool firstContact = !mainSessionKnown || !mainPeerKnown || newSession;
+  const bool peerChanged = mainPeerKnown &&
+      memcmp(mainMac, received.mac, sizeof(mainMac)) != 0;
+  if (peerChanged) {
+    Serial.println("ESP-NOW MAIN peer changed; removing stale peer entry");
+    esp_now_del_peer(mainMac);
+    mainPeerKnown = false;
+  }
+  memcpy(mainMac, received.mac, sizeof(mainMac));
+  if (!mainPeerKnown && !addPeer(mainMac, true)) {
+    mainSessionKnown = false;
+    Serial.println("ESP-NOW MAIN peer setup failed; continuing channel discovery");
+    return;
+  }
+  mainBootId = beacon.bootId;
+  mainSessionKnown = true;
+  mainPeerKnown = true;
+  mainBeaconSequenceKnown = true;
+  lastMainBeaconSequence = beacon.header.sequence;
+  lastMainSeenAt = now;
+  if (firstContact || peerChanged) {
+    Serial.printf("ESP-NOW MAIN peer paired channel=%u; sending discovery hello\n",
+        beacon.currentChannel);
+    sendRainStatus(true);
+  }
+}
+
+void processEspNowPackets(unsigned long now) {
+  if (receivedPackets == nullptr) return;
+  const uint32_t queueDrops = receiveQueueDrops.load(std::memory_order_relaxed);
+  if (queueDrops != reportedReceiveQueueDrops) {
+    reportedReceiveQueueDrops = queueDrops;
+    Serial.printf("ESP-NOW receive queue overflow drops=%lu\n",
+        static_cast<unsigned long>(queueDrops));
+  }
+  ReceivedPacket received;
+  while (xQueueReceive(receivedPackets, &received, 0) == pdTRUE) {
+    if (received.length < sizeof(PacketHeader) + sizeof(uint16_t)) continue;
+    PacketHeader header;
+    memcpy(&header, received.bytes, sizeof(header));
+    if (header.magic != ESPNOW_MAGIC || header.version != ESPNOW_VERSION ||
+        header.sender != DEVICE_MAIN) {
+      Serial.println("ESP-NOW packet rejected: invalid header/version/sender");
+      continue;
+    }
+
+    if (header.type == MSG_MAIN_BEACON) {
+      MainBeaconPacket beacon;
+      memcpy(&beacon, received.bytes, sizeof(beacon));
+      if (!packetValid(beacon, received.length, MSG_MAIN_BEACON, DEVICE_MAIN)) {
+        Serial.println("ESP-NOW beacon rejected: size/CRC/authentication");
+        continue;
+      }
+      processMainBeacon(received, beacon, now);
+      continue;
+    }
+    if (header.type == MSG_PUMP_COMMAND) {
+      PumpCommandPacket command;
+      memcpy(&command, received.bytes, sizeof(command));
+      if (!packetValid(command, received.length, MSG_PUMP_COMMAND, DEVICE_MAIN)) {
+        Serial.println("ESP-NOW command rejected: size/CRC/authentication");
+        continue;
+      }
+      if (mainCommandSequenceKnown &&
+          !sequenceIsNewer(command.header.sequence, lastMainCommandSequence)) {
+        Serial.printf("ESP-NOW stale packet sequence rejected seq=%u\n",
+            command.header.sequence);
+        continue;
+      }
+      mainCommandSequenceKnown = true;
+      lastMainCommandSequence = command.header.sequence;
+      processPumpCommand(received, command, now);
     }
   }
 }
 
-bool pollMain(unsigned long now) {
-  if (WiFi.status() != WL_CONNECTED) return false;
+void serviceChannelDiscovery(unsigned long now) {
+  if (lastDiscoveryChannelChangeAt != 0 &&
+      now - lastDiscoveryChannelChangeAt < DISCOVERY_CHANNEL_DWELL_MS) {
+    return;
+  }
+  const uint8_t channel = nextDiscoveryChannel;
+  nextDiscoveryChannel = channel >= LAST_DISCOVERY_CHANNEL
+      ? FIRST_DISCOVERY_CHANNEL : channel + 1;
+  lastDiscoveryChannelChangeAt = now;
+  discoveryAttemptCount++;
+  const esp_err_t result = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  if (result != ESP_OK) {
+    Serial.printf("RAIN discovery attempt=%lu channel=%u failed=%d active=%d\n",
+        static_cast<unsigned long>(discoveryAttemptCount), channel, result,
+        WiFi.channel());
+    return;
+  }
+  Serial.printf("RAIN discovery attempt=%lu listening=%u active=%d\n",
+      static_cast<unsigned long>(discoveryAttemptCount), channel, WiFi.channel());
+}
 
-  const String fault = reportedFault();
-  String url = String(MAIN_SYNC_URL) + "?token=" + RAIN_TOKEN +
-      "&p1=" + String(pump1On ? 1 : 0) +
-      "&p2=" + String(pump2On ? 1 : 0) +
-      "&mid=" + String(reservoirMidWet ? 1 : 0) +
-      "&full=" + String(reservoirFullWet ? 1 : 0) +
-      "&up=" + String(now / 1000UL);
-  if (fault.length() > 0) url += "&fault=" + fault;
+void serviceDiscovery(unsigned long now) {
+  if (mainSessionKnown && now - lastMainSeenAt >= MAIN_BEACON_TIMEOUT_MS) {
+    stopAllPumpsForRecovery(now);
+  }
+  if (!mainSessionKnown) serviceChannelDiscovery(now);
 
-  HTTPClient http;
-  http.setTimeout(800);
-  if (!http.begin(url)) return false;
-  const int statusCode = http.GET();
-  if (statusCode != HTTP_CODE_OK) {
-    http.end();
+  const unsigned long interval = (commandPending || now < fastStatusUntil)
+      ? FAST_STATUS_INTERVAL_MS : STATUS_INTERVAL_MS;
+  if (now - lastStatusSentAt < interval) return;
+  lastStatusSentAt = now;
+  sendRainStatus(!mainPeerKnown);
+}
+
+bool initializeEspNow() {
+  if (espNowReady) return true;
+  if (receivedPackets == nullptr) {
+    receivedPackets = xQueueCreate(8, sizeof(ReceivedPacket));
+  }
+  if (receivedPackets == nullptr) {
+    Serial.println("ESP-NOW unavailable: receive queue is not allocated");
     return false;
   }
-
-  DynamicJsonDocument response(768);
-  const DeserializationError error = deserializeJson(response, http.getString());
-  http.end();
-  if (error || !(response["ok"] | false)) return false;
-
-  lastMainReplyAt = now;
-  hasValidMainReply = true;
-  const unsigned long maxRunMs = boundedRunLimit(response["maxRunMs"]);
-  const bool pump1WasOn = pump1On;
-  const bool pump2WasOn = pump2On;
-  const JsonObjectConst p1 = response["p1"].as<JsonObjectConst>();
-  const JsonObjectConst p2 = response["p2"].as<JsonObjectConst>();
-  const bool nextPump1On = p1["on"] | false;
-  const bool nextPump2On = p2["on"] | false;
-  if (nextPump1On && nextPump2On) {
-    desiredPump1On = false;
-    desiredPump2On = false;
-    faultCode = "pump_conflict";
-  } else {
-    faultCode = "";
-    applyPumpCommand(1, p1, maxRunMs, now);
-    applyPumpCommand(5, p2, maxRunMs, now);
+  const esp_err_t initResult = esp_now_init();
+  if (initResult != ESP_OK && initResult != ESP_ERR_ESPNOW_EXIST) {
+    Serial.printf("ESP-NOW init failed err=%d channel=%d\n",
+        initResult, WiFi.channel());
+    return false;
   }
-  setPumpRelays(desiredPump1On, desiredPump2On, now);
-  commandPending = commandPending || pump1WasOn != pump1On ||
-      pump2WasOn != pump2On;
+  uint8_t pmk[16];
+  derivePeerKey("HYDRODECK-RAIN-PMK-v1", pmk);
+  const esp_err_t pmkResult = esp_now_set_pmk(pmk);
+  if (pmkResult != ESP_OK) {
+    Serial.printf("ESP-NOW PMK setup failed err=%d\n", pmkResult);
+    esp_now_deinit();
+    return false;
+  }
+  if (!addPeer(ESPNOW_BROADCAST_MAC, false) ||
+      esp_now_register_recv_cb(onEspNowReceive) != ESP_OK) {
+    Serial.println("ESP-NOW callback/broadcast peer setup failed; retrying");
+    esp_now_deinit();
+    return false;
+  }
+  espNowReady = true;
+  Serial.printf("ESP-NOW ready role=RAIN mac=%s channel=%d encryptedPeer=LMK\n",
+      WiFi.macAddress().c_str(), WiFi.channel());
   return true;
-}
-
-void maintainMainConnection(unsigned long now) {
-  if (WiFi.status() == WL_CONNECTED) return;
-  if (lastWifiAttemptAt != 0 && now - lastWifiAttemptAt < WIFI_RETRY_INTERVAL_MS) return;
-  lastWifiAttemptAt = now;
-  WiFi.disconnect();
-  WiFi.begin(MAIN_SSID, MAIN_PASSWORD);
-  Serial.println("Connecting to MAIN ESP32 hotspot...");
 }
 
 void setup() {
@@ -334,12 +868,19 @@ void setup() {
   reservoirMidCandidateAt = millis();
   reservoirFullCandidateAt = millis();
 
+  rainBootId = esp_random();
+  if (rainBootId == 0) rainBootId = 1;
+  receivedPackets = xQueueCreate(8, sizeof(ReceivedPacket));
+  if (receivedPackets == nullptr) {
+    Serial.println("ESP-NOW receive queue allocation failed; pumps remain OFF");
+  }
+
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
-  WiFi.begin(MAIN_SSID, MAIN_PASSWORD);
-  lastWifiAttemptAt = millis();
-  Serial.println("HYDRO_RAIN_ACTIVE");
+  Serial.printf("HYDRO_RAIN_ACTIVE stationMac=%s; no Wi-Fi association required\n",
+      WiFi.macAddress().c_str());
+  lastEspNowRetryAt = millis();
+  initializeEspNow();
 }
 
 void loop() {
@@ -359,13 +900,11 @@ void loop() {
     now
   );
   servicePumpSafety(now);
-  maintainMainConnection(now);
-
-  const unsigned long pollInterval = commandPending
-      ? PENDING_POLL_INTERVAL_MS
-      : NORMAL_POLL_INTERVAL_MS;
-  if (now - lastPollAt >= pollInterval) {
-    lastPollAt = now;
-    pollMain(now);
+  processEspNowPackets(now);
+  if (!espNowReady && now - lastEspNowRetryAt >= ESPNOW_INIT_RETRY_MS) {
+    lastEspNowRetryAt = now;
+    Serial.println("RAIN retrying ESP-NOW initialization");
+    initializeEspNow();
   }
+  serviceDiscovery(now);
 }
