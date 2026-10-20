@@ -165,14 +165,15 @@ bool phLimitRequestPending = false;
 unsigned long waterLowSince1 = 0;
 unsigned long waterLowSince2 = 0;
 
-// NEW: Variables for 10-second delay automatic pH control
+// Variables for 1-minute delay automatic pH control
 unsigned long bed1PhLowSince = 0;
 unsigned long bed1PhHighSince = 0;
 unsigned long bed2PhLowSince = 0;
 unsigned long bed2PhHighSince = 0;
 unsigned long bed1PhLastAttemptLogAt = 0;
 unsigned long bed2PhLastAttemptLogAt = 0;
-const unsigned long phDelayThreshold = 10000; // 10 seconds in milliseconds
+// Change this value to adjust how long pH must stay out of range before auto-dosing.
+const unsigned long phDelayThreshold = 60000UL; // 1 minute in milliseconds
 const unsigned long phAutoRetryLogInterval = 5000UL;
 const float phControlHysteresis = 0.15f;
 
@@ -1312,7 +1313,7 @@ void loop() {
     lastTdsValidAt2 = now;
   }
 
-  // Reading pH Sensors with 10-second delay logic
+  // Reading pH Sensors with 1-minute delay logic
   if (now - lastPhCheck >= phInterval) {
     lastPhCheck = now;
     currentPhValue1 = readPhSensor(PH_PIN1, slope1);
