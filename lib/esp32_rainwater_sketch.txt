@@ -1,0 +1,371 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// Replace this placeholder with the same private token in the MAIN sketch.
+const char* RAIN_TOKEN = "15c7068b34aa4c8103371012c769b18feb98878a948fba5c89786b32f7caaea9";
+const char* MAIN_SSID = "ESP32-HYDRODECK";
+const char* MAIN_PASSWORD = "hydrodeck";
+const char* MAIN_SYNC_URL = "http://192.168.4.1/rain/sync";
+
+#define PUMP_ON HIGH
+#define PUMP_OFF LOW
+
+const int WATER_PUMP1_PIN = 25;
+const int WATER_PUMP2_PIN = 12;
+const int RES_MID_PIN = 21;
+const int RES_FULL_PIN = 22;
+
+// GPIO 12 is a strapping pin. Its relay input must not be pulled HIGH at boot.
+const bool BLOCK_PUMP_WHEN_RESERVOIR_LOW = false;
+const unsigned long RESERVOIR_DEBOUNCE_MS = 1000UL;
+const unsigned long MAIN_TIMEOUT_MS = 3000UL;
+const unsigned long NORMAL_POLL_INTERVAL_MS = 500UL;
+const unsigned long PENDING_POLL_INTERVAL_MS = 250UL;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 5000UL;
+const unsigned long LOCAL_MAX_RUN_MS = 300000UL;
+
+bool pump1On = false;
+bool pump2On = false;
+bool pump1MaxRunLocked = false;
+bool pump2MaxRunLocked = false;
+bool desiredPump1On = false;
+bool desiredPump2On = false;
+bool commandPending = false;
+String pump1CommandId;
+String pump2CommandId;
+String pump1ActiveCommandId;
+String pump2ActiveCommandId;
+String faultCode;
+unsigned long pump1StartedAt = 0;
+unsigned long pump2StartedAt = 0;
+unsigned long pump1MaxRunAt = 0;
+unsigned long pump2MaxRunAt = 0;
+unsigned long pump1MainStopAt = 0;
+unsigned long pump2MainStopAt = 0;
+bool pump1HasMainDeadline = false;
+bool pump2HasMainDeadline = false;
+bool pump1MainDeadlineExpired = false;
+bool pump2MainDeadlineExpired = false;
+bool hasValidMainReply = false;
+unsigned long lastMainReplyAt = 0;
+unsigned long lastPollAt = 0;
+unsigned long lastWifiAttemptAt = 0;
+
+bool reservoirMidWet = false;
+bool reservoirFullWet = false;
+bool reservoirMidCandidate = false;
+bool reservoirFullCandidate = false;
+unsigned long reservoirMidCandidateAt = 0;
+unsigned long reservoirFullCandidateAt = 0;
+
+void configureSafeOutput(int pin, int safeState) {
+  digitalWrite(pin, safeState);
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, safeState);
+}
+
+String reservoirLevel() {
+  if (reservoirFullWet && !reservoirMidWet) return "unknown";
+  if (reservoirFullWet) return "full";
+  if (reservoirMidWet) return "above_50";
+  return "50_or_below";
+}
+
+String reportedFault() {
+  if (reservoirFullWet && !reservoirMidWet) return "sensor_conflict";
+  if (pump1MaxRunLocked || pump2MaxRunLocked) return "max_run";
+  if (faultCode.length() > 0) return faultCode;
+  return "";
+}
+
+void updateDebouncedSensor(
+    int pin,
+    bool& stableState,
+    bool& candidateState,
+    unsigned long& candidateAt,
+    unsigned long now) {
+  const bool reading = digitalRead(pin) == HIGH;
+  if (reading != candidateState) {
+    candidateState = reading;
+    candidateAt = now;
+  } else if (reading != stableState &&
+             now - candidateAt >= RESERVOIR_DEBOUNCE_MS) {
+    stableState = reading;
+  }
+}
+
+void setPumpRelays(bool pump1Requested, bool pump2Requested, unsigned long now) {
+  if (pump1Requested && pump2Requested) {
+    faultCode = "pump_conflict";
+    pump1Requested = false;
+    pump2Requested = false;
+  }
+
+  const bool reservoirLow = reservoirLevel() == "50_or_below";
+  if (BLOCK_PUMP_WHEN_RESERVOIR_LOW && reservoirLow) {
+    if ((pump1Requested && !pump1On) || (pump2Requested && !pump2On)) {
+      faultCode = "reservoir_low";
+    }
+    pump1Requested = pump1On;
+    pump2Requested = pump2On;
+  }
+
+  if (pump1Requested && pump1MaxRunLocked) pump1Requested = false;
+  if (pump2Requested && pump2MaxRunLocked) pump2Requested = false;
+  if (pump1MainDeadlineExpired) pump1Requested = false;
+  if (pump2MainDeadlineExpired) pump2Requested = false;
+  if (pump1Requested && pump2On) {
+    digitalWrite(WATER_PUMP2_PIN, PUMP_OFF);
+    pump2On = false;
+    pump2HasMainDeadline = false;
+    pump2ActiveCommandId = "";
+  }
+  if (pump2Requested && pump1On) {
+    digitalWrite(WATER_PUMP1_PIN, PUMP_OFF);
+    pump1On = false;
+    pump1HasMainDeadline = false;
+    pump1ActiveCommandId = "";
+  }
+
+  if (pump1Requested != pump1On) {
+    digitalWrite(WATER_PUMP1_PIN, pump1Requested ? PUMP_ON : PUMP_OFF);
+    pump1On = pump1Requested;
+    if (pump1On) {
+      pump1StartedAt = now;
+      pump1MaxRunAt = now + LOCAL_MAX_RUN_MS;
+      pump1ActiveCommandId = pump1CommandId;
+    } else {
+      pump1HasMainDeadline = false;
+      pump1ActiveCommandId = "";
+      if (!desiredPump1On) pump1MaxRunLocked = false;
+    }
+  }
+  if (pump2Requested != pump2On) {
+    digitalWrite(WATER_PUMP2_PIN, pump2Requested ? PUMP_ON : PUMP_OFF);
+    pump2On = pump2Requested;
+    if (pump2On) {
+      pump2StartedAt = now;
+      pump2MaxRunAt = now + LOCAL_MAX_RUN_MS;
+      pump2ActiveCommandId = pump2CommandId;
+    } else {
+      pump2HasMainDeadline = false;
+      pump2ActiveCommandId = "";
+      if (!desiredPump2On) pump2MaxRunLocked = false;
+    }
+  }
+  commandPending = pump1On != desiredPump1On || pump2On != desiredPump2On;
+}
+
+void stopPumpForMaxRun(int pumpNumber) {
+  faultCode = "max_run";
+  if (pumpNumber == 1) {
+    digitalWrite(WATER_PUMP1_PIN, PUMP_OFF);
+    pump1On = false;
+    pump1MaxRunLocked = true;
+    pump1HasMainDeadline = false;
+    pump1ActiveCommandId = "";
+  } else {
+    digitalWrite(WATER_PUMP2_PIN, PUMP_OFF);
+    pump2On = false;
+    pump2MaxRunLocked = true;
+    pump2HasMainDeadline = false;
+    pump2ActiveCommandId = "";
+  }
+}
+
+void servicePumpSafety(unsigned long now) {
+  if (!hasValidMainReply || now - lastMainReplyAt >= MAIN_TIMEOUT_MS) {
+    if (pump1On || pump2On) Serial.println("MAIN poll timeout; both water pumps forced OFF");
+    digitalWrite(WATER_PUMP1_PIN, PUMP_OFF);
+    digitalWrite(WATER_PUMP2_PIN, PUMP_OFF);
+    pump1On = false;
+    pump2On = false;
+    desiredPump1On = false;
+    desiredPump2On = false;
+    pump1HasMainDeadline = false;
+    pump2HasMainDeadline = false;
+    pump1MainDeadlineExpired = false;
+    pump2MainDeadlineExpired = false;
+    pump1ActiveCommandId = "";
+    pump2ActiveCommandId = "";
+    commandPending = false;
+    return;
+  }
+
+  if (pump1On && (long)(now - pump1MaxRunAt) >= 0) stopPumpForMaxRun(1);
+  if (pump2On && (long)(now - pump2MaxRunAt) >= 0) stopPumpForMaxRun(2);
+  if (pump1On && pump1HasMainDeadline &&
+      (long)(now - pump1MainStopAt) >= 0) {
+    digitalWrite(WATER_PUMP1_PIN, PUMP_OFF);
+    pump1On = false;
+    pump1MainDeadlineExpired = true;
+    pump1ActiveCommandId = "";
+  }
+  if (pump2On && pump2HasMainDeadline &&
+      (long)(now - pump2MainStopAt) >= 0) {
+    digitalWrite(WATER_PUMP2_PIN, PUMP_OFF);
+    pump2On = false;
+    pump2MainDeadlineExpired = true;
+    pump2ActiveCommandId = "";
+  }
+  commandPending = pump1On != desiredPump1On || pump2On != desiredPump2On;
+}
+
+unsigned long boundedRunLimit(JsonVariantConst value) {
+  const unsigned long requested = value.is<unsigned long>()
+      ? value.as<unsigned long>()
+      : LOCAL_MAX_RUN_MS;
+  if (requested == 0) return LOCAL_MAX_RUN_MS;
+  return requested < LOCAL_MAX_RUN_MS ? requested : LOCAL_MAX_RUN_MS;
+}
+
+void applyPumpCommand(
+    int pumpNumber,
+    JsonObjectConst command,
+    unsigned long maxRunMs,
+    unsigned long now) {
+  const bool requestedOn = command["on"] | false;
+  const String requestId = command["id"] | "";
+  const unsigned long remainingMs = command["remainingMs"] | 0UL;
+  if (pumpNumber == 1) {
+    desiredPump1On = requestedOn;
+    pump1CommandId = requestId;
+    if (!requestedOn) {
+      pump1MaxRunLocked = false;
+      pump1HasMainDeadline = false;
+      pump1MainDeadlineExpired = false;
+    } else if (pump1On && pump1ActiveCommandId == requestId && remainingMs > 0) {
+      pump1MainStopAt = now + (remainingMs < maxRunMs ? remainingMs : maxRunMs);
+      pump1HasMainDeadline = true;
+    } else if (!pump1On && remainingMs > 0) {
+      pump1MainStopAt = now + (remainingMs < maxRunMs ? remainingMs : maxRunMs);
+      pump1HasMainDeadline = true;
+    }
+  } else {
+    desiredPump2On = requestedOn;
+    pump2CommandId = requestId;
+    if (!requestedOn) {
+      pump2MaxRunLocked = false;
+      pump2HasMainDeadline = false;
+      pump2MainDeadlineExpired = false;
+    } else if (pump2On && pump2ActiveCommandId == requestId && remainingMs > 0) {
+      pump2MainStopAt = now + (remainingMs < maxRunMs ? remainingMs : maxRunMs);
+      pump2HasMainDeadline = true;
+    } else if (!pump2On && remainingMs > 0) {
+      pump2MainStopAt = now + (remainingMs < maxRunMs ? remainingMs : maxRunMs);
+      pump2HasMainDeadline = true;
+    }
+  }
+}
+
+bool pollMain(unsigned long now) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  const String fault = reportedFault();
+  String url = String(MAIN_SYNC_URL) + "?token=" + RAIN_TOKEN +
+      "&p1=" + String(pump1On ? 1 : 0) +
+      "&p2=" + String(pump2On ? 1 : 0) +
+      "&mid=" + String(reservoirMidWet ? 1 : 0) +
+      "&full=" + String(reservoirFullWet ? 1 : 0) +
+      "&up=" + String(now / 1000UL);
+  if (fault.length() > 0) url += "&fault=" + fault;
+
+  HTTPClient http;
+  http.setTimeout(800);
+  if (!http.begin(url)) return false;
+  const int statusCode = http.GET();
+  if (statusCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  DynamicJsonDocument response(768);
+  const DeserializationError error = deserializeJson(response, http.getString());
+  http.end();
+  if (error || !(response["ok"] | false)) return false;
+
+  lastMainReplyAt = now;
+  hasValidMainReply = true;
+  const unsigned long maxRunMs = boundedRunLimit(response["maxRunMs"]);
+  const bool pump1WasOn = pump1On;
+  const bool pump2WasOn = pump2On;
+  const JsonObjectConst p1 = response["p1"].as<JsonObjectConst>();
+  const JsonObjectConst p2 = response["p2"].as<JsonObjectConst>();
+  const bool nextPump1On = p1["on"] | false;
+  const bool nextPump2On = p2["on"] | false;
+  if (nextPump1On && nextPump2On) {
+    desiredPump1On = false;
+    desiredPump2On = false;
+    faultCode = "pump_conflict";
+  } else {
+    faultCode = "";
+    applyPumpCommand(1, p1, maxRunMs, now);
+    applyPumpCommand(5, p2, maxRunMs, now);
+  }
+  setPumpRelays(desiredPump1On, desiredPump2On, now);
+  commandPending = commandPending || pump1WasOn != pump1On ||
+      pump2WasOn != pump2On;
+  return true;
+}
+
+void maintainMainConnection(unsigned long now) {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (lastWifiAttemptAt != 0 && now - lastWifiAttemptAt < WIFI_RETRY_INTERVAL_MS) return;
+  lastWifiAttemptAt = now;
+  WiFi.disconnect();
+  WiFi.begin(MAIN_SSID, MAIN_PASSWORD);
+  Serial.println("Connecting to MAIN ESP32 hotspot...");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Boot is always OFF; never restore a previous pump command after restart.
+  configureSafeOutput(WATER_PUMP1_PIN, PUMP_OFF);
+  configureSafeOutput(WATER_PUMP2_PIN, PUMP_OFF);
+  pinMode(RES_MID_PIN, INPUT_PULLUP);
+  pinMode(RES_FULL_PIN, INPUT_PULLUP);
+  reservoirMidWet = digitalRead(RES_MID_PIN) == HIGH;
+  reservoirFullWet = digitalRead(RES_FULL_PIN) == HIGH;
+  reservoirMidCandidate = reservoirMidWet;
+  reservoirFullCandidate = reservoirFullWet;
+  reservoirMidCandidateAt = millis();
+  reservoirFullCandidateAt = millis();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  WiFi.begin(MAIN_SSID, MAIN_PASSWORD);
+  lastWifiAttemptAt = millis();
+  Serial.println("HYDRO_RAIN_ACTIVE");
+}
+
+void loop() {
+  const unsigned long now = millis();
+  updateDebouncedSensor(
+    RES_MID_PIN,
+    reservoirMidWet,
+    reservoirMidCandidate,
+    reservoirMidCandidateAt,
+    now
+  );
+  updateDebouncedSensor(
+    RES_FULL_PIN,
+    reservoirFullWet,
+    reservoirFullCandidate,
+    reservoirFullCandidateAt,
+    now
+  );
+  servicePumpSafety(now);
+  maintainMainConnection(now);
+
+  const unsigned long pollInterval = commandPending
+      ? PENDING_POLL_INTERVAL_MS
+      : NORMAL_POLL_INTERVAL_MS;
+  if (now - lastPollAt >= pollInterval) {
+    lastPollAt = now;
+    pollMain(now);
+  }
+}

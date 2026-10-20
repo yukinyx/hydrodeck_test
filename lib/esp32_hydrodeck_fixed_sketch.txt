@@ -30,6 +30,12 @@ char password[65] = "12345678";
 #define LIGHT_ON HIGH
 #define LIGHT_OFF LOW
 
+// Replace this placeholder with the same private token in the RAIN sketch.
+const char* RAIN_TOKEN = "15c7068b34aa4c8103371012c769b18feb98878a948fba5c89786b32f7caaea9";
+const unsigned long RAIN_NODE_TIMEOUT_MS = 3000UL;
+const unsigned long RAIN_START_CONFIRM_TIMEOUT_MS = 3000UL;
+const unsigned long RAIN_MAX_RUN_MS = 300000UL;
+
 // --- PIN DEFINITIONS ---
 // Sensors Set 1
 const int WATER_SENSOR_PIN1 = 21;
@@ -44,11 +50,9 @@ const int PH_PIN2 = 32;
 const int TDS_PIN2 = 33;
 
 // Actuators (8 named pumps + 1 shared grow light)
-const int waterPump1Pin = 25;
 const int phUp1Pin = 26;
 const int phDown1Pin = 27;
 const int nutrientPump1Pin = 14;
-const int waterPump2Pin = 12;
 const int phUp2Pin = 19;
 const int phDown2Pin = 23;
 const int nutrientPump2Pin = 5;
@@ -164,6 +168,19 @@ const unsigned long phLimitPollInterval = 5000;
 bool phLimitRequestPending = false;
 unsigned long waterLowSince1 = 0;
 unsigned long waterLowSince2 = 0;
+bool rainNodeOnline = false;
+bool rainPump1On = false;
+bool rainPump2On = false;
+bool rainPumpStateKnown1 = false;
+bool rainPumpStateKnown2 = false;
+bool reservoirMidWet = false;
+bool reservoirFullWet = false;
+String reservoirLevel = "unknown";
+String rainFaultCode;
+unsigned long lastRainSeenAt = 0;
+unsigned long lastAutoRefillOfflineLogAt = 0;
+bool rainDesiredPump1On = false;
+bool rainDesiredPump2On = false;
 
 // Variables for 1-minute delay automatic pH control
 unsigned long bed1PhLowSince = 0;
@@ -186,6 +203,11 @@ struct PumpRunState {
   bool active = false;
   bool stopWhenFull = false;
   bool hasDeadline = false;
+  bool awaitingStartConfirmation = false;
+  bool stopRequested = false;
+  bool manualShortRun = false;
+  unsigned long durationMs = 0;
+  unsigned long confirmationStartedAt = 0;
   unsigned long stopAt = 0;
 };
 
@@ -230,14 +252,25 @@ float readPhSensor(int pin, float sensorSlope) {
 }
 
 // Actuator control functions
+bool isRemoteWaterPump(int pumpNum) {
+  return pumpNum == 1 || pumpNum == 5;
+}
+
 void setPump(int pumpNum, bool turnOn) {
+  if (pumpNum == 1) {
+    rainDesiredPump1On = turnOn;
+    return;
+  }
+  if (pumpNum == 5) {
+    rainDesiredPump2On = turnOn;
+    return;
+  }
+
   int pin = -1;
   switch (pumpNum) {
-    case 1: pin = waterPump1Pin; break;
     case 2: pin = phUp1Pin; break;
     case 3: pin = phDown1Pin; break;
     case 4: pin = nutrientPump1Pin; break;
-    case 5: pin = waterPump2Pin; break;
     case 6: pin = phUp2Pin; break;
     case 7: pin = phDown2Pin; break;
     case 8: pin = nutrientPump2Pin; break;
@@ -391,8 +424,18 @@ void publishCommandAck(const String& requestId, const String& status) {
   Database.set<String>(aClient, "/hydrodeck/commandAcks/" + requestId, status);
 }
 
+void publishCommandRejectionReason(const String& requestId, const String& reason) {
+  if (requestId.length() == 0 || !firebaseInitialized || !app.ready()) return;
+  Database.set<String>(
+    aClient,
+    "/hydrodeck/commandAckReasons/" + requestId,
+    reason
+  );
+}
+
 String pumpStartRejectionReason(int pumpNum) {
   if (pumpNum < 1 || pumpNum > 8) return "invalid_pump";
+  if (isRemoteWaterPump(pumpNum) && !rainNodeOnline) return "rain_node_offline";
   if (pumpRuns[pumpNum - 1].active) return "pump_already_active";
   if ((pumpNum == 1 && pumpRuns[4].active) || (pumpNum == 5 && pumpRuns[0].active)) {
     return "other_bed_water_pump_active";
@@ -429,11 +472,26 @@ bool startPumpRun(
   run.active = true;
   run.stopWhenFull = stopWhenFull;
   run.hasDeadline = durationMs > 0;
+  run.awaitingStartConfirmation = isRemoteWaterPump(pumpNum);
+  run.stopRequested = false;
+  run.manualShortRun = false;
+  run.durationMs = durationMs;
+  run.confirmationStartedAt = millis();
   run.stopAt = durationMs == 0 ? 0 : millis() + durationMs;
   activeCommandIds[pumpNum - 1] = requestId;
   setPump(pumpNum, true);
-  publishActuatorState(remoteActuatorNames[pumpNum - 1], true);
-  publishCommandAck(requestId, "running");
+  if (isRemoteWaterPump(pumpNum)) {
+    Serial.printf(
+      "Remote pump start requested pump=%s requestId=%s durationMs=%lu stopWhenFull=%d\n",
+      remoteActuatorNames[pumpNum - 1],
+      requestId.c_str(),
+      durationMs,
+      stopWhenFull ? 1 : 0
+    );
+  } else {
+    publishActuatorState(remoteActuatorNames[pumpNum - 1], true);
+    publishCommandAck(requestId, "running");
+  }
   return true;
 }
 
@@ -511,8 +569,79 @@ void serviceAutomaticPhControl(int bed, float phValue, unsigned long now) {
   }
 }
 
+void finishRemotePumpStop(int pumpNum) {
+  if (pumpNum != 1 && pumpNum != 5) return;
+  PumpRunState& run = pumpRuns[pumpNum - 1];
+  const String requestId = activeCommandIds[pumpNum - 1];
+  const String actuator = remoteActuatorNames[pumpNum - 1];
+  setPump(pumpNum, false);
+  activeCommandIds[pumpNum - 1] = "";
+  run = PumpRunState();
+  publishActuatorState(actuator, false);
+  publishCommandAck(requestId, "completed");
+  Serial.printf(
+    "Remote pump stopped pump=%s requestId=%s confirmed=1\n",
+    actuator.c_str(),
+    requestId.c_str()
+  );
+}
+
+void rejectUnconfirmedRemotePumpStart(int pumpNum) {
+  if (pumpNum != 1 && pumpNum != 5) return;
+  PumpRunState& run = pumpRuns[pumpNum - 1];
+  const String requestId = activeCommandIds[pumpNum - 1];
+  const String actuator = remoteActuatorNames[pumpNum - 1];
+  setPump(pumpNum, false);
+  activeCommandIds[pumpNum - 1] = "";
+  run = PumpRunState();
+  publishCommandRejectionReason(requestId, "rain_node_no_confirm");
+  publishCommandAck(requestId, "rejected");
+  Serial.printf(
+    "Remote pump rejected pump=%s requestId=%s reason=rain_node_no_confirm\n",
+    actuator.c_str(),
+    requestId.c_str()
+  );
+}
+
+void finishRemotePumpFault(int pumpNum, const String& reason) {
+  if ((pumpNum != 1 && pumpNum != 5) || !pumpRuns[pumpNum - 1].active) return;
+  PumpRunState& run = pumpRuns[pumpNum - 1];
+  const String requestId = activeCommandIds[pumpNum - 1];
+  const String actuator = remoteActuatorNames[pumpNum - 1];
+  const bool rejectedBeforeStart = run.awaitingStartConfirmation;
+  setPump(pumpNum, false);
+  activeCommandIds[pumpNum - 1] = "";
+  run = PumpRunState();
+  publishActuatorState(actuator, false);
+  publishCommandRejectionReason(requestId, reason);
+  publishCommandAck(requestId, rejectedBeforeStart ? "rejected" : "timed_out");
+  Serial.printf(
+    "Remote pump %s pump=%s requestId=%s reason=%s\n",
+    rejectedBeforeStart ? "rejected" : "stopped",
+    actuator.c_str(),
+    requestId.c_str(),
+    reason.c_str()
+  );
+}
+
+void requestRemotePumpStop(int pumpNum) {
+  PumpRunState& run = pumpRuns[pumpNum - 1];
+  setPump(pumpNum, false);
+  if (!run.active || run.stopRequested) return;
+  run.stopRequested = true;
+  Serial.printf(
+    "Remote pump stop requested pump=%s requestId=%s\n",
+    remoteActuatorNames[pumpNum - 1],
+    activeCommandIds[pumpNum - 1].c_str()
+  );
+}
+
 void stopPumpRun(int pumpNum) {
   if (pumpNum < 1 || pumpNum > 8) return;
+  if (isRemoteWaterPump(pumpNum)) {
+    requestRemotePumpStop(pumpNum);
+    return;
+  }
   PumpRunState& run = pumpRuns[pumpNum - 1];
   if (!run.active) return;
   setPump(pumpNum, false);
@@ -521,6 +650,10 @@ void stopPumpRun(int pumpNum) {
   run.active = false;
   run.stopWhenFull = false;
   run.hasDeadline = false;
+  run.awaitingStartConfirmation = false;
+  run.stopRequested = false;
+  run.manualShortRun = false;
+  run.durationMs = 0;
   run.stopAt = 0;
   publishActuatorState(remoteActuatorNames[pumpNum - 1], false);
   publishCommandAck(requestId, "completed");
@@ -560,8 +693,173 @@ bool executePumpRequest(const String& actuator, bool enforceManualRules, const S
     }
   }
   const bool started = startPumpRun(pumpNum, durationMs, stopWhenFull, requestId);
-  if (started && manualShortRunCounter != nullptr) (*manualShortRunCounter)++;
+  if (started && manualShortRunCounter != nullptr) {
+    if (isRemoteWaterPump(pumpNum)) {
+      pumpRuns[pumpNum - 1].manualShortRun = true;
+    } else {
+      (*manualShortRunCounter)++;
+    }
+  }
   return started;
+}
+
+void publishReportedRemotePumpState(int pumpNum, bool pumpIsOn, bool wasKnown) {
+  PumpRunState& run = pumpRuns[pumpNum - 1];
+  const String actuator = remoteActuatorNames[pumpNum - 1];
+  const bool changed = pumpNum == 1
+      ? (!wasKnown || rainPump1On != pumpIsOn)
+      : (!wasKnown || rainPump2On != pumpIsOn);
+  if (pumpNum == 1) {
+    rainPump1On = pumpIsOn;
+    rainPumpStateKnown1 = true;
+  } else {
+    rainPump2On = pumpIsOn;
+    rainPumpStateKnown2 = true;
+  }
+
+  if (run.active && run.awaitingStartConfirmation && pumpIsOn) {
+    run.awaitingStartConfirmation = false;
+    if (run.hasDeadline) run.stopAt = millis() + run.durationMs;
+    if (run.manualShortRun) {
+      if (pumpNum == 1) manualWaterShortRuns1++;
+      else manualWaterShortRuns2++;
+      run.manualShortRun = false;
+    }
+    publishCommandAck(activeCommandIds[pumpNum - 1], "running");
+    publishActuatorState(actuator, true);
+    Serial.printf(
+      "Remote pump confirmed pump=%s requestId=%s\n",
+      actuator.c_str(),
+      activeCommandIds[pumpNum - 1].c_str()
+    );
+    return;
+  }
+  if (run.active && run.stopRequested && !pumpIsOn) {
+    finishRemotePumpStop(pumpNum);
+    return;
+  }
+  if (changed) publishActuatorState(actuator, pumpIsOn);
+}
+
+void serviceRemotePumpFeedback(unsigned long now) {
+  for (const int pumpNum : {1, 5}) {
+    PumpRunState& run = pumpRuns[pumpNum - 1];
+    if (run.active && run.awaitingStartConfirmation &&
+        now - run.confirmationStartedAt >= RAIN_START_CONFIRM_TIMEOUT_MS) {
+      rejectUnconfirmedRemotePumpStart(pumpNum);
+    }
+  }
+}
+
+String reservoirLevelFromSensors(bool midWet, bool fullWet) {
+  if (fullWet && !midWet) return "unknown";
+  if (fullWet) return "full";
+  if (midWet) return "above_50";
+  return "50_or_below";
+}
+
+void serviceRainNodeHealth(unsigned long now) {
+  if (!rainNodeOnline || now - lastRainSeenAt <= RAIN_NODE_TIMEOUT_MS) return;
+  rainNodeOnline = false;
+  reservoirLevel = "unknown";
+  Serial.println("RAIN node offline");
+  for (const int pumpNum : {1, 5}) {
+    PumpRunState& run = pumpRuns[pumpNum - 1];
+    const bool wasOn = pumpNum == 1 ? rainPump1On : rainPump2On;
+    if (pumpNum == 1) rainPump1On = false;
+    else rainPump2On = false;
+    if (wasOn || (run.active && !run.awaitingStartConfirmation)) {
+      publishActuatorState(remoteActuatorNames[pumpNum - 1], false);
+    }
+    if (!run.active) continue;
+    if (run.awaitingStartConfirmation) {
+      rejectUnconfirmedRemotePumpStart(pumpNum);
+    } else {
+      finishRemotePumpStop(pumpNum);
+    }
+  }
+}
+
+void handleRainSync() {
+  if (!server.hasArg("token") || server.arg("token") != RAIN_TOKEN) {
+    server.send(403, "application/json", "{\"ok\":false}");
+    return;
+  }
+  for (const char* field : {"p1", "p2", "mid", "full", "up"}) {
+    if (!server.hasArg(field)) {
+      server.send(400, "application/json", "{\"ok\":false}");
+      return;
+    }
+  }
+  const String p1Value = server.arg("p1");
+  const String p2Value = server.arg("p2");
+  const String midValue = server.arg("mid");
+  const String fullValue = server.arg("full");
+  if ((p1Value != "0" && p1Value != "1") ||
+      (p2Value != "0" && p2Value != "1") ||
+      (midValue != "0" && midValue != "1") ||
+      (fullValue != "0" && fullValue != "1")) {
+    server.send(400, "application/json", "{\"ok\":false}");
+    return;
+  }
+
+  const unsigned long now = millis();
+  const bool wasOnline = rainNodeOnline;
+  const bool previousMid = reservoirMidWet;
+  const bool previousFull = reservoirFullWet;
+  const String previousLevel = reservoirLevel;
+  const bool previousPump1Known = rainPumpStateKnown1;
+  const bool previousPump2Known = rainPumpStateKnown2;
+  rainNodeOnline = true;
+  lastRainSeenAt = now;
+  reservoirMidWet = midValue == "1";
+  reservoirFullWet = fullValue == "1";
+  reservoirLevel = reservoirLevelFromSensors(reservoirMidWet, reservoirFullWet);
+  rainFaultCode = server.hasArg("fault") ? server.arg("fault") : "";
+  if (!wasOnline) Serial.println("RAIN node online");
+  if (previousLevel != reservoirLevel || previousMid != reservoirMidWet ||
+      previousFull != reservoirFullWet) {
+    Serial.printf(
+      "Reservoir level changed level=%s mid=%d full=%d\n",
+      reservoirLevel.c_str(),
+      reservoirMidWet ? 1 : 0,
+      reservoirFullWet ? 1 : 0
+    );
+  }
+  if (rainFaultCode.length() > 0) {
+    Serial.printf("RAIN node fault=%s\n", rainFaultCode.c_str());
+  }
+  if (rainFaultCode == "max_run" || rainFaultCode == "reservoir_low") {
+    if (p1Value == "0") finishRemotePumpFault(1, rainFaultCode);
+    if (p2Value == "0") finishRemotePumpFault(5, rainFaultCode);
+  }
+  publishReportedRemotePumpState(1, p1Value == "1", previousPump1Known);
+  publishReportedRemotePumpState(5, p2Value == "1", previousPump2Known);
+
+  const unsigned long remaining1 = pumpRuns[0].active &&
+          pumpRuns[0].hasDeadline && rainDesiredPump1On &&
+          (long)(now - pumpRuns[0].stopAt) < 0
+      ? pumpRuns[0].stopAt - now
+      : 0;
+  const unsigned long remaining2 = pumpRuns[4].active &&
+          pumpRuns[4].hasDeadline && rainDesiredPump2On &&
+          (long)(now - pumpRuns[4].stopAt) < 0
+      ? pumpRuns[4].stopAt - now
+      : 0;
+  StaticJsonDocument<512> response;
+  response["ok"] = true;
+  JsonObject pump1 = response.createNestedObject("p1");
+  pump1["on"] = rainDesiredPump1On;
+  pump1["id"] = activeCommandIds[0];
+  pump1["remainingMs"] = remaining1;
+  JsonObject pump2 = response.createNestedObject("p2");
+  pump2["on"] = rainDesiredPump2On;
+  pump2["id"] = activeCommandIds[4];
+  pump2["remainingMs"] = remaining2;
+  response["maxRunMs"] = RAIN_MAX_RUN_MS;
+  String responseJson;
+  serializeJson(response, responseJson);
+  server.send(200, "application/json", responseJson);
 }
 
 void servicePumpRuns() {
@@ -569,6 +867,7 @@ void servicePumpRuns() {
   for (int pumpNum = 1; pumpNum <= 8; pumpNum++) {
     PumpRunState& run = pumpRuns[pumpNum - 1];
     if (!run.active) continue;
+    if (isRemoteWaterPump(pumpNum) && run.stopRequested) continue;
     if (run.stopWhenFull && waterSensorFullForPump(pumpNum)) {
       stopPumpRun(pumpNum);
     } else if (run.hasDeadline && (long)(now - run.stopAt) >= 0) {
@@ -603,13 +902,19 @@ void finishRemoteCommand(const String& previousStatus) {
 
   if (previousStatus.length() > 0) {
     bool commandIsRunning = false;
+    bool commandAwaitingRemoteStart = false;
     for (int index = 0; index < 8; index++) {
-      if (activeCommandIds[index] == requestId) commandIsRunning = true;
+      if (activeCommandIds[index] == requestId) {
+        commandIsRunning = true;
+        commandAwaitingRemoteStart = pumpRuns[index].awaitingStartConfirmation;
+      }
     }
     if (commandIsRunning) {
-      publishCommandAck(requestId, "running");
+      if (!commandAwaitingRemoteStart) publishCommandAck(requestId, "running");
     } else {
-      publishCommandAck(requestId, "completed");
+      const bool wasTerminal = previousStatus == "completed" ||
+          previousStatus == "rejected" || previousStatus == "timed_out";
+      publishCommandAck(requestId, wasTerminal ? previousStatus : "completed");
     }
     Serial.printf(
       "Command requestId=%s actuator=%s result=%s duplicate=1 leftover_id_removed=1\n",
@@ -647,6 +952,10 @@ void finishRemoteCommand(const String& previousStatus) {
             ? "invalid_value"
             : pumpStartRejectionReason(pumpNum);
         if (rejectionReason.length() == 0) rejectionReason = "threshold_or_manual_safety";
+        if (rejectionReason == "rain_node_offline" ||
+            rejectionReason == "rain_node_no_confirm") {
+          publishCommandRejectionReason(requestId, rejectionReason);
+        }
         publishCommandAck(requestId, "rejected");
       }
       Serial.printf(
@@ -870,11 +1179,15 @@ void processIntervalSnapshotCheck(AsyncResult& result) {
   snapshotJson += "\"bed1\":{\"temp\":" + String(currentTemperature1, 1) + ",";
   snapshotJson += "\"ph\":" + String(currentPhValue1, 2) + ",";
   snapshotJson += "\"tds\":" + String(currentTdsValue1, 0) + ",";
-  snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\"},";
+  snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\",";
+  snapshotJson += "\"reservoir\":\"" + reservoirLevel + "\",";
+  snapshotJson += "\"rainNodeOnline\":" + String(rainNodeOnline ? "true" : "false") + "},";
   snapshotJson += "\"bed2\":{\"temp\":" + String(currentTemperature2, 1) + ",";
   snapshotJson += "\"ph\":" + String(currentPhValue2, 2) + ",";
   snapshotJson += "\"tds\":" + String(currentTdsValue2, 0) + ",";
-  snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\"}}";
+  snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\",";
+  snapshotJson += "\"reservoir\":\"" + reservoirLevel + "\",";
+  snapshotJson += "\"rainNodeOnline\":" + String(rainNodeOnline ? "true" : "false") + "}}";
 
   snapshotWritePending = true;
   Database.set<object_t>(
@@ -963,6 +1276,10 @@ void handleSettings() {
 
 void handleCombinedStatus() {
   String json = "{";
+  json += "\"reservoir\":\"" + reservoirLevel + "\",";
+  json += "\"reservoirMid\":" + String(reservoirMidWet ? 1 : 0) + ",";
+  json += "\"reservoirFull\":" + String(reservoirFullWet ? 1 : 0) + ",";
+  json += "\"rainNodeOnline\":" + String(rainNodeOnline ? "true" : "false") + ",";
   json += "\"water1\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\",";
   json += "\"temp1\":" + String(currentTemperature1, 1) + ",";
   json += "\"ph1\":" + String(currentPhValue1, 2) + ",";
@@ -974,11 +1291,11 @@ void handleCombinedStatus() {
   json += "\"nutrient1\":" + String(digitalRead(nutrientPump1Pin) == PUMP_ON ? 1 : 0) + ",";
   json += "\"phUp1\":" + String(digitalRead(phUp1Pin) == PUMP_ON ? 1 : 0) + ",";
   json += "\"phDown1\":" + String(digitalRead(phDown1Pin) == PUMP_ON ? 1 : 0) + ",";
-  json += "\"waterPump1\":" + String(digitalRead(waterPump1Pin) == PUMP_ON ? 1 : 0) + ",";
+  json += "\"waterPump1\":" + String(rainPump1On ? 1 : 0) + ",";
   json += "\"nutrient2\":" + String(digitalRead(nutrientPump2Pin) == PUMP_ON ? 1 : 0) + ",";
   json += "\"phUp2\":" + String(digitalRead(phUp2Pin) == PUMP_ON ? 1 : 0) + ",";
   json += "\"phDown2\":" + String(digitalRead(phDown2Pin) == PUMP_ON ? 1 : 0) + ",";
-  json += "\"waterPump2\":" + String(digitalRead(waterPump2Pin) == PUMP_ON ? 1 : 0) + ",";
+  json += "\"waterPump2\":" + String(rainPump2On ? 1 : 0) + ",";
   json += "\"growLight\":" + String(digitalRead(growLightPin) == LIGHT_ON ? 1 : 0) + ",";
   json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
   json += "\"firebaseReady\":" + String(firebaseInitialized && app.ready() ? "true" : "false");
@@ -1059,10 +1376,17 @@ void handleControl() {
         server.send(200, "text/plain", "Duplicate request ignored");
         return;
       }
-      if (requestId.length() > 0) rememberConsumedCommand(requestId);
+      if (requestId.length() > 0) publishCommandAck(requestId, "accepted");
       if (!executePumpRequest(actuator, true, requestId)) {
+        String rejectionReason = pumpStartRejectionReason(pumpNum);
+        if (rejectionReason == "rain_node_offline" ||
+            rejectionReason == "rain_node_no_confirm") {
+          publishCommandRejectionReason(requestId, rejectionReason);
+        }
         publishCommandAck(requestId, "rejected");
-        server.send(409, "text/plain", "Pump busy, threshold blocked, or water safety limit reached");
+        server.send(409, "text/plain", rejectionReason.length() > 0
+            ? rejectionReason
+            : "threshold_or_manual_safety");
         return;
       }
       server.send(200, "text/plain", "OK");
@@ -1126,11 +1450,9 @@ void setup() {
   Serial.begin(115200);
 
   // Initialize Actuators (Default OFF)
-  configureSafeOutput(waterPump1Pin, PUMP_OFF);
   configureSafeOutput(phUp1Pin, PUMP_OFF);
   configureSafeOutput(phDown1Pin, PUMP_OFF);
   configureSafeOutput(nutrientPump1Pin, PUMP_OFF);
-  configureSafeOutput(waterPump2Pin, PUMP_OFF);
   configureSafeOutput(phUp2Pin, PUMP_OFF);
   configureSafeOutput(phDown2Pin, PUMP_OFF);
   configureSafeOutput(nutrientPump2Pin, PUMP_OFF);
@@ -1192,6 +1514,7 @@ void setup() {
   server.on("/provision", HTTP_GET, handleProvision);
   server.on("/settings", HTTP_GET, handleSettings);
   server.on("/status", HTTP_GET, handleCombinedStatus);
+  server.on("/rain/sync", HTTP_GET, handleRainSync);
   server.on("/control", HTTP_GET, handleControl); // Control via URL e.g. /control?actuator=phUp1&state=1 OR /control?command=PH_ADJUST:1:UP
   server.begin();
 }
@@ -1200,6 +1523,8 @@ void loop() {
   app.loop();
   server.handleClient();
   unsigned long now = millis();
+  serviceRainNodeHealth(now);
+  serviceRemotePumpFeedback(now);
 
   maintainProvisioningHotspot();
   if (WiFi.status() == WL_CONNECTED && !mdnsStarted) {
@@ -1335,7 +1660,19 @@ void loop() {
     manualWaterShortRuns1 = 0;
     if (waterLowSince1 == 0) waterLowSince1 = now;
     if (now - waterLowSince1 >= waterAutoDelay && !pumpRuns[0].active) {
-      startPumpRun(1, 0, true);
+      if (rainNodeOnline) {
+        String rejectionReason;
+        if (!startPumpRun(1, 0, true, "", &rejectionReason) &&
+            (lastAutoRefillOfflineLogAt == 0 ||
+             now - lastAutoRefillOfflineLogAt >= phAutoRetryLogInterval)) {
+          Serial.printf("Auto refill rejected pump=waterPump1 reason=%s\n", rejectionReason.c_str());
+          lastAutoRefillOfflineLogAt = now;
+        }
+      } else if (lastAutoRefillOfflineLogAt == 0 ||
+                 now - lastAutoRefillOfflineLogAt >= phAutoRetryLogInterval) {
+        Serial.println("Auto refill skipped reason=rain_node_offline");
+        lastAutoRefillOfflineLogAt = now;
+      }
     }
   }
   if (waterFull2) {
@@ -1344,7 +1681,19 @@ void loop() {
     manualWaterShortRuns2 = 0;
     if (waterLowSince2 == 0) waterLowSince2 = now;
     if (now - waterLowSince2 >= waterAutoDelay && !pumpRuns[4].active) {
-      startPumpRun(5, 0, true);
+      if (rainNodeOnline) {
+        String rejectionReason;
+        if (!startPumpRun(5, 0, true, "", &rejectionReason) &&
+            (lastAutoRefillOfflineLogAt == 0 ||
+             now - lastAutoRefillOfflineLogAt >= phAutoRetryLogInterval)) {
+          Serial.printf("Auto refill rejected pump=waterPump2 reason=%s\n", rejectionReason.c_str());
+          lastAutoRefillOfflineLogAt = now;
+        }
+      } else if (lastAutoRefillOfflineLogAt == 0 ||
+                 now - lastAutoRefillOfflineLogAt >= phAutoRetryLogInterval) {
+        Serial.println("Auto refill skipped reason=rain_node_offline");
+        lastAutoRefillOfflineLogAt = now;
+      }
     }
   }
 
@@ -1387,15 +1736,19 @@ void loop() {
     liveTelemetryJson += "\"temp2\":" + String(currentTemperature2, 1) + ",";
     liveTelemetryJson += "\"water2\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\",";
     liveTelemetryJson += "\"actuators\":{";
-    liveTelemetryJson += "\"waterPump1\":" + String(digitalRead(waterPump1Pin) == PUMP_ON ? "true" : "false") + ",";
+    liveTelemetryJson += "\"waterPump1\":" + String(rainPump1On ? "true" : "false") + ",";
     liveTelemetryJson += "\"phUp1\":" + String(digitalRead(phUp1Pin) == PUMP_ON ? "true" : "false") + ",";
     liveTelemetryJson += "\"phDown1\":" + String(digitalRead(phDown1Pin) == PUMP_ON ? "true" : "false") + ",";
     liveTelemetryJson += "\"nutrient1\":" + String(digitalRead(nutrientPump1Pin) == PUMP_ON ? "true" : "false") + ",";
-    liveTelemetryJson += "\"waterPump2\":" + String(digitalRead(waterPump2Pin) == PUMP_ON ? "true" : "false") + ",";
+    liveTelemetryJson += "\"waterPump2\":" + String(rainPump2On ? "true" : "false") + ",";
     liveTelemetryJson += "\"phUp2\":" + String(digitalRead(phUp2Pin) == PUMP_ON ? "true" : "false") + ",";
     liveTelemetryJson += "\"phDown2\":" + String(digitalRead(phDown2Pin) == PUMP_ON ? "true" : "false") + ",";
     liveTelemetryJson += "\"nutrient2\":" + String(digitalRead(nutrientPump2Pin) == PUMP_ON ? "true" : "false") + ",";
     liveTelemetryJson += "\"growLight\":" + String(digitalRead(growLightPin) == LIGHT_ON ? "true" : "false") + "},";
+    liveTelemetryJson += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"mid\":" +
+      String(reservoirMidWet ? "true" : "false") + ",\"full\":" +
+      String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
+      String(rainNodeOnline ? "true" : "false") + "},";
     liveTelemetryJson += "\"wifiConnected\":true,";
     liveTelemetryJson += "\"firebaseReady\":true";
     liveTelemetryJson += "}";

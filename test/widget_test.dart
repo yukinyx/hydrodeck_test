@@ -32,7 +32,79 @@ void main() {
     expect(telemetry.actuatorStates['nutrient2'], isTrue);
   });
 
-  testWidgets('active planting session offers continue instead of start', (WidgetTester tester) async {
+  test(
+    'grow bed reservoir fields round-trip and default for older records',
+    () {
+      final current = GrowBedReading.fromMap({
+        'temp': 24.5,
+        'ph': 6.2,
+        'tds': 700,
+        'water': 'full',
+        'reservoir': 'above_50',
+        'rainNodeOnline': true,
+      });
+      expect(current.toMap()['reservoir'], 'above_50');
+      expect(current.toMap()['rainNodeOnline'], isTrue);
+
+      final legacy = GrowBedReading.fromMap({'temp': 24.5, 'ph': 6.2});
+      expect(legacy.reservoir, 'unknown');
+      expect(legacy.rainNodeOnline, isFalse);
+      expect(legacy.toMap()['reservoir'], 'unknown');
+    },
+  );
+
+  test('scheduled cloud snapshots retain reservoir fields for both beds', () {
+    const bed = GrowBedReading(
+      temperature: 24.5,
+      ph: 6.2,
+      tds: 700,
+      waterFull: true,
+      reservoir: 'full',
+      rainNodeOnline: true,
+    );
+    final snapshot = buildScheduledSnapshot(
+      batchNumber: 3,
+      at: DateTime.utc(2026, 10, 20, 2, 30),
+      bed1: bed,
+      bed2: bed,
+    );
+    final cloudMap = snapshot.toCloudMap();
+    expect((cloudMap['bed1'] as Map)['reservoir'], 'full');
+    expect((cloudMap['bed2'] as Map)['rainNodeOnline'], isTrue);
+  });
+
+  test(
+    'telemetry shares reservoir data across both beds and accepts legacy data',
+    () {
+      final current = HydrodeckTelemetry.fromJson({
+        'reservoir': {
+          'level': 'full',
+          'mid': true,
+          'full': true,
+          'online': true,
+        },
+      });
+      expect(current.bed1.reservoir, 'full');
+      expect(current.bed2.reservoir, 'full');
+      expect(current.bed1.rainNodeOnline, isTrue);
+      expect(current.bed2.rainNodeOnline, isTrue);
+
+      final localStatus = HydrodeckTelemetry.fromJson({
+        'reservoir': 'above_50',
+        'rainNodeOnline': true,
+      });
+      expect(localStatus.bed1.reservoir, 'above_50');
+      expect(localStatus.bed2.rainNodeOnline, isTrue);
+
+      final legacy = HydrodeckTelemetry.fromJson({'ph1': 6.2, 'ph2': 6.4});
+      expect(legacy.bed1.reservoir, 'unknown');
+      expect(legacy.bed2.rainNodeOnline, isFalse);
+    },
+  );
+
+  testWidgets('active planting session offers continue instead of start', (
+    WidgetTester tester,
+  ) async {
     var started = false;
     var continued = false;
     await tester.pumpWidget(
@@ -56,7 +128,9 @@ void main() {
     expect(started, isFalse);
   });
 
-  testWidgets('dashboard shows the dual-bed controls layout', (WidgetTester tester) async {
+  testWidgets('dashboard shows the dual-bed controls layout', (
+    WidgetTester tester,
+  ) async {
     await tester.pumpWidget(
       MaterialApp(
         home: HydroponicsDashboard(
@@ -72,6 +146,7 @@ void main() {
     expect(find.text('Home'), findsOneWidget);
     expect(find.text('Grow Bed 1 Metrics'), findsOneWidget);
     expect(find.text('Grow Bed 2 Metrics'), findsOneWidget);
+    expect(find.text('RESERVOIR'), findsNWidgets(2));
 
     await tester.tap(find.text('CONTROLS'));
     await tester.pumpAndSettle();
@@ -81,6 +156,7 @@ void main() {
     expect(find.text('WATER PUMP'), findsOneWidget);
     expect(find.text('NUTRIENT SOLUTION'), findsOneWidget);
     expect(find.text('GROW LIGHT'), findsOneWidget);
+    expect(find.text('Rainwater unit offline'), findsNWidgets(2));
 
     final growLightButton = find.byKey(const ValueKey('grow-light-button'));
     expect(growLightButton, findsOneWidget);
@@ -88,7 +164,10 @@ void main() {
 
     await tester.tap(find.text('DATA'));
     await tester.pumpAndSettle();
-    expect(find.text('Saved ESP32 snapshots (every 30 minutes, Manila time):'), findsOneWidget);
+    expect(
+      find.text('Saved ESP32 snapshots (every 30 minutes, Manila time):'),
+      findsOneWidget,
+    );
 
     await tester.tap(find.text('SETTINGS'));
     await tester.pumpAndSettle();

@@ -1,5 +1,6 @@
 /// Firmware-aligned pump policy used by tests and documentation.
-/// The ESP32 is the only place that times and drives relays.
+/// The MAIN ESP32 owns pump timing and coordinates the RAIN node, which drives
+/// the water relays and enforces local failsafes.
 const int growBed1PumpDurationMs = 3000;
 const int growBed2PumpDurationMs = 5000;
 
@@ -82,9 +83,21 @@ PumpRunDecision decidePumpCommand({
   required String activeRequestId,
   required bool bedIsFull,
   required bool isWaterPump,
+  required bool rainNodeOnline,
   Set<String> activeActuators = const {},
 }) {
   if (!validRemoteActuators.contains(actuator) || actuator == 'growLight') {
+    return const PumpRunDecision(
+      start: false,
+      reject: true,
+      alreadyRunningSameCommand: false,
+      status: 'rejected',
+      durationMs: 0,
+      stopWhenFull: false,
+    );
+  }
+  if ((actuator == 'waterPump1' || actuator == 'waterPump2') &&
+      !rainNodeOnline) {
     return const PumpRunDecision(
       start: false,
       reject: true,

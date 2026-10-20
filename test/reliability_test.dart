@@ -102,6 +102,7 @@ void main() {
         activeRequestId: '',
         bedIsFull: false,
         isWaterPump: true,
+        rainNodeOnline: true,
       );
       expect(refill.start, isTrue);
       expect(refill.durationMs, 0);
@@ -116,6 +117,7 @@ void main() {
         activeRequestId: 'cmd_same',
         bedIsFull: true,
         isWaterPump: false,
+        rainNodeOnline: true,
       );
       expect(duplicate.start, isFalse);
       expect(duplicate.alreadyRunningSameCommand, isTrue);
@@ -128,6 +130,7 @@ void main() {
         activeRequestId: 'cmd_same',
         bedIsFull: true,
         isWaterPump: false,
+        rainNodeOnline: true,
       );
       expect(conflicting.reject, isTrue);
       expect(conflicting.status, 'rejected');
@@ -141,14 +144,35 @@ void main() {
         activeRequestId: '',
         bedIsFull: true,
         isWaterPump: true,
+        rainNodeOnline: true,
         activeActuators: {'phUp1'},
       );
 
       expect(water.start, isTrue);
       expect(water.durationMs, growBed2PumpDurationMs);
-      expect(canStartActuatorAlongside('growLight', {'phUp1', 'waterPump2'}), isTrue);
+      expect(
+        canStartActuatorAlongside('growLight', {'phUp1', 'waterPump2'}),
+        isTrue,
+      );
       expect(canStartActuatorAlongside('waterPump1', {'waterPump2'}), isFalse);
       expect(canStartActuatorAlongside('phDown1', {'phUp1'}), isFalse);
+    });
+
+    test('rejects either water pump while the RAIN node is offline', () {
+      for (final actuator in ['waterPump1', 'waterPump2']) {
+        final decision = decidePumpCommand(
+          actuator: actuator,
+          requestId: 'cmd_offline_$actuator',
+          pumpActive: false,
+          activeRequestId: '',
+          bedIsFull: true,
+          isWaterPump: true,
+          rainNodeOnline: false,
+        );
+        expect(decision.start, isFalse);
+        expect(decision.reject, isTrue);
+        expect(decision.status, 'rejected');
+      }
     });
 
     test('pump deadline comparison survives millis rollover', () {
