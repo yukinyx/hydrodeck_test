@@ -7352,10 +7352,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                               color: Colors.black87,
                             ),
                           ),
-                          subtitle: Text(
-                            'Reservoir ${reservoirLabel(log.reservoir.level)}',
-                            style: const TextStyle(fontSize: 11),
-                          ),
                           trailing: const Icon(
                             Icons.chevron_right,
                             color: Colors.grey,
