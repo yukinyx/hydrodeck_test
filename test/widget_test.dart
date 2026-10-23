@@ -44,12 +44,12 @@ void main() {
     expect(telemetry.firebaseReady, isFalse);
     expect(telemetry.firebaseHeartbeatFresh, isTrue);
     expect(telemetry.reservoir.online, isFalse);
-    expect(telemetry.reservoir.level, 'unknown');
+    expect(telemetry.reservoir.level, 'not_full');
     expect(
       ReservoirReading.fromSources(
         shared: {'level': 'full', 'online': false},
       ).level,
-      'unknown',
+      'full',
     );
   });
 
@@ -110,13 +110,11 @@ void main() {
     final currentOffline = ReservoirReading.fromSources(
       shared: {'level': 'full', 'online': false},
     );
-    expect(currentOffline.level, 'unknown');
+    expect(currentOffline.level, 'full');
     expect(reservoirLabel('full'), 'Full');
     expect(reservoirLabel('not_full'), 'Not full');
-    expect(reservoirLabel('unknown'), 'Unknown');
     expect(reservoirColor('full'), Colors.green.shade800);
     expect(reservoirColor('not_full'), Colors.orange);
-    expect(reservoirColor('unknown'), Colors.grey);
   });
 
   test('scheduled cloud snapshots retain reservoir fields for both beds', () {
@@ -146,7 +144,6 @@ void main() {
       final current = HydrodeckTelemetry.fromJson({
         'reservoir': {
           'level': 'full',
-          'mid': true,
           'full': true,
           'online': true,
         },
@@ -216,6 +213,7 @@ void main() {
     expect(find.text('Grow Bed 1 Metrics'), findsOneWidget);
     expect(find.text('Grow Bed 2 Metrics'), findsOneWidget);
     expect(find.text('RESERVOIR'), findsOneWidget);
+    expect(find.text('RAIN offline'), findsOneWidget);
     expect(
       tester.getTopLeft(find.text('RESERVOIR')).dy,
       greaterThan(tester.getTopLeft(find.text('Grow Bed 2 Metrics')).dy),
@@ -278,6 +276,7 @@ void main() {
     );
 
     expect(find.text('RESERVOIR'), findsOneWidget);
+    expect(find.text('RAIN online'), findsOneWidget);
     expect(find.text('Grow Bed 1 (Historical Metrics)'), findsOneWidget);
     expect(find.text('Grow Bed 2 (Historical Metrics)'), findsOneWidget);
     expect(

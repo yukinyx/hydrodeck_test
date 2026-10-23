@@ -699,12 +699,10 @@ class ReservoirReading {
   final String level;
   final bool online;
 
-  const ReservoirReading({this.level = 'unknown', this.online = false});
-
-  static const unknown = ReservoirReading();
+  const ReservoirReading({this.level = 'not_full', this.online = false});
 
   Map<String, dynamic> toMap() => {
-    'level': online ? normalizeReservoirLevel(level) : 'unknown',
+    'level': normalizeReservoirLevel(level),
     'online': online,
   };
 
@@ -751,17 +749,9 @@ class ReservoirReading {
       legacyBed1?['rainNodeOnline'] ?? legacyBed2?['rainNodeOnline'],
     );
 
-    final resolvedOnline = sharedOnline ?? legacyOnline;
-    final rawLevel = sharedLevel ?? legacyLevel;
-    final normalizedLevel = normalizeReservoirLevel(rawLevel);
-    final isLegacyLevel = const {'above_50', '50_or_below'}.contains(
-      rawLevel?.toString().trim().toLowerCase(),
-    );
     return ReservoirReading(
-      level: resolvedOnline == false && !isLegacyLevel
-          ? 'unknown'
-          : normalizedLevel,
-      online: resolvedOnline ?? false,
+      level: normalizeReservoirLevel(sharedLevel ?? legacyLevel),
+      online: sharedOnline ?? legacyOnline ?? false,
     );
   }
 }
@@ -771,7 +761,7 @@ String normalizeReservoirLevel(dynamic value) => switch (
 ) {
   'full' => 'full',
   'not_full' || 'above_50' || '50_or_below' => 'not_full',
-  _ => 'unknown',
+  _ => 'not_full',
 };
 
 class GrowBedReading {
@@ -829,14 +819,12 @@ class GrowBedReading {
 
 String reservoirLabel(String level) => switch (normalizeReservoirLevel(level)) {
   'full' => 'Full',
-  'not_full' => 'Not full',
-  _ => 'Unknown',
+  _ => 'Not full',
 };
 
 Color reservoirColor(String level) => switch (normalizeReservoirLevel(level)) {
   'full' => const Color(0xFF2E7D32),
-  'not_full' => Colors.orange,
-  _ => Colors.grey,
+  _ => Colors.orange,
 };
 
 String dashboardConnectionStatus({
@@ -861,7 +849,7 @@ class HydrodeckTelemetry {
   const HydrodeckTelemetry({
     required this.bed1,
     required this.bed2,
-    this.reservoir = ReservoirReading.unknown,
+    this.reservoir = const ReservoirReading(),
     this.wifiConnected,
     this.firebaseReady,
     this.firebaseHeartbeatFresh,
@@ -1086,7 +1074,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   bool lastGrowLight = false;
   GrowBedReading lastBed1 = GrowBedReading.empty();
   GrowBedReading lastBed2 = GrowBedReading.empty();
-  ReservoirReading lastReservoir = ReservoirReading.unknown;
+  ReservoirReading lastReservoir = const ReservoirReading();
 
   bool isAppClosed = false;
   bool isPlantingActive = false;
@@ -2975,7 +2963,7 @@ class HistoricalData {
     this.batchNumber,
     this.bed1,
     this.bed2,
-    this.reservoir = ReservoirReading.unknown,
+    this.reservoir = const ReservoirReading(),
     this.intervalKey,
     this.recordType = scheduledSnapshotRecordType,
     this.recordId,
@@ -3312,7 +3300,7 @@ HistoricalData buildScheduledSnapshot({
   required DateTime at,
   required GrowBedReading bed1,
   required GrowBedReading bed2,
-  ReservoirReading reservoir = ReservoirReading.unknown,
+  ReservoirReading reservoir = const ReservoirReading(),
   String source = 'app',
 }) {
   final intervalKey = manilaIntervalKey(at);
@@ -4776,7 +4764,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   GrowBedReading _bed1 = GrowBedReading.empty();
   GrowBedReading _bed2 = GrowBedReading.empty();
-  ReservoirReading _reservoir = ReservoirReading.unknown;
+  ReservoirReading _reservoir = const ReservoirReading();
   final Map<String, bool> _controlStates = {
     'bed1_water': false,
     'bed1_ph_up': false,
@@ -6805,13 +6793,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           _buildCleanCard(
             'RESERVOIR',
             reservoirLabel(_reservoir.level),
-            '',
-            switch (normalizeReservoirLevel(_reservoir.level)) {
-              'full' => const Color(0xFFE8F7ED),
-              'not_full' => const Color(0xFFFFF3E0),
-              _ => const Color(0xFFF0F0F0),
-            },
-            reservoirColor(_reservoir.level),
+            _reservoir.online ? 'RAIN online' : 'RAIN offline',
+            _reservoir.online
+                ? const Color(0xFFE8F7ED)
+                : const Color(0xFFFFF3E0),
+            _reservoir.online ? Colors.green.shade800 : Colors.orange,
           ),
         ],
       ),
@@ -7837,15 +7823,13 @@ class SnapshotDetailScreen extends StatelessWidget {
             _buildStaticCard(
               'RESERVOIR',
               reservoirLabel(data.reservoir.level),
-              '',
-                bgOverride: switch (
-                  normalizeReservoirLevel(data.reservoir.level)
-                ) {
-                  'full' => const Color(0xFFE8F7ED),
-                  'not_full' => const Color(0xFFFFF3E0),
-                  _ => const Color(0xFFF0F0F0),
-                },
-                textOverride: reservoirColor(data.reservoir.level),
+              data.reservoir.online ? 'RAIN online' : 'RAIN offline',
+              bgOverride: data.reservoir.online
+                  ? const Color(0xFFE8F7ED)
+                  : const Color(0xFFFFF3E0),
+              textOverride: data.reservoir.online
+                  ? Colors.green.shade800
+                  : Colors.orange,
             ),
           ],
         ),

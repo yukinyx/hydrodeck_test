@@ -44,9 +44,9 @@ const unsigned long RAIN_NODE_TIMEOUT_MS = 3000UL;
 const unsigned long RAIN_START_CONFIRM_TIMEOUT_MS = 3000UL;
 const unsigned long RAIN_MAX_RUN_MS = 300000UL;
 const unsigned long RAIN_COMMAND_RETRY_MS = 250UL;
-const unsigned long RAIN_BEACON_INTERVAL_MS = 500UL;
+const unsigned long RAIN_BEACON_INTERVAL_MS = 1000UL;
 const uint16_t ESPNOW_MAGIC = 0x4859;
-const uint8_t ESPNOW_VERSION = 1;
+const uint8_t ESPNOW_VERSION = 2;
 const uint8_t DEVICE_MAIN = 1;
 const uint8_t DEVICE_RAIN = 2;
 const uint8_t MSG_RAIN_HELLO = 1;
@@ -85,7 +85,6 @@ struct RainStatusPacket {
   uint32_t uptimeMs;
   uint32_t activeCommandId;
   uint8_t currentChannel;
-  uint8_t midWet;
   uint8_t fullWet;
   uint8_t pumpMask;
   uint8_t activePump;
@@ -215,7 +214,7 @@ const char* remoteActuatorNames[] = {
   "waterPump2", "phUp2", "phDown2", "nutrient2", "growLight"
 };
 // Pump requests are one-shot values under /commands; actual state is reported separately.
-const unsigned long remoteCommandInterval = 100;
+const unsigned long remoteCommandInterval = 500;
 unsigned long lastRemoteCommandPoll = 0;
 bool remoteCommandPending = false;
 unsigned int pendingCommandCleanupWrites = 0;
@@ -245,7 +244,7 @@ String pendingIntervalSnapshotKey;
 String pendingIntervalSnapshotIdentity;
 String pendingIntervalSnapshotPath;
 String activeCommandIds[8];
-const unsigned long firebaseHeartbeatInterval = 2000;
+const unsigned long firebaseHeartbeatInterval = 5000;
 OneWire oneWire1(DS18B20_PIN1);
 DallasTemperature sensors1(&oneWire1);
 
@@ -272,6 +271,7 @@ unsigned long lastTempCheck = 0;
 unsigned long lastPhCheck = 0;
 unsigned long lastFirebasePush = 0;
 unsigned long lastFirebaseHeartbeat = 0;
+String lastFirebaseTelemetryJson;
 const unsigned long firebaseInterval = 5000;
 const unsigned long tempInterval = 1000;
 const unsigned long phInterval = 1000;
@@ -285,9 +285,8 @@ bool rainPump1On = false;
 bool rainPump2On = false;
 bool rainPumpStateKnown1 = false;
 bool rainPumpStateKnown2 = false;
-bool reservoirMidWet = false;
 bool reservoirFullWet = false;
-String reservoirLevel = "unknown";
+String reservoirLevel = "not_full";
 String rainFaultCode;
 unsigned long lastRainSeenAt = 0;
 bool rainDesiredPump1On = false;
@@ -844,6 +843,13 @@ void finishRemotePumpStop(int pumpNum) {
   const String stopRequestId = pendingRemoteStopCommandIds[index];
   const String actuator = remoteActuatorNames[pumpNum - 1];
   setPump(pumpNum, false);
+  if (index == 0) {
+    rainPump1On = false;
+    rainPumpStateKnown1 = true;
+  } else {
+    rainPump2On = false;
+    rainPumpStateKnown2 = true;
+  }
   activeCommandIds[pumpNum - 1] = "";
   run = PumpRunState();
   publishActuatorState(actuator, false);
@@ -1037,7 +1043,6 @@ void serviceRainNodeHealth(unsigned long now) {
   }
   if (now - lastRainSeenAt <= RAIN_NODE_TIMEOUT_MS) return;
   rainNodeOnline = false;
-  reservoirLevel = "unknown";
   Serial.println("RAIN node offline");
   for (const int pumpNum : {1, 5}) {
     PumpRunState& run = pumpRuns[pumpNum - 1];
@@ -1148,7 +1153,7 @@ void processRainStatus(const ReceivedPacket& received,
       (report.pumpMask == 0 && report.activePump == 0) ||
       (report.pumpMask == 1 && report.activePump == PUMP1_ID) ||
       (report.pumpMask == 2 && report.activePump == PUMP2_ID);
-  if (report.bootId == 0 || report.midWet > 1 || report.fullWet > 1 ||
+  if (report.bootId == 0 || report.fullWet > 1 ||
       !pumpMaskValid || !activePumpValid || report.fault > FAULT_INVALID_COMMAND ||
       report.currentChannel < 1 || report.currentChannel > 13 ||
       (report.pumpMask == 0 && report.activeCommandId != 0) ||
@@ -1190,7 +1195,6 @@ void processRainStatus(const ReceivedPacket& received,
 
   const bool wasOnline = rainNodeOnline;
   const String oldLevel = reservoirLevel;
-  const bool previousMid = reservoirMidWet;
   const bool previousFull = reservoirFullWet;
   const bool previousPump1Known = rainPumpStateKnown1;
   const bool previousPump2Known = rainPumpStateKnown2;
@@ -1200,7 +1204,6 @@ void processRainStatus(const ReceivedPacket& received,
   lastRainSequenceKnown = true;
   lastRainSeenAt = now;
   rainNodeOnline = true;
-  reservoirMidWet = report.midWet != 0;
   reservoirFullWet = report.fullWet != 0;
   reservoirLevel = reservoirLevelFromSensors(reservoirFullWet);
   rainFaultCode = rainFaultName(report.fault);
@@ -1211,11 +1214,9 @@ void processRainStatus(const ReceivedPacket& received,
     lastLoggedRainChannel = report.currentChannel;
     Serial.printf("ESP-NOW channel active=%u\n", lastLoggedRainChannel);
   }
-  if (oldLevel != reservoirLevel || previousMid != reservoirMidWet ||
-      previousFull != reservoirFullWet) {
-    Serial.printf("Reservoir changed level=%s mid=%u full=%u\n",
-        reservoirLevel.c_str(), reservoirMidWet ? 1 : 0,
-        reservoirFullWet ? 1 : 0);
+  if (oldLevel != reservoirLevel || previousFull != reservoirFullWet) {
+    Serial.printf("Reservoir changed level=%s full=%u\n",
+        reservoirLevel.c_str(), reservoirFullWet ? 1 : 0);
   }
   if (report.fault != FAULT_NONE) {
     Serial.printf("RAIN fault=%s\n", rainFaultName(report.fault));
@@ -1260,6 +1261,25 @@ void processRainAck(const ReceivedPacket& received,
     }
   } else if (ack.result == ACK_ACCEPTED || ack.result == ACK_DUPLICATE) {
     lastRainCommandSentAt[index] = 0;
+    const int pumpNum = index == 0 ? 1 : 5;
+    PumpRunState& run = pumpRuns[pumpNum - 1];
+    const bool requestedOn = index == 0
+        ? rainDesiredPump1On : rainDesiredPump2On;
+    if (requestedOn && run.active && run.awaitingStartConfirmation) {
+      run.awaitingStartConfirmation = false;
+      if (index == 0) {
+        rainPump1On = true;
+        rainPumpStateKnown1 = true;
+      } else {
+        rainPump2On = true;
+        rainPumpStateKnown2 = true;
+      }
+      publishActuatorState(remoteActuatorNames[pumpNum - 1], true);
+      publishCommandAck(activeCommandIds[pumpNum - 1], "running");
+    } else if (!requestedOn &&
+        (!pendingRemoteStopCommandIds[index].isEmpty() || run.stopRequested)) {
+      finishRemotePumpStop(pumpNum);
+    }
   }
 }
 
@@ -1686,8 +1706,7 @@ void processIntervalSnapshotCheck(AsyncResult& result) {
   snapshotJson += "\"ph\":" + String(currentPhValue2, 2) + ",";
   snapshotJson += "\"tds\":" + String(currentTdsValue2, 0) + ",";
   snapshotJson += "\"water\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\"},";
-  snapshotJson += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"mid\":" +
-      String(reservoirMidWet ? "true" : "false") + ",\"full\":" +
+  snapshotJson += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"full\":" +
       String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
       String(rainNodeOnline ? "true" : "false") + "}}";
 
@@ -1783,11 +1802,9 @@ void handleCombinedStatus() {
       ? now - lastFirebaseHeartbeatSuccessAt : 0;
   const bool heartbeatFresh = heartbeatKnown && heartbeatAge <= 10000UL;
   String json = "{";
-  json += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"mid\":" +
-      String(reservoirMidWet ? "true" : "false") + ",\"full\":" +
+  json += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"full\":" +
       String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
       String(rainNodeOnline ? "true" : "false") + "},";
-  json += "\"reservoirMid\":" + String(reservoirMidWet ? 1 : 0) + ",";
   json += "\"reservoirFull\":" + String(reservoirFullWet ? 1 : 0) + ",";
   json += "\"rainNodeOnline\":" + String(rainNodeOnline ? "true" : "false") + ",";
   json += "\"water1\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\",";
@@ -1940,6 +1957,7 @@ void processFirebaseResult(AsyncResult& firebaseResult) {
     Serial.print(firebaseResult.error().code());
     Serial.println();
     firebaseInitialized = false;
+    lastFirebaseTelemetryJson = "";
   }
   if (firebaseResult.isEvent()) {
     Serial.println("Firebase event received.");
@@ -1976,6 +1994,7 @@ void processMainWifiDiagnostics() {
           diagnostic.disconnectReason,
           WiFi.disconnectReasonName(reason), WiFi.channel());
       firebaseInitialized = false;
+        lastFirebaseTelemetryJson = "";
     } else if (diagnostic.kind == 2) {
       Serial.printf("MAIN Wi-Fi associated channel=%d\n", WiFi.channel());
     } else if (diagnostic.kind == 3) {
@@ -2176,6 +2195,7 @@ void loop() {
   } else {
     if (firebaseInitialized) {
       firebaseInitialized = false;
+      lastFirebaseTelemetryJson = "";
       Serial.println("Wi-Fi lost; Firebase will re-authenticate after reconnect.");
     }
     if (wifiConnectInProgress && now - wifiConnectStarted >= wifiConnectTimeout) {
@@ -2329,8 +2349,7 @@ void loop() {
     liveTelemetryJson += "\"phDown2\":" + String(digitalRead(phDown2Pin) == PUMP_ON ? "true" : "false") + ",";
     liveTelemetryJson += "\"nutrient2\":" + String(digitalRead(nutrientPump2Pin) == PUMP_ON ? "true" : "false") + ",";
     liveTelemetryJson += "\"growLight\":" + String(digitalRead(growLightPin) == LIGHT_ON ? "true" : "false") + "},";
-    liveTelemetryJson += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"mid\":" +
-      String(reservoirMidWet ? "true" : "false") + ",\"full\":" +
+    liveTelemetryJson += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"full\":" +
       String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
       String(rainNodeOnline ? "true" : "false") + "},";
     liveTelemetryJson += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
@@ -2340,13 +2359,19 @@ void loop() {
     liveTelemetryJson += "\"firebaseHeartbeatFresh\":" +
       String(firebaseHeartbeatFresh ? "true" : "false");
     liveTelemetryJson += "}";
-    Database.update<object_t>(aClient, "/hydrodeck", object_t(liveTelemetryJson.c_str()));
-
-    if (aClient.lastError().code() != 0) {
-      Serial.print("Firebase live telemetry update failed, code: ");
-      Serial.println(aClient.lastError().code());
-    } else {
-      Serial.println("Firebase update sent for dual sensor sets and actuators.");
+    if (liveTelemetryJson != lastFirebaseTelemetryJson) {
+      Database.update<object_t>(
+        aClient,
+        "/hydrodeck",
+        object_t(liveTelemetryJson.c_str())
+      );
+      if (aClient.lastError().code() != 0) {
+        Serial.print("Firebase live telemetry update failed, code: ");
+        Serial.println(aClient.lastError().code());
+      } else {
+        lastFirebaseTelemetryJson = liveTelemetryJson;
+        Serial.println("Firebase changed telemetry update sent.");
+      }
     }
   }
 }

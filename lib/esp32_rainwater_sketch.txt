@@ -28,16 +28,14 @@ const unsigned long MAIN_TIMEOUT_MS = 3000UL;
 const unsigned long NORMAL_POLL_INTERVAL_MS = 500UL;
 const unsigned long PENDING_POLL_INTERVAL_MS = 250UL;
 const unsigned long LOCAL_MAX_RUN_MS = 0UL;
-const unsigned long STATUS_INTERVAL_MS = 500UL;
-const unsigned long FAST_STATUS_INTERVAL_MS = 250UL;
-const unsigned long FAST_STATUS_WINDOW_MS = 1500UL;
+const unsigned long STATUS_INTERVAL_MS = 1000UL;
 const unsigned long DISCOVERY_CHANNEL_DWELL_MS = 450UL;
 const unsigned long ESPNOW_INIT_RETRY_MS = 2000UL;
 const uint8_t FIRST_DISCOVERY_CHANNEL = 1;
 const uint8_t LAST_DISCOVERY_CHANNEL = 13;
 const unsigned long MAIN_BEACON_TIMEOUT_MS = 3000UL;
 const uint16_t ESPNOW_MAGIC = 0x4859;
-const uint8_t ESPNOW_VERSION = 1;
+const uint8_t ESPNOW_VERSION = 2;
 const uint8_t DEVICE_MAIN = 1;
 const uint8_t DEVICE_RAIN = 2;
 const uint8_t MSG_RAIN_HELLO = 1;
@@ -75,7 +73,6 @@ struct RainStatusPacket {
   uint32_t uptimeMs;
   uint32_t activeCommandId;
   uint8_t currentChannel;
-  uint8_t midWet;
   uint8_t fullWet;
   uint8_t pumpMask;
   uint8_t activePump;
@@ -134,8 +131,8 @@ bool requireFreshOffCommand = true;
 uint32_t mainBootId = 0;
 uint32_t rainBootId = 0;
 uint32_t lastMainSeenAt = 0;
-uint32_t fastStatusUntil = 0;
 uint32_t lastStatusSentAt = 0;
+bool statusUpdatePending = true;
 uint32_t lastCommandId[2] = {};
 uint32_t activeCommandId[2] = {};
 uint32_t localStopAt[2] = {};
@@ -159,7 +156,6 @@ bool pump1MaxRunLocked = false;
 bool pump2MaxRunLocked = false;
 bool desiredPump1On = false;
 bool desiredPump2On = false;
-bool commandPending = false;
 String pump1CommandId;
 String pump2CommandId;
 String pump1ActiveCommandId;
@@ -314,10 +310,6 @@ uint8_t currentFaultCode() {
   return FAULT_NONE;
 }
 
-void updateFastStatusWindow(unsigned long now) {
-  fastStatusUntil = now + FAST_STATUS_WINDOW_MS;
-}
-
 void configureSafeOutput(int pin, int safeState) {
   digitalWrite(pin, safeState);
   pinMode(pin, OUTPUT);
@@ -352,6 +344,8 @@ void updateDebouncedSensor(
 }
 
 void setPumpRelays(bool pump1Requested, bool pump2Requested, unsigned long now) {
+  const bool previousPump1On = pump1On;
+  const bool previousPump2On = pump2On;
   if (pump1Requested && pump2Requested) {
     faultCode = "pump_conflict";
     pump1Requested = false;
@@ -404,7 +398,9 @@ void setPumpRelays(bool pump1Requested, bool pump2Requested, unsigned long now) 
       if (!desiredPump2On) pump2MaxRunLocked = false;
     }
   }
-  commandPending = pump1On != desiredPump1On || pump2On != desiredPump2On;
+  if (pump1On != previousPump1On || pump2On != previousPump2On) {
+    statusUpdatePending = true;
+  }
 }
 
 void stopPumpForMaxRun(int pumpNumber) {
@@ -421,6 +417,7 @@ void stopPumpForMaxRun(int pumpNumber) {
     pump2MaxRunLocked = true;
     pump2ActiveCommandId = "";
   }
+  statusUpdatePending = true;
 }
 
 void servicePumpSafety(unsigned long now) {
@@ -433,7 +430,6 @@ void servicePumpSafety(unsigned long now) {
     if (pump1On && (long)(now - pump1MaxRunAt) >= 0) stopPumpForMaxRun(1);
     if (pump2On && (long)(now - pump2MaxRunAt) >= 0) stopPumpForMaxRun(2);
   }
-  commandPending = pump1On != desiredPump1On || pump2On != desiredPump2On;
 }
 
 void sendCommandAck(const uint8_t mac[6], uint32_t commandId, uint8_t pump,
@@ -466,7 +462,6 @@ void sendRainStatus(bool broadcast) {
       (pump2On ? activeCommandId[1] : 0);
   const int currentChannel = WiFi.channel();
   packet.currentChannel = static_cast<uint8_t>(currentChannel > 0 ? currentChannel : 0);
-  packet.midWet = reservoirFullWet ? 1 : 0;
   packet.fullWet = reservoirFullWet ? 1 : 0;
   packet.pumpMask = (pump1On ? 1 : 0) | (pump2On ? 2 : 0);
   packet.activePump = pump1On ? PUMP1_ID : (pump2On ? PUMP2_ID : 0);
@@ -491,7 +486,7 @@ void stopAllPumpsForRecovery(unsigned long now) {
   desiredPump2On = false;
   pump1ActiveCommandId = "";
   pump2ActiveCommandId = "";
-  commandPending = false;
+  statusUpdatePending = true;
   mainSessionKnown = false;
   requireFreshOffCommand = true;
   if (mainPeerKnown) esp_now_del_peer(mainMac);
@@ -575,7 +570,6 @@ void processPumpCommand(const ReceivedPacket& received,
     activeCommandId[index] = 0;
     sendCommandAck(received.mac, command.commandId, pump, ACK_ACCEPTED,
         FAULT_NONE);
-    updateFastStatusWindow(now);
     Serial.printf("ESP-NOW stop accepted pump=%u command=%lu\n", pump,
         static_cast<unsigned long>(command.commandId));
     return;
@@ -632,8 +626,7 @@ void processPumpCommand(const ReceivedPacket& received,
     return;
   }
   sendCommandAck(received.mac, command.commandId, pump, ACK_ACCEPTED, FAULT_NONE);
-  updateFastStatusWindow(now);
-    Serial.printf("ESP-NOW pump accepted pump=%u command=%lu\n",
+  Serial.printf("ESP-NOW pump accepted pump=%u command=%lu\n",
       pump, static_cast<unsigned long>(command.commandId));
 }
 
@@ -682,6 +675,8 @@ void processMainBeacon(const ReceivedPacket& received,
     Serial.printf("ESP-NOW MAIN peer paired channel=%u; sending discovery hello\n",
         beacon.currentChannel);
     sendRainStatus(true);
+    statusUpdatePending = false;
+    lastStatusSentAt = now;
   }
 }
 
@@ -761,9 +756,13 @@ void serviceDiscovery(unsigned long now) {
   }
   if (!mainSessionKnown) serviceChannelDiscovery(now);
 
-  const unsigned long interval = (commandPending || now < fastStatusUntil)
-      ? FAST_STATUS_INTERVAL_MS : STATUS_INTERVAL_MS;
-  if (now - lastStatusSentAt < interval) return;
+  if (statusUpdatePending) {
+    statusUpdatePending = false;
+    lastStatusSentAt = now;
+    sendRainStatus(!mainPeerKnown);
+    return;
+  }
+  if (now - lastStatusSentAt < STATUS_INTERVAL_MS) return;
   lastStatusSentAt = now;
   sendRainStatus(!mainPeerKnown);
 }
@@ -831,6 +830,7 @@ void setup() {
 
 void loop() {
   const unsigned long now = millis();
+  const bool previousReservoirFull = reservoirFullWet;
   updateDebouncedSensor(
     RES_FULL_PIN,
     reservoirFullWet,
@@ -838,6 +838,7 @@ void loop() {
     reservoirFullCandidateAt,
     now
   );
+  if (reservoirFullWet != previousReservoirFull) statusUpdatePending = true;
   servicePumpSafety(now);
   processEspNowPackets(now);
   if (!espNowReady && now - lastEspNowRetryAt >= ESPNOW_INIT_RETRY_MS) {
