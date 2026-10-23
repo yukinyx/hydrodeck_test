@@ -31,10 +31,9 @@ char password[65] = "12345678";
 #define USER_PASSWORD "asdqwe123"
 #define DATABASE_URL "https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/"
 
-// Relay module logic for a normally-closed relay contact:
-// HIGH drives the relay input, and the relay output is interpreted as ON.
-#define PUMP_ON HIGH
-#define PUMP_OFF LOW
+// Pump relay inputs are active-low; the grow-light relay remains active-high.
+#define PUMP_ON LOW
+#define PUMP_OFF HIGH
 #define LIGHT_ON HIGH
 #define LIGHT_OFF LOW
 

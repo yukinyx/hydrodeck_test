@@ -14,14 +14,14 @@
 const char* RAIN_TOKEN = "15c7068b34aa4c8103371012c769b18feb98878a948fba5c89786b32f7caaea9";
 const uint8_t ESPNOW_BROADCAST_MAC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
-#define PUMP_ON HIGH
-#define PUMP_OFF LOW
+#define PUMP_ON LOW
+#define PUMP_OFF HIGH
 
 const int WATER_PUMP1_PIN = 25;
 const int WATER_PUMP2_PIN = 12;
 const int RES_FULL_PIN = 21;
 
-// GPIO 12 is a strapping pin. Its relay input must not be pulled HIGH at boot.
+// GPIO 12 is a strapping pin; hold it LOW during reset, then drive HIGH for OFF.
 const bool BLOCK_PUMP_WHEN_RESERVOIR_LOW = false;
 const unsigned long RESERVOIR_DEBOUNCE_MS = 1000UL;
 const unsigned long MAIN_TIMEOUT_MS = 3000UL;
