@@ -38,8 +38,18 @@ void main() {
           batchNumber: 8,
           intervalKey: intervalKey,
         );
+        final otherBatchId = scheduledSnapshotRecordId(
+          batchNumber: 9,
+          intervalKey: intervalKey,
+        );
+        final otherIntervalId = scheduledSnapshotRecordId(
+          batchNumber: 8,
+          intervalKey: '20261017_1100',
+        );
 
         expect(firstId, retryId);
+        expect(otherBatchId, isNot(firstId));
+        expect(otherIntervalId, isNot(firstId));
         expect(
           shouldReplaceHistoryRecord(
             existing: {'source': 'esp32', 'readingsComplete': true},

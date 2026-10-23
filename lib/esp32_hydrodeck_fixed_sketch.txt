@@ -223,8 +223,6 @@ String pendingRemoteCommandId;
 String pendingRemoteCommandValue;
 String pendingRemoteCommandPath;
 bool activeBatchRequestPending = false;
-bool snapshotCheckPending = false;
-bool snapshotWritePending = false;
 bool ntpConfigured = false;
 int activeBatchNumber = 0;
 bool temperatureSensorValid1 = false;
@@ -240,9 +238,21 @@ unsigned long lastPhValidAt2 = 0;
 unsigned long lastTdsValidAt1 = 0;
 unsigned long lastTdsValidAt2 = 0;
 String lastIntervalSnapshotIdentity;
-String pendingIntervalSnapshotKey;
-String pendingIntervalSnapshotIdentity;
-String pendingIntervalSnapshotPath;
+String lastSnapshotScheduleAttemptIdentity;
+String pendingSnapshotUploadUid;
+String pendingSnapshotUploadIdentity;
+String pendingSnapshotUploadPayload;
+int pendingSnapshotUploadSlot = -1;
+uint32_t snapshotUploadSequence = 0;
+bool snapshotUploadPending = false;
+unsigned long snapshotUploadStartedAt = 0;
+unsigned long lastSnapshotUploadAttemptAt = 0;
+const uint8_t SNAPSHOT_QUEUE_LIMIT = 4;
+const char* SNAPSHOT_QUEUE_KEYS[SNAPSHOT_QUEUE_LIMIT] = {
+  "snap0", "snap1", "snap2", "snap3"
+};
+const unsigned long SNAPSHOT_UPLOAD_TIMEOUT_MS = 15000UL;
+const unsigned long SNAPSHOT_UPLOAD_RETRY_MS = 30000UL;
 String activeCommandIds[8];
 const unsigned long firebaseHeartbeatInterval = 5000;
 OneWire oneWire1(DS18B20_PIN1);
@@ -1632,7 +1642,11 @@ void processActiveBatchResult(AsyncResult& result) {
   activeBatchRequestPending = false;
   if (!result.isError() && result.available()) {
     int receivedBatch = result.to<RealtimeDatabaseResult>().to<int>();
-    activeBatchNumber = receivedBatch > 0 ? receivedBatch : 0;
+    const int updatedBatch = receivedBatch > 0 ? receivedBatch : 0;
+    if (updatedBatch != activeBatchNumber) {
+      activeBatchNumber = updatedBatch;
+      commandPreferences.putInt("activeBatch", activeBatchNumber);
+    }
     result.clear();
   }
 }
@@ -1665,36 +1679,199 @@ String currentManilaIntervalKey(const struct tm& localTime) {
   return String(key);
 }
 
-void processIntervalSnapshotWrite(AsyncResult& result) {
-  snapshotWritePending = false;
-  if (result.isError()) return;
-  lastIntervalSnapshotIdentity = pendingIntervalSnapshotIdentity;
-  commandPreferences.putString("lastSnapshotIdentity", lastIntervalSnapshotIdentity);
+const char* snapshotQueueKey(int slot) {
+  return SNAPSHOT_QUEUE_KEYS[slot];
+}
+
+String snapshotIdentityFromJson(const String& snapshotJson) {
+  DynamicJsonDocument document(1536);
+  if (deserializeJson(document, snapshotJson)) return "";
+  const char* intervalKey = document["intervalKey"] | "";
+  const int batchNumber = document["batchNumber"] | 0;
+  if (intervalKey[0] == '\0' || batchNumber <= 0) return "";
+  return String(intervalKey) + "|" + String(batchNumber);
+}
+
+bool snapshotIdentityWasRecorded(const String& identity) {
+  if (identity.length() == 0) return false;
+  if (identity == lastIntervalSnapshotIdentity) return true;
+  const String history = commandPreferences.getString("snapshotIds", ";");
+  if (history.indexOf(";" + identity + ";") >= 0) return true;
+  for (int slot = 0; slot < SNAPSHOT_QUEUE_LIMIT; slot++) {
+    if (snapshotIdentityFromJson(
+            commandPreferences.getString(snapshotQueueKey(slot), "")) == identity) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void rememberSnapshotIdentity(const String& identity) {
+  String history = commandPreferences.getString("snapshotIds", ";");
+  const String token = ";" + identity + ";";
+  if (history.indexOf(token) >= 0) return;
+  if (!history.startsWith(";")) history = ";" + history;
+  if (!history.endsWith(";")) history += ";";
+  history += identity + ";";
+
+  int separatorCount = 0;
+  for (int index = 0; index < history.length(); index++) {
+    if (history[index] == ';') separatorCount++;
+  }
+  while (separatorCount > 9) {
+    const int first = history.indexOf(';');
+    const int second = history.indexOf(';', first + 1);
+    if (second < 0) break;
+    history.remove(first + 1, second - first);
+    separatorCount--;
+  }
+  commandPreferences.putString("snapshotIds", history);
+}
+
+bool enqueueIntervalSnapshot(const String& identity, const String& snapshotJson) {
+  if (snapshotIdentityWasRecorded(identity)) return true;
+  for (int slot = 0; slot < SNAPSHOT_QUEUE_LIMIT; slot++) {
+    const char* key = snapshotQueueKey(slot);
+    if (commandPreferences.getString(key, "").length() > 0) continue;
+    if (commandPreferences.putString(key, snapshotJson) == 0) return false;
+    lastIntervalSnapshotIdentity = identity;
+    commandPreferences.putString("snapLast", identity);
+    rememberSnapshotIdentity(identity);
+    return true;
+  }
+  Serial.println("Snapshot queue full; newest scheduled snapshot dropped");
+  return false;
+}
+
+void processQueuedSnapshotUpload(AsyncResult& result) {
+  if (result.isDebug() || result.isEvent()) {
+    result.clear();
+    return;
+  }
+  if (!result.isResult()) return;
+  if (result.uid() != pendingSnapshotUploadUid) {
+    result.clear();
+    return;
+  }
+
+  const int slot = pendingSnapshotUploadSlot;
+  const String identity = pendingSnapshotUploadIdentity;
+  const String payload = pendingSnapshotUploadPayload;
+  const char* queueKey = slot >= 0 ? snapshotQueueKey(slot) : "";
+  if (result.isError()) {
+    Serial.printf("Snapshot upload failed identity=%s code=%d; retry queued\n",
+        identity.c_str(), result.error().code());
+    snapshotUploadPending = false;
+    lastSnapshotUploadAttemptAt = millis();
+  } else if (slot >= 0 && commandPreferences.getString(queueKey, "") == payload) {
+    const bool removed = commandPreferences.remove(queueKey);
+    if (removed || commandPreferences.getString(queueKey, "").length() == 0) {
+      Serial.printf("Snapshot upload confirmed identity=%s\n", identity.c_str());
+      lastSnapshotUploadAttemptAt = 0;
+    } else {
+      Serial.printf("Snapshot queue cleanup failed identity=%s; retry later\n",
+          identity.c_str());
+      lastSnapshotUploadAttemptAt = millis();
+    }
+    snapshotUploadPending = false;
+  } else {
+    Serial.printf("Snapshot queue item changed before ACK identity=%s\n",
+        identity.c_str());
+    snapshotUploadPending = false;
+    lastSnapshotUploadAttemptAt = millis();
+  }
   result.clear();
 }
 
-void processIntervalSnapshotCheck(AsyncResult& result) {
-  snapshotCheckPending = false;
-  if (result.isError() || !result.available()) return;
-  const String currentValue = result.to<RealtimeDatabaseResult>().to<String>();
-  result.clear();
-  if (currentValue.length() > 0 && currentValue != "null") {
-    lastIntervalSnapshotIdentity = pendingIntervalSnapshotIdentity;
-    commandPreferences.putString("lastSnapshotIdentity", lastIntervalSnapshotIdentity);
+void serviceQueuedSnapshotUpload(unsigned long now) {
+  if (!firebaseInitialized || !app.ready() || firebaseHeartbeatPending) return;
+  if (snapshotUploadPending) {
+    if (now - snapshotUploadStartedAt < SNAPSHOT_UPLOAD_TIMEOUT_MS) return;
+    Serial.printf("Snapshot upload timed out identity=%s; retry queued\n",
+        pendingSnapshotUploadIdentity.c_str());
+    snapshotUploadPending = false;
+    lastSnapshotUploadAttemptAt = now;
+  }
+  if (lastSnapshotUploadAttemptAt != 0 &&
+      now - lastSnapshotUploadAttemptAt < SNAPSHOT_UPLOAD_RETRY_MS) return;
+
+  int selectedSlot = -1;
+  long oldestCapture = 0;
+  String selectedPayload;
+  String selectedIdentity;
+  String selectedPath;
+  for (int slot = 0; slot < SNAPSHOT_QUEUE_LIMIT; slot++) {
+    const String payload = commandPreferences.getString(snapshotQueueKey(slot), "");
+    if (payload.length() == 0) continue;
+    DynamicJsonDocument document(1536);
+    if (deserializeJson(document, payload)) {
+      Serial.printf("Discarding malformed queued snapshot slot=%d\n", slot);
+      commandPreferences.remove(snapshotQueueKey(slot));
+      continue;
+    }
+    const String identity = snapshotIdentityFromJson(payload);
+    const char* intervalKey = document["intervalKey"] | "";
+    const int batchNumber = document["batchNumber"] | 0;
+    if (identity.length() == 0 || intervalKey[0] == '\0' || batchNumber <= 0) {
+      commandPreferences.remove(snapshotQueueKey(slot));
+      continue;
+    }
+    const long capturedAt = document["capturedAt"].as<long>();
+    if (selectedSlot < 0 || capturedAt < oldestCapture) {
+      selectedSlot = slot;
+      oldestCapture = capturedAt;
+      selectedPayload = payload;
+      selectedIdentity = identity;
+      selectedPath = "/hydrodeck/intervalSnapshots/" + String(intervalKey) +
+          "/sessions/" + String(batchNumber);
+    }
+  }
+  if (selectedSlot < 0) return;
+
+  snapshotUploadSequence++;
+  pendingSnapshotUploadUid = "snapshotUpload_" + String(mainBootId, HEX) + "_" +
+      String(snapshotUploadSequence);
+  pendingSnapshotUploadIdentity = selectedIdentity;
+  pendingSnapshotUploadPayload = selectedPayload;
+  pendingSnapshotUploadSlot = selectedSlot;
+  snapshotUploadPending = true;
+  snapshotUploadStartedAt = now;
+  lastSnapshotUploadAttemptAt = now;
+  Database.set<object_t>(
+    aClient,
+    selectedPath,
+    object_t(selectedPayload.c_str()),
+    processQueuedSnapshotUpload,
+    pendingSnapshotUploadUid
+  );
+}
+
+void requestIntervalSnapshot() {
+  if (activeBatchNumber <= 0) return;
+  struct tm localTime;
+  if (!getLocalTime(&localTime, 0) || localTime.tm_year < (2024 - 1900)) return;
+  if (localTime.tm_min != 0 && localTime.tm_min != 30) return;
+
+  const String intervalKey = currentManilaIntervalKey(localTime);
+  const String intervalIdentity = intervalKey + "|" + String(activeBatchNumber);
+  if (intervalIdentity == lastSnapshotScheduleAttemptIdentity) return;
+  if (snapshotIdentityWasRecorded(intervalIdentity)) {
+    lastSnapshotScheduleAttemptIdentity = intervalIdentity;
     return;
   }
 
   const unsigned long nowMs = millis();
-    if (!temperatureSensorValid1 || !temperatureSensorValid2 ||
+  if (!temperatureSensorValid1 || !temperatureSensorValid2 ||
       !phSensorValid1 || !phSensorValid2 || !tdsSensorValid1 || !tdsSensorValid2 ||
       nowMs - lastTemperatureValidAt1 > 5000UL ||
       nowMs - lastTemperatureValidAt2 > 5000UL ||
       nowMs - lastPhValidAt1 > 5000UL || nowMs - lastPhValidAt2 > 5000UL ||
       nowMs - lastTdsValidAt1 > 5000UL || nowMs - lastTdsValidAt2 > 5000UL) return;
 
+  lastSnapshotScheduleAttemptIdentity = intervalIdentity;
   const time_t capturedAt = time(nullptr);
   String snapshotJson = "{";
-  snapshotJson += "\"intervalKey\":\"" + pendingIntervalSnapshotKey + "\",";
+  snapshotJson += "\"intervalKey\":\"" + intervalKey + "\",";
   snapshotJson += "\"batchNumber\":" + String(activeBatchNumber) + ",";
   snapshotJson += "\"capturedAt\":" + String((long)capturedAt) + ",";
   snapshotJson += "\"source\":\"esp32\",";
@@ -1710,39 +1887,9 @@ void processIntervalSnapshotCheck(AsyncResult& result) {
       String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
       String(rainNodeOnline ? "true" : "false") + "}}";
 
-  snapshotWritePending = true;
-  Database.set<object_t>(
-    aClient,
-    pendingIntervalSnapshotPath,
-    object_t(snapshotJson.c_str()),
-    processIntervalSnapshotWrite,
-    "intervalSnapshotWrite"
-  );
-}
-
-void requestIntervalSnapshot() {
-  if (!firebaseInitialized || !app.ready() || activeBatchNumber <= 0 ||
-      snapshotCheckPending || snapshotWritePending) return;
-
-  struct tm localTime;
-  if (!getLocalTime(&localTime, 0) || localTime.tm_year < (2024 - 1900)) return;
-  if (localTime.tm_min != 0 && localTime.tm_min != 30) return;
-  const String intervalKey = currentManilaIntervalKey(localTime);
-  const String intervalIdentity = intervalKey + "|" + String(activeBatchNumber);
-  if (intervalIdentity == lastIntervalSnapshotIdentity) return;
-
-  pendingIntervalSnapshotKey = intervalKey;
-  pendingIntervalSnapshotIdentity = intervalIdentity;
-  pendingIntervalSnapshotPath = "/hydrodeck/intervalSnapshots/" + intervalKey +
-      "/sessions/" + String(activeBatchNumber);
-  snapshotCheckPending = true;
-  Database.get(
-    aClient,
-    pendingIntervalSnapshotPath,
-    processIntervalSnapshotCheck,
-    false,
-    "intervalSnapshotCheck"
-  );
+  if (!enqueueIntervalSnapshot(intervalIdentity, snapshotJson)) {
+    Serial.printf("Snapshot identity=%s was not queued\n", intervalIdentity.c_str());
+  }
 }
 
 void handleRootIdent() {
@@ -2123,7 +2270,11 @@ void setup() {
   wifiPreferences.begin("wifi", false);
   commandPreferences.begin("pumpcmd", false);
   setGrowLight(commandPreferences.getBool("growLightOn", false));
-  lastIntervalSnapshotIdentity = commandPreferences.getString("lastSnapshotIdentity", "");
+  activeBatchNumber = commandPreferences.getInt("activeBatch", 0);
+  lastIntervalSnapshotIdentity = commandPreferences.getString(
+    "snapLast",
+    commandPreferences.getString("lastSnapshotIdentity", "")
+  );
   String savedSsid = wifiPreferences.getString("ssid", ssid);
   String savedPassword = wifiPreferences.getString("password", password);
   savedSsid.toCharArray(ssid, sizeof(ssid));
@@ -2225,9 +2376,8 @@ void loop() {
       lastActiveBatchPoll = now;
       requestActiveBatchNumber();
     }
-    requestIntervalSnapshot();
-
     if (firebaseInitialized && app.ready() && !firebaseHeartbeatPending &&
+      !snapshotUploadPending &&
         now - lastFirebaseHeartbeat >= firebaseHeartbeatInterval) {
       lastFirebaseHeartbeat = now;
       firebaseHeartbeatStartedAt = now;
@@ -2241,6 +2391,9 @@ void loop() {
       );
     }
   }
+
+  requestIntervalSnapshot();
+  serviceQueuedSnapshotUpload(now);
 
   if (firebaseHeartbeatPending &&
       now - firebaseHeartbeatStartedAt >= firebaseHeartbeatInterval * 3UL) {
