@@ -32,6 +32,82 @@ void main() {
     expect(telemetry.actuatorStates['nutrient2'], isTrue);
   });
 
+  test('local status parses flat actuator fields and legacy values', () {
+    final local = HydrodeckTelemetry.fromJson({
+      'waterPump1': 1,
+      'waterPump2': 'off',
+      'phUp1': true,
+      'nutrient2': '0',
+      'growLight': 'on',
+    });
+
+    expect(local.actuatorStates['waterPump1'], isTrue);
+    expect(local.actuatorStates['waterPump2'], isFalse);
+    expect(local.actuatorStates['phUp1'], isTrue);
+    expect(local.actuatorStates['nutrient2'], isFalse);
+    expect(local.actuatorStates['growLight'], isTrue);
+    expect(local.growLightOn, isTrue);
+  });
+
+  test('local flat status parses actuator values and wins while fresh', () {
+    final local = HydrodeckTelemetry.fromJson({
+      'waterPump1': 1,
+      'waterPump2': 'off',
+      'phUp1': true,
+      'nutrient2': '0',
+      'growLight': 'on',
+    });
+
+    expect(local.actuatorStates['waterPump1'], isTrue);
+    expect(local.actuatorStates['waterPump2'], isFalse);
+    expect(local.actuatorStates['phUp1'], isTrue);
+    expect(local.actuatorStates['nutrient2'], isFalse);
+    expect(local.growLightOn, isTrue);
+    expect(
+      shouldApplyFirebaseDeviceState(localTelemetryFresh: true),
+      isFalse,
+    );
+    expect(
+      shouldApplyFirebaseDeviceState(localTelemetryFresh: false),
+      isTrue,
+    );
+    expect(
+      shouldShowWifiSetupPrompt(
+        localDeviceReachable: true,
+        cloudReachable: false,
+      ),
+      isFalse,
+    );
+    expect(
+      shouldShowWifiSetupPrompt(
+        localDeviceReachable: false,
+        cloudReachable: true,
+      ),
+      isFalse,
+    );
+    expect(
+      shouldShowWifiSetupPrompt(
+        localDeviceReachable: false,
+        cloudReachable: false,
+      ),
+      isTrue,
+    );
+    expect(
+      reportedActuatorStateConfirmsRequest(
+        requestedState: true,
+        reportedState: true,
+      ),
+      isTrue,
+    );
+    expect(
+      reportedActuatorStateConfirmsRequest(
+        requestedState: true,
+        reportedState: false,
+      ),
+      isFalse,
+    );
+  });
+
   test('telemetry keeps MAIN readiness and heartbeat separate', () {
     final telemetry = HydrodeckTelemetry.fromJson({
       'wifiConnected': true,

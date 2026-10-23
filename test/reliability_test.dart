@@ -254,6 +254,30 @@ void main() {
       expect(shouldReleasePendingCommand(timedOut: true), isTrue);
     });
 
+    test('failed local dispatch without Firebase clears pending state', () {
+      expect(
+        shouldClearPendingAfterDispatch(
+          localAccepted: false,
+          firebaseQueued: false,
+        ),
+        isTrue,
+      );
+      expect(
+        shouldClearPendingAfterDispatch(
+          localAccepted: true,
+          firebaseQueued: false,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldClearPendingAfterDispatch(
+          localAccepted: false,
+          firebaseQueued: true,
+        ),
+        isFalse,
+      );
+    });
+
     test('releases confirmed water starts and terminal failures', () {
       expect(isConfirmedWaterPumpOnAck('waterPump1', 'accepted'), isFalse);
       expect(isConfirmedWaterPumpOnAck('waterPump1', 'running'), isTrue);

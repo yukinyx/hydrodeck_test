@@ -836,6 +836,21 @@ String dashboardConnectionStatus({
     ? 'Online'
     : 'ESP32 offline';
 
+bool shouldApplyFirebaseDeviceState({required bool localTelemetryFresh}) =>
+    !localTelemetryFresh;
+
+bool shouldShowWifiSetupPrompt({
+  required bool localDeviceReachable,
+  required bool cloudReachable,
+}) =>
+    !localDeviceReachable && !cloudReachable;
+
+bool reportedActuatorStateConfirmsRequest({
+  required bool requestedState,
+  required bool reportedState,
+}) =>
+    requestedState == reportedState;
+
 class HydrodeckTelemetry {
   final GrowBedReading bed1;
   final GrowBedReading bed2;
@@ -4851,6 +4866,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         } else {
           _offlineSince ??= DateTime.now();
           if (!_wifiPromptShown &&
+              shouldShowWifiSetupPrompt(
+                localDeviceReachable: _hasFreshLocalTelemetry,
+                cloudReachable: _hasFreshFirebaseTelemetry,
+              ) &&
               _currentIndex == 0 &&
               DateTime.now().difference(_offlineSince!).inSeconds >= 3) {
             _showWifiSetupDialog();
@@ -4938,46 +4957,47 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           }
 
           if (!mounted) return;
+          final applyFirebaseDeviceState = shouldApplyFirebaseDeviceState(
+            localTelemetryFresh: _hasFreshLocalTelemetry,
+          );
           setState(() {
-            _reservoir = telemetry.reservoir;
             if (heartbeatFresh) {
               _lastFirebaseTelemetryAt = DateTime.now();
             }
-            if (payload.containsKey('temp1') ||
-                payload.containsKey('ph1') ||
-                payload.containsKey('tds1') ||
-                payload.containsKey('water1') ||
-                payload['bed1'] is Map) {
-              _bed1 = telemetry.bed1;
-            }
-            if (payload.containsKey('temp2') ||
-                payload.containsKey('ph2') ||
-                payload.containsKey('tds2') ||
-                payload.containsKey('water2') ||
-                payload['bed2'] is Map) {
-              _bed2 = telemetry.bed2;
-            }
+            if (applyFirebaseDeviceState) {
+              _reservoir = telemetry.reservoir;
+              if (payload.containsKey('temp1') ||
+                  payload.containsKey('ph1') ||
+                  payload.containsKey('tds1') ||
+                  payload.containsKey('water1') ||
+                  payload['bed1'] is Map) {
+                _bed1 = telemetry.bed1;
+              }
+              if (payload.containsKey('temp2') ||
+                  payload.containsKey('ph2') ||
+                  payload.containsKey('tds2') ||
+                  payload.containsKey('water2') ||
+                  payload['bed2'] is Map) {
+                _bed2 = telemetry.bed2;
+              }
 
-            final actuators = payload['actuators'] is Map
-                ? Map<String, dynamic>.from(payload['actuators'] as Map)
-                : payload;
-            _updateActuatorFromFirebase('bed1_water', 'waterPump1', actuators);
-            _updateActuatorFromFirebase('bed1_ph_up', 'phUp1', actuators);
-            _updateActuatorFromFirebase('bed1_ph_down', 'phDown1', actuators);
-            _updateActuatorFromFirebase(
-              'bed1_nutrient',
-              'nutrient1',
-              actuators,
-            );
-            _updateActuatorFromFirebase('bed2_water', 'waterPump2', actuators);
-            _updateActuatorFromFirebase('bed2_ph_up', 'phUp2', actuators);
-            _updateActuatorFromFirebase('bed2_ph_down', 'phDown2', actuators);
-            _updateActuatorFromFirebase(
-              'bed2_nutrient',
-              'nutrient2',
-              actuators,
-            );
-            _applyGrowLightTelemetry(telemetry.growLightOn);
+              final actuators = payload['actuators'] is Map
+                  ? Map<String, dynamic>.from(payload['actuators'] as Map)
+                  : payload;
+              _updateActuatorFromFirebase(
+                'bed1_water', 'waterPump1', actuators,
+              );
+              _updateActuatorFromFirebase('bed1_ph_up', 'phUp1', actuators);
+              _updateActuatorFromFirebase('bed1_ph_down', 'phDown1', actuators);
+              _updateActuatorFromFirebase('bed1_nutrient', 'nutrient1', actuators);
+              _updateActuatorFromFirebase(
+                'bed2_water', 'waterPump2', actuators,
+              );
+              _updateActuatorFromFirebase('bed2_ph_up', 'phUp2', actuators);
+              _updateActuatorFromFirebase('bed2_ph_down', 'phDown2', actuators);
+              _updateActuatorFromFirebase('bed2_nutrient', 'nutrient2', actuators);
+              _applyGrowLightTelemetry(telemetry.growLightOn);
+            }
             _updateConnectionStatus();
             if (payload['ip'] != null) {
               _esp32Ip = payload['ip'].toString();
@@ -5237,11 +5257,19 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     });
   }
 
-  void _updateActuatorStates(Map<String, bool> states) {
+  void _updateActuatorStates(
+    Map<String, bool> states, {
+    bool isLocal = false,
+  }) {
     for (final entry in states.entries) {
       final key = _actuatorControlKeys[entry.key];
       if (key != null) {
-        _updateActuatorFromFirebase(key, entry.key, {entry.key: entry.value});
+        _updateActuatorFromFirebase(
+          key,
+          entry.key,
+          {entry.key: entry.value},
+          isLocal: isLocal,
+        );
       }
     }
   }
@@ -5249,7 +5277,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   void _updateActuatorFromFirebase(
     String key,
     String actuatorName,
-    Map<String, dynamic> actuators,
+    Map<String, dynamic> actuators, {
+    bool isLocal = false,
+  }
   ) {
     if (!actuators.containsKey(actuatorName)) return;
     final value = HydrodeckTelemetry._readBoolLike(actuators, [actuatorName]);
@@ -5262,6 +5292,18 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     final isWaterPump = actuatorName.startsWith('waterPump');
     if (pendingId != null) {
       if (isWaterPump) _controlStates[key] = value;
+      final requestedState = _pendingActuatorStates[key];
+      if (isLocal &&
+          isWaterPump &&
+          requestedState != null &&
+          reportedActuatorStateConfirmsRequest(
+            requestedState: requestedState,
+            reportedState: value,
+          )) {
+        _clearPendingCommand(actuatorName, pendingId);
+        _actuatorBusy[key] = value;
+        return;
+      }
       if (value) {
         if (_actuatorsSeenRunning.add(key)) {
           _commandsAcceptedOrRunning.add(pendingId);
@@ -5393,7 +5435,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           _bed2 = result.value.bed2;
           _reservoir = result.value.reservoir;
           _applyGrowLightTelemetry(result.value.growLightOn);
-          _updateActuatorStates(result.value.actuatorStates);
+          _updateActuatorStates(result.value.actuatorStates, isLocal: true);
           _esp32Ip = result.key;
           _ipController.text = result.key;
           _lastLocalTelemetryAt = DateTime.now();
@@ -5466,14 +5508,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   void _updateConnectionStatus() {
-    final localTelemetryFresh =
-        _lastLocalTelemetryAt != null &&
-        DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <= 10;
     _connectionStatus = dashboardConnectionStatus(
-      localTelemetryFresh: localTelemetryFresh,
+      localTelemetryFresh: _hasFreshLocalTelemetry,
       firebaseHeartbeatFresh: _hasFreshFirebaseTelemetry,
     );
   }
+
+  bool get _hasFreshLocalTelemetry =>
+      _lastLocalTelemetryAt != null &&
+      DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <= 10;
 
   bool get _hasFreshFirebaseTelemetry =>
       _lastFirebaseTelemetryAt != null &&
@@ -5650,6 +5693,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         event,
       ) {
         if (event != null && mounted) {
+          final isLocalUpdate = event['source'] == 'local';
+          final applyDeviceState = isLocalUpdate ||
+              (event['source'] == 'firebase' &&
+                  shouldApplyFirebaseDeviceState(
+                    localTelemetryFresh: _hasFreshLocalTelemetry,
+                  ));
           setState(() {
             if (event['source'] == 'local') {
               _lastLocalTelemetryAt = DateTime.now();
@@ -5663,57 +5712,49 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               }
             }
             _updateConnectionStatus();
-            if (event['bed1'] != null) {
-              _bed1 = GrowBedReading.fromMap(
-                Map<String, dynamic>.from(event['bed1'] as Map),
-              );
-            }
-            if (event['reservoir'] is Map) {
-              _reservoir = ReservoirReading.fromSources(
-                shared: event['reservoir'],
-              );
-            }
-            if (event['bed2'] != null) {
-              _bed2 = GrowBedReading.fromMap(
-                Map<String, dynamic>.from(event['bed2'] as Map),
-              );
-            }
-            if (event['growLight'] != null) {
-              _applyGrowLightTelemetry(
-                HydrodeckTelemetry._readBoolLike(
-                  {'growLight': event['growLight']},
-                  const ['growLight'],
-                ),
-              );
-            }
-            if (event['actuators'] is Map) {
-              final actuatorMap = Map<String, dynamic>.from(
-                event['actuators'] as Map,
-              );
-              _updateActuatorFromFirebase('bed1_water', 'waterPump1', actuatorMap);
-              _updateActuatorFromFirebase('bed1_ph_up', 'phUp1', actuatorMap);
-              _updateActuatorFromFirebase(
-                'bed1_ph_down',
-                'phDown1',
-                actuatorMap,
-              );
-              _updateActuatorFromFirebase(
-                'bed1_nutrient',
-                'nutrient1',
-                actuatorMap,
-              );
-              _updateActuatorFromFirebase('bed2_water', 'waterPump2', actuatorMap);
-              _updateActuatorFromFirebase('bed2_ph_up', 'phUp2', actuatorMap);
-              _updateActuatorFromFirebase(
-                'bed2_ph_down',
-                'phDown2',
-                actuatorMap,
-              );
-              _updateActuatorFromFirebase(
-                'bed2_nutrient',
-                'nutrient2',
-                actuatorMap,
-              );
+            if (applyDeviceState) {
+              if (event['bed1'] != null) {
+                _bed1 = GrowBedReading.fromMap(
+                  Map<String, dynamic>.from(event['bed1'] as Map),
+                );
+              }
+              if (event['reservoir'] is Map) {
+                _reservoir = ReservoirReading.fromSources(
+                  shared: event['reservoir'],
+                );
+              }
+              if (event['bed2'] != null) {
+                _bed2 = GrowBedReading.fromMap(
+                  Map<String, dynamic>.from(event['bed2'] as Map),
+                );
+              }
+              if (event['growLight'] != null) {
+                _applyGrowLightTelemetry(
+                  HydrodeckTelemetry._readBoolLike(
+                    {'growLight': event['growLight']},
+                    const ['growLight'],
+                  ),
+                );
+              }
+              if (event['actuators'] is Map) {
+                final actuatorMap = Map<String, dynamic>.from(
+                  event['actuators'] as Map,
+                );
+                _updateActuatorFromFirebase(
+                  'bed1_water', 'waterPump1', actuatorMap,
+                  isLocal: isLocalUpdate,
+                );
+                _updateActuatorFromFirebase('bed1_ph_up', 'phUp1', actuatorMap);
+                _updateActuatorFromFirebase('bed1_ph_down', 'phDown1', actuatorMap);
+                _updateActuatorFromFirebase('bed1_nutrient', 'nutrient1', actuatorMap);
+                _updateActuatorFromFirebase(
+                  'bed2_water', 'waterPump2', actuatorMap,
+                  isLocal: isLocalUpdate,
+                );
+                _updateActuatorFromFirebase('bed2_ph_up', 'phUp2', actuatorMap);
+                _updateActuatorFromFirebase('bed2_ph_down', 'phDown2', actuatorMap);
+                _updateActuatorFromFirebase('bed2_nutrient', 'nutrient2', actuatorMap);
+              }
             }
             if (event['water'] != null) {
               _lastValidWaterStatus = event['water'];
@@ -6190,7 +6231,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       }
     }
 
-    if (!firebaseQueued && !localQueued) {
+    if (shouldClearPendingAfterDispatch(
+      localAccepted: localQueued,
+      firebaseQueued: firebaseQueued,
+    )) {
       _clearPendingCommand(actuatorName, commandId);
       unawaited(commandRef.remove().catchError((_) {}));
       final firebaseMessage = firebaseFailure == null
@@ -6237,6 +6281,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         _bed1 = telemetry.bed1;
         _bed2 = telemetry.bed2;
         _reservoir = telemetry.reservoir;
+        _applyGrowLightTelemetry(telemetry.growLightOn);
+        _updateActuatorStates(telemetry.actuatorStates, isLocal: true);
         _hotspotStatus = 'Connected to ESP32 hotspot for local control.';
         _updateConnectionStatus();
       });
