@@ -43,7 +43,6 @@ FirebaseDatabase hydrodeckDatabase() => FirebaseDatabase.instanceFor(
 );
 
 const Duration commandAckTimeout = Duration(seconds: 20);
-const Duration waterPumpAckTimeout = Duration(minutes: 3);
 
 Future<DateTime> getServerNow() async {
   try {
@@ -338,7 +337,7 @@ class DatabaseHelper {
       'recordType': log.recordType,
       'recordId': log.identity,
       'source': log.source,
-      'reservoir': log.reservoir.level,
+      'reservoir': normalizeReservoirLevel(log.reservoir.level),
       'rainNodeOnline': log.reservoir.online ? 1 : 0,
     };
   }
@@ -694,26 +693,6 @@ class NotificationHelper {
     );
   }
 
-  static Future<void> showReservoirNotification({
-    required String title,
-    required String body,
-  }) async {
-    if (kIsWeb) return;
-    const androidDetails = AndroidNotificationDetails(
-      'reservoir_alerts_channel',
-      'Reservoir Alerts',
-      channelDescription:
-          'Notifications for low reservoir levels and RAIN-unit outages',
-      importance: Importance.high,
-      priority: Priority.high,
-    );
-    await _notificationsPlugin.show(
-      id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-      title: title,
-      body: body,
-      notificationDetails: const NotificationDetails(android: androidDetails),
-    );
-  }
 }
 
 class ReservoirReading {
@@ -724,7 +703,10 @@ class ReservoirReading {
 
   static const unknown = ReservoirReading();
 
-  Map<String, dynamic> toMap() => {'level': level, 'online': online};
+  Map<String, dynamic> toMap() => {
+    'level': online ? normalizeReservoirLevel(level) : 'unknown',
+    'online': online,
+  };
 
   static ReservoirReading fromSources({
     dynamic shared,
@@ -769,12 +751,28 @@ class ReservoirReading {
       legacyBed1?['rainNodeOnline'] ?? legacyBed2?['rainNodeOnline'],
     );
 
+    final resolvedOnline = sharedOnline ?? legacyOnline;
+    final rawLevel = sharedLevel ?? legacyLevel;
+    final normalizedLevel = normalizeReservoirLevel(rawLevel);
+    final isLegacyLevel = const {'above_50', '50_or_below'}.contains(
+      rawLevel?.toString().trim().toLowerCase(),
+    );
     return ReservoirReading(
-      level: (sharedLevel ?? legacyLevel ?? 'unknown').toString(),
-      online: sharedOnline ?? legacyOnline ?? false,
+      level: resolvedOnline == false && !isLegacyLevel
+          ? 'unknown'
+          : normalizedLevel,
+      online: resolvedOnline ?? false,
     );
   }
 }
+
+String normalizeReservoirLevel(dynamic value) => switch (
+  value?.toString().trim().toLowerCase()
+) {
+  'full' => 'full',
+  'not_full' || 'above_50' || '50_or_below' => 'not_full',
+  _ => 'unknown',
+};
 
 class GrowBedReading {
   final double temperature;
@@ -829,25 +827,26 @@ class GrowBedReading {
   };
 }
 
-String reservoirLabel(String level) => switch (level) {
-  'full' => '100% (Full)',
-  'above_50' => 'Above 50%',
-  '50_or_below' => '50% or below',
+String reservoirLabel(String level) => switch (normalizeReservoirLevel(level)) {
+  'full' => 'Full',
+  'not_full' => 'Not full',
   _ => 'Unknown',
 };
 
-String reservoirStatusLabel(ReservoirReading reservoir) =>
-    reservoir.level == 'unknown'
-    ? 'Unknown'
-    : reservoir.online
-    ? 'RAIN NODE ONLINE'
-    : 'RAIN NODE OFFLINE';
-
-Color reservoirColor(String level) => switch (level) {
-  'full' || 'above_50' => const Color(0xFF2E7D32),
-  '50_or_below' => Colors.orange,
+Color reservoirColor(String level) => switch (normalizeReservoirLevel(level)) {
+  'full' => const Color(0xFF2E7D32),
+  'not_full' => Colors.orange,
   _ => Colors.grey,
 };
+
+String dashboardConnectionStatus({
+  required bool localTelemetryFresh,
+  required bool firebaseHeartbeatFresh,
+}) => localTelemetryFresh
+    ? 'Connected locally'
+    : firebaseHeartbeatFresh
+    ? 'Online'
+    : 'ESP32 offline';
 
 class HydrodeckTelemetry {
   final GrowBedReading bed1;
@@ -926,48 +925,48 @@ class HydrodeckTelemetry {
 
     final bed1Map = {
       'temp':
-          wireMap['temp1'] ??
-          wireMap['bed1']?['temp'] ??
-          wireMap['set1']?['temp'] ??
-          25.0,
+        wireMap['temp1'] ??
+        wireMap['bed1']?['temp'] ??
+        wireMap['set1']?['temp'] ??
+        25.0,
       'ph':
-          wireMap['ph1'] ??
-          wireMap['bed1']?['ph'] ??
-          wireMap['set1']?['ph'] ??
-          6.0,
+        wireMap['ph1'] ??
+        wireMap['bed1']?['ph'] ??
+        wireMap['set1']?['ph'] ??
+        6.0,
       'tds':
-          wireMap['tds1'] ??
-          wireMap['bed1']?['tds'] ??
-          wireMap['set1']?['tds'] ??
-          0.0,
+        wireMap['tds1'] ??
+        wireMap['bed1']?['tds'] ??
+        wireMap['set1']?['tds'] ??
+        0.0,
       'water':
-          wireMap['water1'] ??
-          wireMap['bed1']?['water'] ??
-          wireMap['set1']?['water'] ??
-          'low',
+        wireMap['water1'] ??
+        wireMap['bed1']?['water'] ??
+        wireMap['set1']?['water'] ??
+        'low',
     };
 
     final bed2Map = {
       'temp':
-          wireMap['temp2'] ??
-          wireMap['bed2']?['temp'] ??
-          wireMap['set2']?['temp'] ??
-          25.0,
+        wireMap['temp2'] ??
+        wireMap['bed2']?['temp'] ??
+        wireMap['set2']?['temp'] ??
+        25.0,
       'ph':
-          wireMap['ph2'] ??
-          wireMap['bed2']?['ph'] ??
-          wireMap['set2']?['ph'] ??
-          6.0,
+        wireMap['ph2'] ??
+        wireMap['bed2']?['ph'] ??
+        wireMap['set2']?['ph'] ??
+        6.0,
       'tds':
-          wireMap['tds2'] ??
-          wireMap['bed2']?['tds'] ??
-          wireMap['set2']?['tds'] ??
-          0.0,
+        wireMap['tds2'] ??
+        wireMap['bed2']?['tds'] ??
+        wireMap['set2']?['tds'] ??
+        0.0,
       'water':
-          wireMap['water2'] ??
-          wireMap['bed2']?['water'] ??
-          wireMap['set2']?['water'] ??
-          'low',
+        wireMap['water2'] ??
+        wireMap['bed2']?['water'] ??
+        wireMap['set2']?['water'] ??
+        'low',
     };
 
     final bed1 = GrowBedReading(
@@ -1098,10 +1097,6 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
   DateTime? criticalPhStart;
   DateTime? lastAlertTime;
-  String previousReservoirLevel = 'unknown';
-  DateTime? lastReservoirAlertAt;
-  DateTime? rainNodeOfflineSince;
-  bool rainNodeOfflineAlertSent = false;
 
   bool isPolling = false; // Prevents timer stack overlap
 
@@ -1288,6 +1283,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
     bool found = false;
     String telemetrySource = 'offline';
+    bool firebaseHeartbeatFresh = false;
     String cleanTargetIp = sanitizeHost(targetIp);
 
     // 1. Fast attempt to primary target IP
@@ -1445,6 +1441,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
                       )
                       .inSeconds <=
                   _deviceHeartbeatGraceSeconds;
+                  firebaseHeartbeatFresh = heartbeatFresh;
           isConnected =
               data['wifiConnected'] == true &&
               data['firebaseReady'] == true &&
@@ -1458,42 +1455,6 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     if (!found) {
       isConnected = false;
       telemetrySource = 'offline';
-    }
-
-    final monitoringTime = DateTime.now();
-    if (found &&
-        lastReservoir.level == '50_or_below' &&
-        previousReservoirLevel != '50_or_below' &&
-        (lastReservoirAlertAt == null ||
-            monitoringTime.difference(lastReservoirAlertAt!).inHours >= 1)) {
-      unawaited(
-        NotificationHelper.showReservoirNotification(
-          title: 'Low rainwater reservoir',
-          body: 'The reservoir has dropped to 50% or below.',
-        ),
-      );
-      lastReservoirAlertAt = monitoringTime;
-    }
-    previousReservoirLevel = lastReservoir.level;
-
-    if (lastReservoir.online) {
-      rainNodeOfflineSince = null;
-      rainNodeOfflineAlertSent = false;
-    } else if (found) {
-      rainNodeOfflineSince ??= monitoringTime;
-      if (!rainNodeOfflineAlertSent &&
-          monitoringTime.difference(rainNodeOfflineSince!).inSeconds >= 60) {
-        unawaited(
-          NotificationHelper.showReservoirNotification(
-            title: 'Rainwater unit offline',
-            body: 'The RAIN node has been offline for more than 60 seconds.',
-          ),
-        );
-        rainNodeOfflineAlertSent = true;
-      }
-    } else {
-      rainNodeOfflineSince = null;
-      rainNodeOfflineAlertSent = false;
     }
 
     bool isCritical = (lastPh < minPhThreshold || lastPh > maxPhThreshold);
@@ -1525,6 +1486,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     service.invoke('telemetryUpdate', {
       'isConnected': isConnected,
       'firebaseConnected': firebaseConnected,
+      'firebaseHeartbeatFresh': firebaseHeartbeatFresh,
       'source': telemetrySource,
       'ip': targetIp,
       'ph': lastPh,
@@ -4810,11 +4772,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   late String _esp32Ip;
   late TextEditingController _ipController;
 
-  String _connectionStatus = "Fetching...";
-  bool _firebaseConnected = false;
-  bool? _mainWifiConnected;
-  bool? _mainFirebaseReady;
-  bool? _mainFirebaseHeartbeatFresh;
+  String _connectionStatus = "ESP32 offline";
 
   GrowBedReading _bed1 = GrowBedReading.empty();
   GrowBedReading _bed2 = GrowBedReading.empty();
@@ -4837,7 +4795,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   StreamSubscription? _snapshotSub;
   StreamSubscription? _firebaseSub;
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _cloudLogsSub;
-  StreamSubscription? _firebaseConnectionSub;
   StreamSubscription?
   _firebaseCommandsSub; // Subscription for command status updates
   Timer? _connectionTimer;
@@ -4886,7 +4843,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     unawaited(_reconcileHistory());
     unawaited(_subscribeToCloudLogs());
     _subscribeToFirebase();
-    _subscribeToFirebaseConnection();
     _subscribeToBackgroundUpdates();
     _subscribeToFirebaseCommands();
     unawaited(_refreshServerTime());
@@ -4901,7 +4857,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         // Only prompt to provision the ESP32 when the user is on the Home screen
         // and the device has been offline for a while. This prevents intrusive
         // popups while navigating other screens.
-        if (_connectionStatus.startsWith('Connected')) {
+        if (_connectionStatus != 'ESP32 offline') {
           _offlineSince = null;
           _wifiPromptShown = false;
         } else {
@@ -4931,7 +4887,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     _snapshotSub?.cancel();
     _firebaseSub?.cancel();
     _cloudLogsSub?.cancel();
-    _firebaseConnectionSub?.cancel();
     _firebaseCommandsSub?.cancel();
     _connectionTimer?.cancel();
     _thresholdPublishTimer?.cancel();
@@ -4997,9 +4952,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           if (!mounted) return;
           setState(() {
             _reservoir = telemetry.reservoir;
-            _mainWifiConnected = telemetry.wifiConnected;
-            _mainFirebaseReady = telemetry.firebaseReady;
-            _mainFirebaseHeartbeatFresh = heartbeatFresh;
             if (heartbeatFresh) {
               _lastFirebaseTelemetryAt = DateTime.now();
             }
@@ -5112,34 +5064,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     return posted;
   }
 
-  void _subscribeToFirebaseConnection() {
-    try {
-      final connectionRef = FirebaseDatabase.instanceFor(
-        app: Firebase.app(),
-        databaseURL:
-            'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
-      ).ref('.info/connected');
-      _firebaseConnectionSub = connectionRef.onValue.listen(
-        (event) {
-          if (!mounted) return;
-          setState(() {
-            _firebaseConnected = event.snapshot.value == true;
-            _updateConnectionStatus();
-          });
-        },
-        onError: (_) {
-          if (!mounted) return;
-          setState(() {
-            _firebaseConnected = false;
-            _updateConnectionStatus();
-          });
-        },
-      );
-    } catch (_) {
-      _firebaseConnected = false;
-    }
-  }
-
   void _subscribeToFirebaseCommands() {
     if (kIsWeb) return;
     try {
@@ -5161,14 +5085,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             _commandTimeouts.remove(pending.value)?.cancel();
             final busyKey = _getActuatorBusyKey(pending.key);
             if (busyKey != null) _actuatorBusy[busyKey] = true;
-            _commandTimeouts[pending.value] = Timer(
-              _actuatorPulseGrace(pending.key),
-              () {
-                if (_pendingCommandIds[pending.key] != pending.value) return;
-                _clearPendingCommand(pending.key, pending.value);
-                if (mounted) setState(() {});
-              },
-            );
+            if (!pending.key.startsWith('waterPump')) {
+              _commandTimeouts[pending.value] = Timer(
+                _actuatorPulseGrace(pending.key),
+                () {
+                  if (_pendingCommandIds[pending.key] != pending.value) return;
+                  _clearPendingCommand(pending.key, pending.value);
+                  if (mounted) setState(() {});
+                },
+              );
+            }
             changed = true;
             continue;
           }
@@ -5183,6 +5109,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           final actuatorWasSeen =
               busyKey != null && _actuatorsSeenRunning.remove(busyKey);
           if (busyKey != null) {
+            if (pending.key.startsWith('waterPump') && status == 'completed') {
+              _controlStates[busyKey] =
+                  _pendingActuatorStates[busyKey] ?? false;
+            } else if (pending.key.startsWith('waterPump') &&
+                status == 'timed_out') {
+              _controlStates[busyKey] = false;
+            }
             if (pending.key == 'growLight') {
               final requestedState = _pendingActuatorStates[busyKey];
               if (status == 'completed' && requestedState != null) {
@@ -5197,8 +5130,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           }
           if (status == 'rejected') {
             unawaited(_showCommandRejection(pending.key, pending.value));
-          } else if (status == 'timed_out' &&
-              (!wasAcceptedOrRunning || actuatorWasSeen)) {
+            } else if (status == 'timed_out' &&
+              (pending.key.startsWith('waterPump') ||
+                !wasAcceptedOrRunning || actuatorWasSeen)) {
             unawaited(
               _showCommandRejection(
                 pending.key,
@@ -5223,7 +5157,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   String _friendlyCommandRejection(String reason) => switch (reason.trim()) {
     'rain_node_offline' => 'Rainwater unit offline.',
     'rain_node_no_confirm' => 'Rainwater unit did not confirm the pump.',
-    'reservoir_low' => 'The reservoir is at or below 50%.',
     'max_run' => 'The pump reached its maximum run time.',
     _ => 'The ESP32 rejected this command.',
   };
@@ -5302,23 +5235,32 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       return;
     }
     final pendingId = _pendingCommandIds[actuatorName];
+    final isWaterPump = actuatorName.startsWith('waterPump');
     if (pendingId != null) {
+      if (isWaterPump) _controlStates[key] = value;
       if (value) {
         if (_actuatorsSeenRunning.add(key)) {
           _commandsAcceptedOrRunning.add(pendingId);
           _commandTimeouts.remove(pendingId)?.cancel();
           _actuatorBusy[key] = true;
-          _commandTimeouts[pendingId] = Timer(
-            _actuatorPulseGrace(actuatorName),
-            () {
-              if (_pendingCommandIds[actuatorName] != pendingId) return;
-              _clearPendingCommand(actuatorName, pendingId);
-              if (mounted) setState(() {});
-            },
-          );
+          if (!isWaterPump) {
+            _commandTimeouts[pendingId] = Timer(
+              _actuatorPulseGrace(actuatorName),
+              () {
+                if (_pendingCommandIds[actuatorName] != pendingId) return;
+                _clearPendingCommand(actuatorName, pendingId);
+                if (mounted) setState(() {});
+              },
+            );
+          }
         }
+      } else if (isWaterPump && _pendingActuatorStates[key] == false) {
+        _actuatorBusy[key] = false;
+        _controlStates[key] = false;
       } else if (_actuatorsSeenRunning.remove(key)) {
         _clearPendingCommand(actuatorName, pendingId);
+      } else if (isWaterPump) {
+        _actuatorBusy[key] = false;
       } else {
         _actuatorBusy[key] = true;
       }
@@ -5326,6 +5268,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     }
 
     _controlStates[key] = value;
+    if (isWaterPump) {
+      _actuatorBusy[key] = value;
+      _actuatorTelemetryTimeouts.remove(key)?.cancel();
+      _actuatorsSeenRunning.remove(key);
+      return;
+    }
     if (value) {
       if (_actuatorsSeenRunning.add(key)) {
         _actuatorBusy[key] = true;
@@ -5420,9 +5368,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           _bed1 = result.value.bed1;
           _bed2 = result.value.bed2;
           _reservoir = result.value.reservoir;
-          _mainWifiConnected = result.value.wifiConnected;
-          _mainFirebaseReady = result.value.firebaseReady;
-          _mainFirebaseHeartbeatFresh = result.value.firebaseHeartbeatFresh;
           _applyGrowLightTelemetry(result.value.growLightOn);
           _updateActuatorStates(result.value.actuatorStates);
           _esp32Ip = result.key;
@@ -5438,7 +5383,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         try {
           await WiFiForIoTPlugin.forceWifiUsage(false);
         } catch (_) {}
-        var firebaseReachable = false;
         var freshDeviceHeartbeat = false;
         var statusData = <String, dynamic>{};
         try {
@@ -5447,11 +5391,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             databaseURL:
                 'https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/',
           );
-          final connection = await database
-              .ref('.info/connected')
-              .get()
-              .timeout(const Duration(seconds: 2));
-          firebaseReachable = connection.value == true;
           final snapshot = await database
               .ref('hydrodeck')
               .get()
@@ -5475,15 +5414,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         } catch (_) {}
         if (mounted) {
           setState(() {
-            _firebaseConnected = firebaseReachable;
             _lastLocalTelemetryAt = null;
-            _mainWifiConnected = statusData['wifiConnected'] is bool
-                ? statusData['wifiConnected'] as bool
-                : null;
-            _mainFirebaseReady = statusData['firebaseReady'] is bool
-                ? statusData['firebaseReady'] as bool
-                : null;
-            _mainFirebaseHeartbeatFresh = freshDeviceHeartbeat;
             if (!freshDeviceHeartbeat &&
                 (_lastFirebaseTelemetryAt == null ||
                     DateTime.now()
@@ -5511,26 +5442,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   void _updateConnectionStatus() {
-    // Local HTTP freshness means this app can reach MAIN directly.
-    // Firebase connection and MAIN's fresh Firebase heartbeat are separate.
-    // RAIN freshness is reported by MAIN's ESP-NOW heartbeat, not Firebase.
     final localTelemetryFresh =
         _lastLocalTelemetryAt != null &&
         DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <= 10;
-
-    if (localTelemetryFresh) {
-      _connectionStatus = _firebaseConnected
-          ? 'Connected locally'
-          : 'Connected locally · Firebase unavailable';
-    } else if (_hasFreshFirebaseTelemetry) {
-      _connectionStatus = _firebaseConnected
-          ? 'Connected'
-          : 'Firebase heartbeat recently received';
-    } else if (_firebaseConnected) {
-      _connectionStatus = 'MAIN offline (Firebase connected)';
-    } else {
-      _connectionStatus = 'MAIN unreachable; Firebase unavailable';
-    }
+    _connectionStatus = dashboardConnectionStatus(
+      localTelemetryFresh: localTelemetryFresh,
+      firebaseHeartbeatFresh: _hasFreshFirebaseTelemetry,
+    );
   }
 
   bool get _hasFreshFirebaseTelemetry =>
@@ -5714,10 +5632,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             } else if (event['source'] == 'offline') {
               _lastLocalTelemetryAt = null;
             } else if (event['source'] == 'firebase') {
-              if (event['isConnected'] == true) {
+              if (event['firebaseHeartbeatFresh'] == true) {
                 _lastFirebaseTelemetryAt = DateTime.now();
+              } else {
+                _lastFirebaseTelemetryAt = null;
               }
-              _firebaseConnected = event['firebaseConnected'] == true;
             }
             _updateConnectionStatus();
             if (event['bed1'] != null) {
@@ -5747,11 +5666,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               final actuatorMap = Map<String, dynamic>.from(
                 event['actuators'] as Map,
               );
-              _updateActuatorFromFirebase(
-                'bed1_water',
-                'waterPump1',
-                actuatorMap,
-              );
+              _updateActuatorFromFirebase('bed1_water', 'waterPump1', actuatorMap);
               _updateActuatorFromFirebase('bed1_ph_up', 'phUp1', actuatorMap);
               _updateActuatorFromFirebase(
                 'bed1_ph_down',
@@ -5763,11 +5678,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 'nutrient1',
                 actuatorMap,
               );
-              _updateActuatorFromFirebase(
-                'bed2_water',
-                'waterPump2',
-                actuatorMap,
-              );
+              _updateActuatorFromFirebase('bed2_water', 'waterPump2', actuatorMap);
               _updateActuatorFromFirebase('bed2_ph_up', 'phUp2', actuatorMap);
               _updateActuatorFromFirebase(
                 'bed2_ph_down',
@@ -5892,18 +5803,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     String actuatorName,
     String commandId,
     DatabaseReference commandRef,
+    bool requestedOn,
   ) {
     if (actuatorName == 'growLight') _confirmedGrowLightState = null;
     _pendingCommandIds[actuatorName] = commandId;
-    _pendingActuatorStates[key] = true;
+    _pendingActuatorStates[key] = requestedOn;
     _actuatorBusy[key] = true;
     _actuatorsSeenRunning.remove(key);
     _actuatorTelemetryTimeouts.remove(key)?.cancel();
     _commandTimeouts[commandId]?.cancel();
-    final timeout = actuatorName.startsWith('waterPump')
-        ? waterPumpAckTimeout
-        : commandAckTimeout;
-    _commandTimeouts[commandId] = Timer(timeout, () {
+    _commandTimeouts[commandId] = Timer(commandAckTimeout, () {
       if (_pendingCommandIds[actuatorName] != commandId) return;
       final wasAcceptedOrSeen =
           _commandsAcceptedOrRunning.remove(commandId) ||
@@ -5939,12 +5848,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   Duration _actuatorPulseGrace(String actuatorName) {
-    if (actuatorName == 'waterPump1' && !_bed1.waterFull) {
-      return waterPumpAckTimeout;
-    }
-    if (actuatorName == 'waterPump2' && !_bed2.waterFull) {
-      return waterPumpAckTimeout;
-    }
     return Duration(seconds: actuatorName.endsWith('1') ? 4 : 6);
   }
 
@@ -5968,6 +5871,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     bool? growLightState,
   }) {
     _commandsAcceptedOrRunning.add(commandId);
+    if (actuatorName.startsWith('waterPump')) {
+      return;
+    }
     _commandTimeouts.remove(commandId)?.cancel();
     if (actuatorName == 'growLight') {
       if (growLightState != null) {
@@ -5978,7 +5884,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       if (mounted) setState(() {});
       return;
     }
-
     final completionGrace = _actuatorPulseGrace(actuatorName);
     _commandTimeouts[commandId] = Timer(completionGrace, () {
       if (_pendingCommandIds[actuatorName] != commandId) return;
@@ -6049,8 +5954,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   Future<String?> _sendLocalControlCommand({
     required String actuatorName,
     required String commandId,
-    required bool growLight,
-    required bool growLightState,
+    required bool requestedOn,
   }) async {
     var lastFailure = 'No ESP32 local HTTP target responded.';
     try {
@@ -6063,7 +5967,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               .get(
                 Uri.http(target, '/control', {
                   'actuator': actuatorName,
-                  'state': growLight ? (growLightState ? '1' : '0') : '1',
+                  'state': requestedOn ? '1' : '0',
                   'requestId': commandId,
                 }),
                 headers: {'Connection': 'close'},
@@ -6101,22 +6005,32 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   Future<void> _toggleActuator(String key, String actuatorName) async {
-    if (actuatorName.startsWith('waterPump') && !_reservoir.online) {
+    final isWaterPump = actuatorName.startsWith('waterPump');
+    final isGrowLight = actuatorName == 'growLight';
+    final currentState = isWaterPump
+        ? (_controlStates[key] ?? false)
+        : (_pendingActuatorStates[key] ?? _controlStates[key] ?? false);
+    final requestedOn = isWaterPump || isGrowLight ? !currentState : true;
+    if (isWaterPump && _pendingCommandIds.containsKey(actuatorName) &&
+        (_pendingActuatorStates[key] == false || requestedOn)) {
+      return;
+    }
+    if (isWaterPump && requestedOn && !_reservoir.online) {
       _showCommandMessage(actuatorName, 'Rainwater unit offline.');
       return;
     }
-    if (_pendingCommandIds.containsKey(actuatorName) ||
-        _actuatorBusy[key] == true) {
-      _showCommandMessage(
-        actuatorName,
-        'Already running. Wait for this pulse to finish.',
-      );
-      return;
-    }
-    if (_otherWaterPumpIsRunning(actuatorName)) {
+    if (isWaterPump && requestedOn && _otherWaterPumpIsRunning(actuatorName)) {
       _showCommandMessage(
         actuatorName,
         'The other water pump is still running.',
+      );
+      return;
+    }
+    if (!isWaterPump && (_pendingCommandIds.containsKey(actuatorName) ||
+        _actuatorBusy[key] == true)) {
+      _showCommandMessage(
+        actuatorName,
+        'Already running. Wait for this pulse to finish.',
       );
       return;
     }
@@ -6138,8 +6052,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       return;
     }
 
-    final isGrowLight = actuatorName == 'growLight';
-    final nextGrowLight = !(_controlStates['grow_light'] ?? false);
     final database = FirebaseDatabase.instanceFor(
       app: Firebase.app(),
       databaseURL:
@@ -6151,10 +6063,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         generatedCommandId ??
         'cmd_${DateTime.now().microsecondsSinceEpoch}_${actuatorName.hashCode.abs()}';
     final commandRef = commandQueue.child(commandId);
-    final commandValue = isGrowLight ? (nextGrowLight ? '1' : '0') : '1';
+    final commandValue = requestedOn ? '1' : '0';
 
-    _trackPendingCommand(key, actuatorName, commandId, commandRef);
-    if (isGrowLight) _pendingActuatorStates[key] = nextGrowLight;
+    _trackPendingCommand(
+      key,
+      actuatorName,
+      commandId,
+      commandRef,
+      requestedOn,
+    );
     if (mounted) setState(() {});
 
     final localTelemetryFresh =
@@ -6175,8 +6092,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           (await _sendLocalControlCommand(
             actuatorName: actuatorName,
             commandId: commandId,
-            growLight: isGrowLight,
-            growLightState: nextGrowLight,
+            requestedOn: requestedOn,
           )) ??
           '';
       if (localFailure.startsWith('ESP32_REJECTED:')) {
@@ -6196,7 +6112,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           key,
           actuatorName,
           commandId,
-          growLightState: isGrowLight ? nextGrowLight : null,
+          growLightState: isGrowLight ? requestedOn : null,
         );
         return;
       }
@@ -6222,8 +6138,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           (await _sendLocalControlCommand(
             actuatorName: actuatorName,
             commandId: commandId,
-            growLight: isGrowLight,
-            growLightState: nextGrowLight,
+            requestedOn: requestedOn,
           )) ??
           '';
       if (localFailure.startsWith('ESP32_REJECTED:')) {
@@ -6244,7 +6159,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           key,
           actuatorName,
           commandId,
-          growLightState: isGrowLight ? nextGrowLight : null,
+          growLightState: isGrowLight ? requestedOn : null,
         );
         return;
       }
@@ -6581,7 +6496,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               ),
               SizedBox(height: 10),
               Text(
-                '5. Tap refresh. “Connected locally” means this phone can reach the ESP32; “System online” means Firebase and the ESP32 heartbeat are current.',
+                '5. Tap refresh. “Connected locally” means this phone can reach the ESP32; “Online” means the MAIN Firebase heartbeat is current.',
               ),
             ],
           ),
@@ -6665,33 +6580,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   // Home screen
   Widget _buildHomeScreen(String waterLabel) {
-    final isOnline =
-        _connectionStatus.startsWith('Connected') ||
-        _connectionStatus == 'System Online';
-    final statusColor = isOnline ? Colors.green : Colors.orange;
-    final baseStatusText = _connectionStatus == 'Connected'
-        ? 'System Online'
-        : _connectionStatus;
-    final mainTelemetryFresh =
-        (_lastLocalTelemetryAt != null &&
-            DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <=
-                10) ||
-        _hasFreshFirebaseTelemetry;
-    final localHttpFresh =
-        _lastLocalTelemetryAt != null &&
-        DateTime.now().difference(_lastLocalTelemetryAt!).inSeconds <= 10;
-    final statusText =
-        mainTelemetryFresh &&
-            _reservoir.level != 'unknown' &&
-            !_reservoir.online
-        ? '$baseStatusText · RAIN offline'
-        : baseStatusText;
+    final statusColor = _connectionStatus == 'ESP32 offline'
+      ? Colors.orange
+      : Colors.green;
     final isBed1Warning =
         _bed1.ph < _minPhThreshold || _bed1.ph > _maxPhThreshold;
     final isBed2Warning =
         _bed2.ph < _minPhThreshold || _bed2.ph > _maxPhThreshold;
     final hasPhWarning = isBed1Warning || isBed2Warning;
-    final lowReservoir = _reservoir.level == '50_or_below';
     final currentDayCount = _getElapsedPlantingDay(
       _serverNow ?? DateTime.now(),
     );
@@ -6746,55 +6642,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               ),
               const SizedBox(width: 8),
               Text(
-                statusText,
+                _connectionStatus,
                 style: TextStyle(
                   color: statusColor,
                   fontWeight: FontWeight.bold,
                   fontSize: 13,
                 ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 12,
-            runSpacing: 5,
-            children: [
-              Text(
-                'MAIN HTTP: ${localHttpFresh ? 'Reachable' : 'Unreachable'}',
-                style: const TextStyle(fontSize: 11),
-              ),
-              Text(
-                'MAIN Wi-Fi: ${_mainWifiConnected == null
-                    ? 'Unknown'
-                    : _mainWifiConnected!
-                    ? 'Connected'
-                    : 'Disconnected'}',
-                style: const TextStyle(fontSize: 11),
-              ),
-              Text(
-                'MAIN Firebase: ${_mainFirebaseReady == null
-                    ? 'Unknown'
-                    : _mainFirebaseReady!
-                    ? 'Ready'
-                    : 'Not ready'}',
-                style: const TextStyle(fontSize: 11),
-              ),
-              Text(
-                'MAIN Firebase heartbeat: ${_mainFirebaseHeartbeatFresh == null
-                    ? 'Unknown'
-                    : _mainFirebaseHeartbeatFresh!
-                    ? 'Fresh'
-                    : 'Stale'}',
-                style: const TextStyle(fontSize: 11),
-              ),
-              Text(
-                'RAIN ESP-NOW: ${!mainTelemetryFresh
-                    ? 'Unknown'
-                    : _reservoir.online
-                    ? 'Fresh'
-                    : 'Stale'}',
-                style: const TextStyle(fontSize: 11),
               ),
             ],
           ),
@@ -6935,29 +6788,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   ),
                 ),
           const SizedBox(height: 24),
-          if (lowReservoir) ...[
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: const Color(0xFFFFF3E0),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: const Row(
-                children: [
-                  Icon(Icons.water_drop_outlined, color: Colors.orange),
-                  SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      'Rainwater reservoir is at or below 50%.',
-                      style: TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-          ],
           const Text(
             'Grow Bed 1 Metrics',
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
@@ -6975,15 +6805,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           _buildCleanCard(
             'RESERVOIR',
             reservoirLabel(_reservoir.level),
-            reservoirStatusLabel(_reservoir),
-            _reservoir.online &&
-                    (_reservoir.level == 'full' ||
-                        _reservoir.level == 'above_50')
-                ? const Color(0xFFE8F7ED)
-                : const Color(0xFFFFF3E0),
-            !_reservoir.online || _reservoir.level == 'unknown'
-                ? reservoirColor('unknown')
-                : reservoirColor(_reservoir.level),
+            '',
+            switch (normalizeReservoirLevel(_reservoir.level)) {
+              'full' => const Color(0xFFE8F7ED),
+              'not_full' => const Color(0xFFFFF3E0),
+              _ => const Color(0xFFF0F0F0),
+            },
+            reservoirColor(_reservoir.level),
           ),
         ],
       ),
@@ -7156,9 +6984,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           ? (bedIndex == 1 ? 'nutrient1' : 'nutrient2')
           : (bedIndex == 1 ? 'waterPump1' : 'waterPump2');
       final needsWater = bedIndex == 1 ? !_bed1.waterFull : !_bed2.waterFull;
+      final isOn = _controlStates[key] ?? false;
       final rainNodeOnline = _reservoir.online;
-      final otherWaterPumpRunning =
-          !nutrient && _otherWaterPumpIsRunning(actuator);
+      final commandPending = _pendingCommandIds.containsKey(actuator);
       return Column(
         children: [
           Container(
@@ -7178,22 +7006,34 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   width: 112,
                   height: 48,
                   child: ElevatedButton(
-                    onPressed:
-                        _actuatorBusy[key] == true ||
-                            otherWaterPumpRunning ||
-                            (nutrient && _chemicalPumpBusy) ||
-                            (!nutrient && !rainNodeOnline)
+                    key: nutrient
+                      ? null
+                      : ValueKey('water-pump-$bedIndex-toggle'),
+                    onPressed: nutrient
+                      ? (_actuatorBusy[key] == true || _chemicalPumpBusy
+                          ? null
+                          : () => _toggleActuator(key, actuator))
+                      : (commandPending &&
+                          (!isOn || _pendingActuatorStates[key] == false)
                         ? null
-                        : () => _toggleActuator(key, actuator),
+                        : (!isOn &&
+                              (!rainNodeOnline ||
+                                _otherWaterPumpIsRunning(actuator))
+                            ? null
+                            : () => _toggleActuator(key, actuator))),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: !nutrient && needsWater
-                          ? Colors.amber.shade300
-                          : Colors.grey.shade200,
-                      foregroundColor: Colors.black87,
+                      backgroundColor: !nutrient && isOn
+                        ? const Color(0xFF2DC867)
+                        : !nutrient && needsWater
+                        ? Colors.amber.shade300
+                        : Colors.grey.shade200,
+                      foregroundColor: !nutrient && isOn
+                        ? Colors.white
+                        : Colors.black87,
                       padding: const EdgeInsets.symmetric(horizontal: 8),
                     ),
                     child: Text(
-                      nutrient ? 'ADD' : 'PUMP',
+                      nutrient ? 'ADD' : isOn ? 'ON' : 'OFF',
                       style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
                   ),
@@ -7201,17 +7041,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               ],
             ),
           ),
-          if (!nutrient && !rainNodeOnline)
-            const Padding(
-              padding: EdgeInsets.only(left: 12, right: 12, bottom: 8),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  'Rainwater unit offline',
-                  style: TextStyle(color: Colors.orange, fontSize: 12),
-                ),
-              ),
-            ),
         ],
       );
     }
@@ -7266,20 +7095,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               ],
             ),
           ),
-          if (_reservoir.level == '50_or_below')
-            Container(
-              width: double.infinity,
-              margin: const EdgeInsets.only(bottom: 8),
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: const Color(0xFFFFF3E0),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: const Text(
-                'Low reservoir level. The firmware may block watering if configured.',
-                style: TextStyle(color: Colors.deepOrange, fontSize: 12),
-              ),
-            ),
           separatedRows([
             pumpRow(1, nutrient: false),
             pumpRow(2, nutrient: false),
@@ -7469,7 +7284,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                             ),
                           ),
                           subtitle: Text(
-                            'Reservoir ${reservoirLabel(log.reservoir.level)} · ${reservoirStatusLabel(log.reservoir)}',
+                            'Reservoir ${reservoirLabel(log.reservoir.level)}',
                             style: const TextStyle(fontSize: 11),
                           ),
                           trailing: const Icon(
@@ -7803,7 +7618,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   Widget _buildCleanCard(
     String title,
     String value,
-    String badgeText,
+    String? badgeText,
     Color bg,
     Color text,
   ) {
@@ -7837,22 +7652,24 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             value,
             style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
           ),
-          const SizedBox(height: 10),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: bg,
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Text(
-              badgeText,
-              style: TextStyle(
-                fontSize: 10,
-                fontWeight: FontWeight.bold,
-                color: text,
+          if (badgeText != null && badgeText.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: bg,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                badgeText,
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  color: text,
+                ),
               ),
             ),
-          ),
+          ],
         ],
       ),
     );
@@ -7914,7 +7731,7 @@ class _BatchHistoryScreenState extends State<BatchHistoryScreen> {
                 child: ListTile(
                   title: Text(_formatDateTime(log.timestamp)),
                   subtitle: Text(
-                    'pH ${log.pH.toStringAsFixed(2)}  |  ${log.temperature}  |  ${log.waterLevel}  |  TDS ${log.tds.toStringAsFixed(1)}  |  Reservoir ${reservoirLabel(log.reservoir.level)}  |  RAIN ${log.reservoir.online ? 'online' : 'offline'}',
+                    'pH ${log.pH.toStringAsFixed(2)}  |  ${log.temperature}  |  ${log.waterLevel}  |  TDS ${log.tds.toStringAsFixed(1)}  |  Reservoir ${reservoirLabel(log.reservoir.level)}',
                   ),
                   onTap: () => Navigator.push(
                     context,
@@ -8020,17 +7837,15 @@ class SnapshotDetailScreen extends StatelessWidget {
             _buildStaticCard(
               'RESERVOIR',
               reservoirLabel(data.reservoir.level),
-              reservoirStatusLabel(data.reservoir),
-              bgOverride:
-                  data.reservoir.online &&
-                      (data.reservoir.level == 'full' ||
-                          data.reservoir.level == 'above_50')
-                  ? const Color(0xFFE8F7ED)
-                  : const Color(0xFFFFF3E0),
-              textOverride:
-                  !data.reservoir.online || data.reservoir.level == 'unknown'
-                  ? reservoirColor('unknown')
-                  : reservoirColor(data.reservoir.level),
+              '',
+                bgOverride: switch (
+                  normalizeReservoirLevel(data.reservoir.level)
+                ) {
+                  'full' => const Color(0xFFE8F7ED),
+                  'not_full' => const Color(0xFFFFF3E0),
+                  _ => const Color(0xFFF0F0F0),
+                },
+                textOverride: reservoirColor(data.reservoir.level),
             ),
           ],
         ),
@@ -8105,7 +7920,7 @@ class SnapshotDetailScreen extends StatelessWidget {
   Widget _buildStaticCard(
     String title,
     String value,
-    String badgeText, {
+    String? badgeText, {
     Color? bgOverride,
     Color? textOverride,
   }) {
@@ -8139,22 +7954,24 @@ class SnapshotDetailScreen extends StatelessWidget {
             value,
             style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
           ),
-          const SizedBox(height: 10),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: bgOverride ?? const Color(0xFFF0F0F0),
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Text(
-              badgeText,
-              style: TextStyle(
-                fontSize: 10,
-                fontWeight: FontWeight.bold,
-                color: textOverride ?? Colors.grey,
+          if (badgeText != null && badgeText.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: bgOverride ?? const Color(0xFFF0F0F0),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                badgeText,
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  color: textOverride ?? Colors.grey,
+                ),
               ),
             ),
-          ),
+          ],
         ],
       ),
     );

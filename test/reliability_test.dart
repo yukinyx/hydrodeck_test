@@ -91,32 +91,64 @@ void main() {
   });
 
   group('pump command policy', () {
-    test('uses timed bed duration but fills a low bed until full', () {
+    test('keeps chemical pulses timed and water pumps on until switched off', () {
       expect(timedPumpDurationMs('nutrient1'), growBed1PumpDurationMs);
       expect(timedPumpDurationMs('phDown2'), growBed2PumpDurationMs);
+      expect(timedPumpDurationMs('waterPump1'), 0);
 
-      final refill = decidePumpCommand(
+      final start = decidePumpCommand(
         actuator: 'waterPump1',
-        requestId: 'cmd_refill',
+        requestedOn: true,
+        requestId: 'cmd_water_on',
         pumpActive: false,
         activeRequestId: '',
-        bedIsFull: false,
-        isWaterPump: true,
         rainNodeOnline: true,
       );
-      expect(refill.start, isTrue);
-      expect(refill.durationMs, 0);
-      expect(refill.stopWhenFull, isTrue);
+      expect(start.start, isTrue);
+      expect(start.durationMs, 0);
+
+      final stop = decidePumpCommand(
+        actuator: 'waterPump1',
+        requestedOn: false,
+        requestId: 'cmd_water_off',
+        pumpActive: true,
+        activeRequestId: 'cmd_water_on',
+        rainNodeOnline: false,
+      );
+      expect(stop.start, isFalse);
+      expect(stop.reject, isFalse);
+      expect(stop.status, 'accepted');
     });
 
     test('does not restart duplicate IDs and rejects a new ID while busy', () {
+      final duplicateWater = decidePumpCommand(
+        actuator: 'waterPump1',
+        requestedOn: true,
+        requestId: 'cmd_water_same',
+        pumpActive: true,
+        activeRequestId: 'cmd_water_same',
+        rainNodeOnline: true,
+      );
+      expect(duplicateWater.start, isFalse);
+      expect(duplicateWater.alreadyRunningSameCommand, isTrue);
+      expect(duplicateWater.durationMs, 0);
+
+      final conflictingWater = decidePumpCommand(
+        actuator: 'waterPump1',
+        requestedOn: true,
+        requestId: 'cmd_water_new',
+        pumpActive: true,
+        activeRequestId: 'cmd_water_same',
+        rainNodeOnline: true,
+      );
+      expect(conflictingWater.reject, isTrue);
+
       final duplicate = decidePumpCommand(
         actuator: 'phUp1',
+        requestedOn: true,
         requestId: 'cmd_same',
         pumpActive: true,
         activeRequestId: 'cmd_same',
-        bedIsFull: true,
-        isWaterPump: false,
         rainNodeOnline: true,
       );
       expect(duplicate.start, isFalse);
@@ -125,11 +157,10 @@ void main() {
 
       final conflicting = decidePumpCommand(
         actuator: 'phUp1',
+        requestedOn: true,
         requestId: 'cmd_new',
         pumpActive: true,
         activeRequestId: 'cmd_same',
-        bedIsFull: true,
-        isWaterPump: false,
         rainNodeOnline: true,
       );
       expect(conflicting.reject, isTrue);
@@ -139,17 +170,16 @@ void main() {
     test('allows water and grow light alongside one chemical pulse', () {
       final water = decidePumpCommand(
         actuator: 'waterPump2',
+        requestedOn: true,
         requestId: 'cmd_water_2',
         pumpActive: false,
         activeRequestId: '',
-        bedIsFull: true,
-        isWaterPump: true,
         rainNodeOnline: true,
         activeActuators: {'phUp1'},
       );
 
       expect(water.start, isTrue);
-      expect(water.durationMs, growBed2PumpDurationMs);
+      expect(water.durationMs, 0);
       expect(
         canStartActuatorAlongside('growLight', {'phUp1', 'waterPump2'}),
         isTrue,
@@ -162,11 +192,10 @@ void main() {
       for (final actuator in ['waterPump1', 'waterPump2']) {
         final decision = decidePumpCommand(
           actuator: actuator,
+          requestedOn: true,
           requestId: 'cmd_offline_$actuator',
           pumpActive: false,
           activeRequestId: '',
-          bedIsFull: true,
-          isWaterPump: true,
           rainNodeOnline: false,
         );
         expect(decision.start, isFalse);

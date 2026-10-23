@@ -280,8 +280,6 @@ float maxPhThreshold = 7.0;
 unsigned long lastPhLimitPoll = 0;
 const unsigned long phLimitPollInterval = 5000;
 bool phLimitRequestPending = false;
-unsigned long waterLowSince1 = 0;
-unsigned long waterLowSince2 = 0;
 bool rainNodeOnline = false;
 bool rainPump1On = false;
 bool rainPump2On = false;
@@ -292,7 +290,6 @@ bool reservoirFullWet = false;
 String reservoirLevel = "unknown";
 String rainFaultCode;
 unsigned long lastRainSeenAt = 0;
-unsigned long lastAutoRefillOfflineLogAt = 0;
 bool rainDesiredPump1On = false;
 bool rainDesiredPump2On = false;
 bool espNowReady = false;
@@ -304,6 +301,8 @@ uint32_t reportedEspNowQueueDrops = 0;
 uint32_t mainBootId = 0;
 uint32_t remoteCommandCounter = 0;
 uint32_t remotePumpCommandIds[2] = {};
+String pendingRemoteStopCommandIds[2];
+unsigned long pendingRemoteStopStartedAt[2] = {};
 uint32_t lastRainBootId = 0;
 uint16_t espNowSequence = 0;
 uint16_t lastRainSequence = 0;
@@ -330,24 +329,17 @@ const float phControlHysteresis = 0.15f;
 
 const unsigned long BED1_PUMP_DURATION_MS = 3000UL;
 const unsigned long BED2_PUMP_DURATION_MS = 5000UL;
-const unsigned long WATER_AUTO_START_DELAY_SECONDS = 20; // Set to 0 for immediate auto-fill.
-const unsigned long waterAutoDelay = WATER_AUTO_START_DELAY_SECONDS * 1000UL;
-
 struct PumpRunState {
   bool active = false;
-  bool stopWhenFull = false;
   bool hasDeadline = false;
   bool awaitingStartConfirmation = false;
   bool stopRequested = false;
-  bool manualShortRun = false;
   unsigned long durationMs = 0;
   unsigned long confirmationStartedAt = 0;
   unsigned long stopAt = 0;
 };
 
 PumpRunState pumpRuns[8];
-int manualWaterShortRuns1 = 0;
-int manualWaterShortRuns2 = 0;
 
 int getMedianNum(int values[], int length) {
   int bTab[length];
@@ -632,15 +624,10 @@ void parsePhAdjustCommand(const String& command) {
   // Start the pump run
   PumpRunState& run = pumpRuns[pumpNum - 1];
   run.active = true;
-  run.stopWhenFull = false;
   run.hasDeadline = true;
   run.stopAt = millis() + durationMs;
   setPump(pumpNum, true);
   publishActuatorState(actuatorName, true);
-}
-
-bool waterSensorFullForPump(int pumpNum) {
-  return digitalRead(pumpNum == 1 ? WATER_SENSOR_PIN1 : WATER_SENSOR_PIN2) == HIGH;
 }
 
 String consumedCommandStatus(const String& requestId) {
@@ -748,7 +735,6 @@ String pumpStartRejectionReason(int pumpNum) {
 bool startPumpRun(
     int pumpNum,
     unsigned long durationMs,
-    bool stopWhenFull,
     const String& requestId = "",
     String* rejectionReason = nullptr) {
   const String reason = pumpStartRejectionReason(pumpNum);
@@ -756,11 +742,9 @@ bool startPumpRun(
   if (reason.length() > 0) return false;
   PumpRunState& run = pumpRuns[pumpNum - 1];
   run.active = true;
-  run.stopWhenFull = stopWhenFull;
   run.hasDeadline = durationMs > 0;
   run.awaitingStartConfirmation = isRemoteWaterPump(pumpNum);
   run.stopRequested = false;
-  run.manualShortRun = false;
   run.durationMs = durationMs;
   run.confirmationStartedAt = millis();
   run.stopAt = durationMs == 0 ? 0 : millis() + durationMs;
@@ -768,11 +752,10 @@ bool startPumpRun(
   setPump(pumpNum, true);
   if (isRemoteWaterPump(pumpNum)) {
     Serial.printf(
-      "Remote pump start requested pump=%s requestId=%s durationMs=%lu stopWhenFull=%d\n",
+      "Remote pump start requested pump=%s requestId=%s durationMs=%lu\n",
       remoteActuatorNames[pumpNum - 1],
       requestId.c_str(),
-      durationMs,
-      stopWhenFull ? 1 : 0
+      durationMs
     );
   } else {
     publishActuatorState(remoteActuatorNames[pumpNum - 1], true);
@@ -800,7 +783,6 @@ void serviceAutomaticPhControl(int bed, float phValue, unsigned long now) {
       const bool started = startPumpRun(
         upPump,
         pulseDuration,
-        false,
         "",
         &rejectionReason
       );
@@ -829,7 +811,6 @@ void serviceAutomaticPhControl(int bed, float phValue, unsigned long now) {
       const bool started = startPumpRun(
         downPump,
         pulseDuration,
-        false,
         "",
         &rejectionReason
       );
@@ -858,13 +839,18 @@ void serviceAutomaticPhControl(int bed, float phValue, unsigned long now) {
 void finishRemotePumpStop(int pumpNum) {
   if (pumpNum != 1 && pumpNum != 5) return;
   PumpRunState& run = pumpRuns[pumpNum - 1];
+  const int index = pumpNum == 1 ? 0 : 1;
   const String requestId = activeCommandIds[pumpNum - 1];
+  const String stopRequestId = pendingRemoteStopCommandIds[index];
   const String actuator = remoteActuatorNames[pumpNum - 1];
   setPump(pumpNum, false);
   activeCommandIds[pumpNum - 1] = "";
   run = PumpRunState();
   publishActuatorState(actuator, false);
   publishCommandAck(requestId, "completed");
+  if (stopRequestId != requestId) publishCommandAck(stopRequestId, "completed");
+  pendingRemoteStopCommandIds[index] = "";
+  pendingRemoteStopStartedAt[index] = 0;
   Serial.printf(
     "Remote pump stopped pump=%s requestId=%s confirmed=1\n",
     actuator.c_str(),
@@ -890,17 +876,26 @@ void rejectUnconfirmedRemotePumpStart(int pumpNum) {
 }
 
 void finishRemotePumpFault(int pumpNum, const String& reason) {
-  if ((pumpNum != 1 && pumpNum != 5) || !pumpRuns[pumpNum - 1].active) return;
+  if (pumpNum != 1 && pumpNum != 5) return;
+  const int index = pumpNum == 1 ? 0 : 1;
   PumpRunState& run = pumpRuns[pumpNum - 1];
+  if (!run.active && pendingRemoteStopCommandIds[index].isEmpty()) return;
   const String requestId = activeCommandIds[pumpNum - 1];
+  const String stopRequestId = pendingRemoteStopCommandIds[index];
   const String actuator = remoteActuatorNames[pumpNum - 1];
-  const bool rejectedBeforeStart = run.awaitingStartConfirmation;
+  const bool rejectedBeforeStart = run.active && run.awaitingStartConfirmation;
   setPump(pumpNum, false);
   activeCommandIds[pumpNum - 1] = "";
   run = PumpRunState();
   publishActuatorState(actuator, false);
   publishCommandRejectionReason(requestId, reason);
   publishCommandAck(requestId, rejectedBeforeStart ? "rejected" : "timed_out");
+  if (stopRequestId != requestId) {
+    publishCommandRejectionReason(stopRequestId, reason);
+    publishCommandAck(stopRequestId, "timed_out");
+  }
+  pendingRemoteStopCommandIds[index] = "";
+  pendingRemoteStopStartedAt[index] = 0;
   Serial.printf(
     "Remote pump %s pump=%s requestId=%s reason=%s\n",
     rejectedBeforeStart ? "rejected" : "stopped",
@@ -910,48 +905,59 @@ void finishRemotePumpFault(int pumpNum, const String& reason) {
   );
 }
 
-void requestRemotePumpStop(int pumpNum) {
+void requestRemotePumpStop(int pumpNum, const String& requestId) {
+  const int index = pumpNum == 1 ? 0 : 1;
   PumpRunState& run = pumpRuns[pumpNum - 1];
+  pendingRemoteStopCommandIds[index] = requestId;
+  pendingRemoteStopStartedAt[index] = millis();
+  const bool wasDesired = index == 0 ? rainDesiredPump1On : rainDesiredPump2On;
   setPump(pumpNum, false);
-  if (!run.active || run.stopRequested) return;
-  run.stopRequested = true;
+  if (!wasDesired) {
+    remoteCommandCounter++;
+    if (remoteCommandCounter == 0) remoteCommandCounter++;
+    remotePumpCommandIds[index] = remoteCommandCounter;
+    rainAcknowledgedCommandId[index] = 0;
+    rainAcknowledgedResult[index] = 0;
+    lastRainCommandSentAt[index] = 0;
+  }
+  if (run.active) run.stopRequested = true;
   Serial.printf(
-    "Remote pump stop requested pump=%s requestId=%s\n",
+    "Remote pump stop requested pump=%s requestId=%s command=%lu\n",
     remoteActuatorNames[pumpNum - 1],
-    activeCommandIds[pumpNum - 1].c_str()
+    requestId.c_str(),
+    static_cast<unsigned long>(remotePumpCommandIds[index])
   );
 }
 
-void stopPumpRun(int pumpNum) {
+void stopPumpRun(int pumpNum, const String& requestId = "") {
   if (pumpNum < 1 || pumpNum > 8) return;
   if (isRemoteWaterPump(pumpNum)) {
-    requestRemotePumpStop(pumpNum);
+    requestRemotePumpStop(pumpNum, requestId);
     return;
   }
   PumpRunState& run = pumpRuns[pumpNum - 1];
   if (!run.active) return;
   setPump(pumpNum, false);
-  const String requestId = activeCommandIds[pumpNum - 1];
+  const String activeRequestId = activeCommandIds[pumpNum - 1];
   activeCommandIds[pumpNum - 1] = "";
   run.active = false;
-  run.stopWhenFull = false;
   run.hasDeadline = false;
   run.awaitingStartConfirmation = false;
   run.stopRequested = false;
-  run.manualShortRun = false;
   run.durationMs = 0;
   run.stopAt = 0;
   publishActuatorState(remoteActuatorNames[pumpNum - 1], false);
-  publishCommandAck(requestId, "completed");
+  publishCommandAck(activeRequestId, "completed");
 }
-
-bool executePumpRequest(const String& actuator, bool enforceManualRules, const String& requestId = "") {
+bool executePumpRequest(const String& actuator, bool requestedOn, const String& requestId = "") {
   const int pumpNum = pumpNumberForActuator(actuator);
   if (pumpNum == 0) return false;
+  if (!requestedOn) {
+    stopPumpRun(pumpNum, requestId);
+    return true;
+  }
 
   unsigned long durationMs = 0;
-  bool stopWhenFull = false;
-  int* manualShortRunCounter = nullptr;
   if (actuator == "phUp1" || actuator == "phDown1") {
     if ((actuator == "phUp1" && currentPhValue1 > maxPhThreshold) ||
       (actuator == "phDown1" && currentPhValue1 < minPhThreshold)) return false;
@@ -964,29 +970,10 @@ bool executePumpRequest(const String& actuator, bool enforceManualRules, const S
     durationMs = BED1_PUMP_DURATION_MS;
   } else if (actuator == "nutrient2") {
     durationMs = BED2_PUMP_DURATION_MS;
-  } else if (actuator == "waterPump1" || actuator == "waterPump2") {
-    if (pumpRuns[pumpNum - 1].active) return false;
-    const bool isFull = waterSensorFullForPump(pumpNum);
-    if (isFull) {
-      durationMs = pumpNum <= 4 ? BED1_PUMP_DURATION_MS : BED2_PUMP_DURATION_MS;
-      if (enforceManualRules) {
-        int& count = actuator == "waterPump1" ? manualWaterShortRuns1 : manualWaterShortRuns2;
-        if (count >= 2) return false;
-        manualShortRunCounter = &count;
-      }
-    } else {
-      stopWhenFull = true;
-    }
+  } else if (isRemoteWaterPump(pumpNum)) {
+    durationMs = 0;
   }
-  const bool started = startPumpRun(pumpNum, durationMs, stopWhenFull, requestId);
-  if (started && manualShortRunCounter != nullptr) {
-    if (isRemoteWaterPump(pumpNum)) {
-      pumpRuns[pumpNum - 1].manualShortRun = true;
-    } else {
-      (*manualShortRunCounter)++;
-    }
-  }
-  return started;
+  return startPumpRun(pumpNum, durationMs, requestId);
 }
 
 void publishReportedRemotePumpState(int pumpNum, bool pumpIsOn, bool wasKnown) {
@@ -1006,11 +993,6 @@ void publishReportedRemotePumpState(int pumpNum, bool pumpIsOn, bool wasKnown) {
   if (run.active && run.awaitingStartConfirmation && pumpIsOn) {
     run.awaitingStartConfirmation = false;
     if (run.hasDeadline) run.stopAt = millis() + run.durationMs;
-    if (run.manualShortRun) {
-      if (pumpNum == 1) manualWaterShortRuns1++;
-      else manualWaterShortRuns2++;
-      run.manualShortRun = false;
-    }
     publishCommandAck(activeCommandIds[pumpNum - 1], "running");
     publishActuatorState(actuator, true);
     Serial.printf(
@@ -1020,7 +1002,8 @@ void publishReportedRemotePumpState(int pumpNum, bool pumpIsOn, bool wasKnown) {
     );
     return;
   }
-  if (run.active && run.stopRequested && !pumpIsOn) {
+  if (!pumpIsOn && (run.stopRequested ||
+      !pendingRemoteStopCommandIds[pumpNum == 1 ? 0 : 1].isEmpty())) {
     finishRemotePumpStop(pumpNum);
     return;
   }
@@ -1037,15 +1020,22 @@ void serviceRemotePumpFeedback(unsigned long now) {
   }
 }
 
-String reservoirLevelFromSensors(bool midWet, bool fullWet) {
-  if (fullWet && !midWet) return "unknown";
-  if (fullWet) return "full";
-  if (midWet) return "above_50";
-  return "50_or_below";
+String reservoirLevelFromSensors(bool fullWet) {
+  return fullWet ? "full" : "not_full";
 }
 
 void serviceRainNodeHealth(unsigned long now) {
-  if (!rainNodeOnline || now - lastRainSeenAt <= RAIN_NODE_TIMEOUT_MS) return;
+  if (!rainNodeOnline) {
+    for (const int pumpNum : {1, 5}) {
+      const int index = pumpNum == 1 ? 0 : 1;
+      if (!pendingRemoteStopCommandIds[index].isEmpty() &&
+          now - pendingRemoteStopStartedAt[index] >= RAIN_NODE_TIMEOUT_MS) {
+        finishRemotePumpFault(pumpNum, "rain_node_offline");
+      }
+    }
+    return;
+  }
+  if (now - lastRainSeenAt <= RAIN_NODE_TIMEOUT_MS) return;
   rainNodeOnline = false;
   reservoirLevel = "unknown";
   Serial.println("RAIN node offline");
@@ -1057,11 +1047,16 @@ void serviceRainNodeHealth(unsigned long now) {
     if (wasOn || (run.active && !run.awaitingStartConfirmation)) {
       publishActuatorState(remoteActuatorNames[pumpNum - 1], false);
     }
-    if (!run.active) continue;
+    if (!run.active) {
+      if (!pendingRemoteStopCommandIds[pumpNum == 1 ? 0 : 1].isEmpty()) {
+        finishRemotePumpFault(pumpNum, "rain_node_offline");
+      }
+      continue;
+    }
     if (run.awaitingStartConfirmation) {
       rejectUnconfirmedRemotePumpStart(pumpNum);
     } else {
-      finishRemotePumpStop(pumpNum);
+      finishRemotePumpFault(pumpNum, "rain_node_offline");
     }
   }
 }
@@ -1094,7 +1089,8 @@ void sendMainBeacon() {
 
 unsigned long remotePumpRemainingMs(int pumpNum, unsigned long now) {
   const PumpRunState& run = pumpRuns[pumpNum - 1];
-  if (!run.active || !run.hasDeadline || run.stopRequested) return 0;
+  if (isRemoteWaterPump(pumpNum) || !run.active || !run.hasDeadline ||
+      run.stopRequested) return 0;
   if ((long)(now - run.stopAt) >= 0) return 1;
   return min(run.stopAt - now, RAIN_MAX_RUN_MS);
 }
@@ -1206,7 +1202,7 @@ void processRainStatus(const ReceivedPacket& received,
   rainNodeOnline = true;
   reservoirMidWet = report.midWet != 0;
   reservoirFullWet = report.fullWet != 0;
-  reservoirLevel = reservoirLevelFromSensors(reservoirMidWet, reservoirFullWet);
+  reservoirLevel = reservoirLevelFromSensors(reservoirFullWet);
   rainFaultCode = rainFaultName(report.fault);
   if (!wasOnline) {
     Serial.printf("RAIN ESP-NOW online channel=%u\n", report.currentChannel);
@@ -1368,9 +1364,7 @@ void servicePumpRuns() {
     PumpRunState& run = pumpRuns[pumpNum - 1];
     if (!run.active) continue;
     if (isRemoteWaterPump(pumpNum) && run.stopRequested) continue;
-    if (run.stopWhenFull && waterSensorFullForPump(pumpNum)) {
-      stopPumpRun(pumpNum);
-    } else if (run.hasDeadline && (long)(now - run.stopAt) >= 0) {
+    if (run.hasDeadline && (long)(now - run.stopAt) >= 0) {
       stopPumpRun(pumpNum);
     }
   }
@@ -1409,6 +1403,9 @@ void finishRemoteCommand(const String& previousStatus) {
         commandAwaitingRemoteStart = pumpRuns[index].awaitingStartConfirmation;
       }
     }
+    for (const String& stopRequestId : pendingRemoteStopCommandIds) {
+      if (stopRequestId == requestId) commandIsRunning = true;
+    }
     if (commandIsRunning) {
       if (!commandAwaitingRemoteStart) publishCommandAck(requestId, "running");
     } else {
@@ -1446,11 +1443,16 @@ void finishRemoteCommand(const String& previousStatus) {
     } else {
       const int pumpNum = pumpNumberForActuator(actuator);
       String rejectionReason;
-      const bool started = commandValue == "1" && executePumpRequest(actuator, true, requestId);
-      if (!started) {
-        rejectionReason = commandValue != "1"
-            ? "invalid_value"
-            : pumpStartRejectionReason(pumpNum);
+      const bool waterPump = isRemoteWaterPump(pumpNum);
+      const bool validValue = commandValue == "1" ||
+        (waterPump && commandValue == "0");
+      const bool requestedOn = commandValue == "1";
+      const bool accepted = validValue &&
+        executePumpRequest(actuator, requestedOn, requestId);
+      if (!accepted) {
+      rejectionReason = !validValue
+        ? "invalid_value"
+        : pumpStartRejectionReason(pumpNum);
         if (rejectionReason.length() == 0) rejectionReason = "threshold_or_manual_safety";
         if (rejectionReason == "rain_node_offline" ||
             rejectionReason == "rain_node_no_confirm") {
@@ -1462,8 +1464,8 @@ void finishRemoteCommand(const String& previousStatus) {
         "Command requestId=%s actuator=%s result=%s reason=%s\n",
         requestId.c_str(),
         actuator.c_str(),
-        started ? "accepted" : "rejected",
-        started ? "none" : rejectionReason.c_str()
+        accepted ? "accepted" : "rejected",
+        accepted ? "none" : rejectionReason.c_str()
       );
     }
   }
@@ -1781,7 +1783,10 @@ void handleCombinedStatus() {
       ? now - lastFirebaseHeartbeatSuccessAt : 0;
   const bool heartbeatFresh = heartbeatKnown && heartbeatAge <= 10000UL;
   String json = "{";
-  json += "\"reservoir\":\"" + reservoirLevel + "\",";
+  json += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"mid\":" +
+      String(reservoirMidWet ? "true" : "false") + ",\"full\":" +
+      String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
+      String(rainNodeOnline ? "true" : "false") + "},";
   json += "\"reservoirMid\":" + String(reservoirMidWet ? 1 : 0) + ",";
   json += "\"reservoirFull\":" + String(reservoirFullWet ? 1 : 0) + ",";
   json += "\"rainNodeOnline\":" + String(rainNodeOnline ? "true" : "false") + ",";
@@ -1849,7 +1854,8 @@ void handleControl() {
   // Handle traditional actuator control: /control?actuator=<name>&state=<0|1>
   if (server.hasArg("actuator") && server.hasArg("state")) {
     String actuator = server.arg("actuator");
-    bool state = (server.arg("state") == "1" || server.arg("state") == "on");
+    const String stateValue = server.arg("state");
+    bool state = (stateValue == "1" || stateValue == "on");
     if (actuator == "growLight") {
       const String requestId = server.arg("requestId");
       if (requestId.length() > 0 && !isValidCommandRequestId(requestId)) {
@@ -1869,12 +1875,12 @@ void handleControl() {
     }
     const int pumpNum = pumpNumberForActuator(actuator);
     if (pumpNum > 0) {
-      const String requestId = server.arg("requestId");
-      if (!state) {
-        stopPumpRun(pumpNum);
-        server.send(200, "text/plain", "OK");
+      if (isRemoteWaterPump(pumpNum) && stateValue != "0" &&
+          stateValue != "1" && stateValue != "on" && stateValue != "off") {
+        server.send(400, "text/plain", "Invalid water-pump state");
         return;
       }
+      const String requestId = server.arg("requestId");
       if (requestId.length() > 0 && !isValidCommandRequestId(requestId)) {
         server.send(400, "text/plain", "Invalid request ID");
         return;
@@ -1885,6 +1891,16 @@ void handleControl() {
         return;
       }
       if (requestId.length() > 0) publishCommandAck(requestId, "accepted");
+      if (!state) {
+        if (isRemoteWaterPump(pumpNum)) {
+          stopPumpRun(pumpNum, requestId);
+        } else {
+          stopPumpRun(pumpNum);
+          if (requestId.length() > 0) publishCommandAck(requestId, "completed");
+        }
+        server.send(200, "text/plain", "OK");
+        return;
+      }
       if (!executePumpRequest(actuator, true, requestId)) {
         String rejectionReason = pumpStartRejectionReason(pumpNum);
         if (rejectionReason == "rain_node_offline" ||
@@ -2263,51 +2279,6 @@ void loop() {
 
     serviceAutomaticPhControl(1, currentPhValue1, now);
     serviceAutomaticPhControl(2, currentPhValue2, now);
-  }
-
-  const bool waterFull1 = digitalRead(WATER_SENSOR_PIN1) == HIGH;
-  const bool waterFull2 = digitalRead(WATER_SENSOR_PIN2) == HIGH;
-  if (waterFull1) {
-    waterLowSince1 = 0;
-  } else {
-    manualWaterShortRuns1 = 0;
-    if (waterLowSince1 == 0) waterLowSince1 = now;
-    if (now - waterLowSince1 >= waterAutoDelay && !pumpRuns[0].active) {
-      if (rainNodeOnline) {
-        String rejectionReason;
-        if (!startPumpRun(1, 0, true, "", &rejectionReason) &&
-            (lastAutoRefillOfflineLogAt == 0 ||
-             now - lastAutoRefillOfflineLogAt >= phAutoRetryLogInterval)) {
-          Serial.printf("Auto refill rejected pump=waterPump1 reason=%s\n", rejectionReason.c_str());
-          lastAutoRefillOfflineLogAt = now;
-        }
-      } else if (lastAutoRefillOfflineLogAt == 0 ||
-                 now - lastAutoRefillOfflineLogAt >= phAutoRetryLogInterval) {
-        Serial.println("Auto refill skipped reason=rain_node_offline");
-        lastAutoRefillOfflineLogAt = now;
-      }
-    }
-  }
-  if (waterFull2) {
-    waterLowSince2 = 0;
-  } else {
-    manualWaterShortRuns2 = 0;
-    if (waterLowSince2 == 0) waterLowSince2 = now;
-    if (now - waterLowSince2 >= waterAutoDelay && !pumpRuns[4].active) {
-      if (rainNodeOnline) {
-        String rejectionReason;
-        if (!startPumpRun(5, 0, true, "", &rejectionReason) &&
-            (lastAutoRefillOfflineLogAt == 0 ||
-             now - lastAutoRefillOfflineLogAt >= phAutoRetryLogInterval)) {
-          Serial.printf("Auto refill rejected pump=waterPump2 reason=%s\n", rejectionReason.c_str());
-          lastAutoRefillOfflineLogAt = now;
-        }
-      } else if (lastAutoRefillOfflineLogAt == 0 ||
-                 now - lastAutoRefillOfflineLogAt >= phAutoRetryLogInterval) {
-        Serial.println("Auto refill skipped reason=rain_node_offline");
-        lastAutoRefillOfflineLogAt = now;
-      }
-    }
   }
 
   servicePumpRuns();

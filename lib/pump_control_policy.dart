@@ -24,14 +24,9 @@ const Set<String> validRemoteActuators = {
   'growLight',
 };
 
-/// Timed pulse duration for a named actuator.
-///
-/// Safety exception: a water pump filling a low bed runs until the water
-/// sensor reports full (`durationMs = 0`, `stopWhenFull = true`) instead of
-/// using the 3s/5s pulse. Automatic refill uses that same fill-until-full
-/// behavior. Timed 3s/5s pulses apply to pH, nutrient, and manual water
-/// pulses when the bed is already full.
+/// Timed pulse duration for chemical pumps; water pumps are ON/OFF.
 int timedPumpDurationMs(String actuator) {
+  if (actuator == 'waterPump1' || actuator == 'waterPump2') return 0;
   if (growBed1Actuators.contains(actuator)) return growBed1PumpDurationMs;
   if (growBed2Actuators.contains(actuator)) return growBed2PumpDurationMs;
   return 0;
@@ -62,7 +57,6 @@ class PumpRunDecision {
   final bool alreadyRunningSameCommand;
   final String status;
   final int durationMs;
-  final bool stopWhenFull;
 
   const PumpRunDecision({
     required this.start,
@@ -70,7 +64,6 @@ class PumpRunDecision {
     required this.alreadyRunningSameCommand,
     required this.status,
     required this.durationMs,
-    required this.stopWhenFull,
   });
 }
 
@@ -78,11 +71,10 @@ class PumpRunDecision {
 /// an already-running pump is rejected.
 PumpRunDecision decidePumpCommand({
   required String actuator,
+  required bool requestedOn,
   required String requestId,
   required bool pumpActive,
   required String activeRequestId,
-  required bool bedIsFull,
-  required bool isWaterPump,
   required bool rainNodeOnline,
   Set<String> activeActuators = const {},
 }) {
@@ -93,18 +85,34 @@ PumpRunDecision decidePumpCommand({
       alreadyRunningSameCommand: false,
       status: 'rejected',
       durationMs: 0,
-      stopWhenFull: false,
     );
   }
-  if ((actuator == 'waterPump1' || actuator == 'waterPump2') &&
-      !rainNodeOnline) {
+  final isWaterPump = actuator == 'waterPump1' || actuator == 'waterPump2';
+  if (!requestedOn) {
+    if (!isWaterPump) {
+      return const PumpRunDecision(
+        start: false,
+        reject: true,
+        alreadyRunningSameCommand: false,
+        status: 'rejected',
+        durationMs: 0,
+      );
+    }
+    return const PumpRunDecision(
+      start: false,
+      reject: false,
+      alreadyRunningSameCommand: false,
+      status: 'accepted',
+      durationMs: 0,
+    );
+  }
+  if (isWaterPump && !rainNodeOnline) {
     return const PumpRunDecision(
       start: false,
       reject: true,
       alreadyRunningSameCommand: false,
       status: 'rejected',
       durationMs: 0,
-      stopWhenFull: false,
     );
   }
   if (pumpActive && activeRequestId == requestId && requestId.isNotEmpty) {
@@ -114,7 +122,6 @@ PumpRunDecision decidePumpCommand({
       alreadyRunningSameCommand: true,
       status: 'running',
       durationMs: 0,
-      stopWhenFull: false,
     );
   }
   if (pumpActive) {
@@ -124,7 +131,6 @@ PumpRunDecision decidePumpCommand({
       alreadyRunningSameCommand: false,
       status: 'rejected',
       durationMs: 0,
-      stopWhenFull: false,
     );
   }
   if (!canStartActuatorAlongside(actuator, activeActuators)) {
@@ -134,18 +140,6 @@ PumpRunDecision decidePumpCommand({
       alreadyRunningSameCommand: false,
       status: 'rejected',
       durationMs: 0,
-      stopWhenFull: false,
-    );
-  }
-
-  if (isWaterPump && !bedIsFull) {
-    return const PumpRunDecision(
-      start: true,
-      reject: false,
-      alreadyRunningSameCommand: false,
-      status: 'running',
-      durationMs: 0,
-      stopWhenFull: true,
     );
   }
 
@@ -155,7 +149,6 @@ PumpRunDecision decidePumpCommand({
     alreadyRunningSameCommand: false,
     status: 'running',
     durationMs: timedPumpDurationMs(actuator),
-    stopWhenFull: false,
   );
 }
 

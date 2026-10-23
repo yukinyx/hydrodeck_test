@@ -44,6 +44,37 @@ void main() {
     expect(telemetry.firebaseReady, isFalse);
     expect(telemetry.firebaseHeartbeatFresh, isTrue);
     expect(telemetry.reservoir.online, isFalse);
+    expect(telemetry.reservoir.level, 'unknown');
+    expect(
+      ReservoirReading.fromSources(
+        shared: {'level': 'full', 'online': false},
+      ).level,
+      'unknown',
+    );
+  });
+
+  test('dashboard status has exactly three reachability labels', () {
+    expect(
+      dashboardConnectionStatus(
+        localTelemetryFresh: true,
+        firebaseHeartbeatFresh: false,
+      ),
+      'Connected locally',
+    );
+    expect(
+      dashboardConnectionStatus(
+        localTelemetryFresh: false,
+        firebaseHeartbeatFresh: true,
+      ),
+      'Online',
+    );
+    expect(
+      dashboardConnectionStatus(
+        localTelemetryFresh: false,
+        firebaseHeartbeatFresh: false,
+      ),
+      'ESP32 offline',
+    );
   });
 
   test('reservoir model prefers shared data and reads legacy bed fields', () {
@@ -57,7 +88,7 @@ void main() {
     final legacy = ReservoirReading.fromSources(
       bed1: {'reservoir': 'above_50', 'rainNodeOnline': true},
     );
-    expect(legacy.level, 'above_50');
+    expect(legacy.level, 'not_full');
     expect(legacy.online, isTrue);
 
     final legacyBed2 = ReservoirReading.fromSources(
@@ -69,8 +100,23 @@ void main() {
     final legacySqlite = ReservoirReading.fromSources(
       bed1: '{"reservoir":"50_or_below","rainNodeOnline":true}',
     );
-    expect(legacySqlite.level, '50_or_below');
+    expect(legacySqlite.level, 'not_full');
     expect(legacySqlite.online, isTrue);
+    final legacyOffline = ReservoirReading.fromSources(
+      shared: {'level': '50_or_below', 'online': false},
+    );
+    expect(legacyOffline.level, 'not_full');
+    expect(legacyOffline.online, isFalse);
+    final currentOffline = ReservoirReading.fromSources(
+      shared: {'level': 'full', 'online': false},
+    );
+    expect(currentOffline.level, 'unknown');
+    expect(reservoirLabel('full'), 'Full');
+    expect(reservoirLabel('not_full'), 'Not full');
+    expect(reservoirLabel('unknown'), 'Unknown');
+    expect(reservoirColor('full'), Colors.green.shade800);
+    expect(reservoirColor('not_full'), Colors.orange);
+    expect(reservoirColor('unknown'), Colors.grey);
   });
 
   test('scheduled cloud snapshots retain reservoir fields for both beds', () {
@@ -112,7 +158,7 @@ void main() {
         'reservoir': 'above_50',
         'rainNodeOnline': true,
       });
-      expect(localStatus.reservoir.level, 'above_50');
+      expect(localStatus.reservoir.level, 'not_full');
       expect(localStatus.reservoir.online, isTrue);
 
       final legacy = HydrodeckTelemetry.fromJson({
@@ -120,7 +166,7 @@ void main() {
         'ph2': 6.4,
         'bed1': {'reservoir': 'above_50', 'rainNodeOnline': true},
       });
-      expect(legacy.reservoir.level, 'above_50');
+      expect(legacy.reservoir.level, 'not_full');
       expect(legacy.reservoir.online, isTrue);
     },
   );
@@ -167,11 +213,6 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Home'), findsOneWidget);
-    expect(find.textContaining('MAIN HTTP:'), findsOneWidget);
-    expect(find.textContaining('MAIN Wi-Fi:'), findsOneWidget);
-    expect(find.textContaining('MAIN Firebase:'), findsOneWidget);
-    expect(find.textContaining('MAIN Firebase heartbeat:'), findsOneWidget);
-    expect(find.textContaining('RAIN ESP-NOW:'), findsOneWidget);
     expect(find.text('Grow Bed 1 Metrics'), findsOneWidget);
     expect(find.text('Grow Bed 2 Metrics'), findsOneWidget);
     expect(find.text('RESERVOIR'), findsOneWidget);
@@ -188,11 +229,13 @@ void main() {
     expect(find.text('WATER PUMP'), findsOneWidget);
     expect(find.text('NUTRIENT SOLUTION'), findsOneWidget);
     expect(find.text('GROW LIGHT'), findsOneWidget);
-    expect(find.text('Rainwater unit offline'), findsNWidgets(2));
+    expect(find.text('Rainwater unit offline'), findsNothing);
 
     final growLightButton = find.byKey(const ValueKey('grow-light-button'));
     expect(growLightButton, findsOneWidget);
-    expect(find.text('OFF'), findsOneWidget);
+    expect(find.text('OFF'), findsNWidgets(3));
+    expect(find.byKey(const ValueKey('water-pump-1-toggle')), findsOneWidget);
+    expect(find.byKey(const ValueKey('water-pump-2-toggle')), findsOneWidget);
 
     await tester.tap(find.text('DATA'));
     await tester.pumpAndSettle();
