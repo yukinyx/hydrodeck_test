@@ -17,3 +17,9 @@ bool isValidCommandAckStatus(String? status) =>
 
 bool isTerminalCommandAckStatus(String? status) =>
     status != null && terminalCommandAckStatuses.contains(status);
+
+bool shouldReleasePendingCommand({String? status, bool timedOut = false}) =>
+  timedOut || isTerminalCommandAckStatus(status);
+
+bool isConfirmedWaterPumpOnAck(String actuator, String? status) =>
+  actuator.startsWith('waterPump') && status == 'running';

@@ -5068,12 +5068,48 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         var changed = false;
         for (final pending in _pendingCommandIds.entries.toList()) {
           final status = acknowledgments[pending.value]?.toString();
-          if (status == 'accepted' || status == 'running') {
-            _commandsAcceptedOrRunning.add(pending.value);
+          if (isConfirmedWaterPumpOnAck(pending.key, status)) {
+            final busyKey = _getActuatorBusyKey(pending.key);
+            _pendingCommandIds.remove(pending.key);
+            _commandsAcceptedOrRunning.remove(pending.value);
             _commandTimeouts.remove(pending.value)?.cancel();
+            unawaited(
+              _removeFirebaseCommandRecord(pending.key, pending.value),
+            );
+            if (busyKey != null) {
+              _controlStates[busyKey] = true;
+              _actuatorBusy[busyKey] = false;
+              _pendingActuatorStates.remove(busyKey);
+              _actuatorsSeenRunning.remove(busyKey);
+            }
+            changed = true;
+            continue;
+          }
+          if (status == 'accepted' || status == 'running') {
+            final firstAcceptance =
+                _commandsAcceptedOrRunning.add(pending.value);
             final busyKey = _getActuatorBusyKey(pending.key);
             if (busyKey != null) _actuatorBusy[busyKey] = true;
-            if (!pending.key.startsWith('waterPump')) {
+            if (pending.key.startsWith('waterPump')) {
+              if (firstAcceptance) {
+                _commandTimeouts.remove(pending.value)?.cancel();
+                _commandTimeouts[pending.value] = Timer(commandAckTimeout, () {
+                  if (_pendingCommandIds[pending.key] != pending.value) return;
+                  _clearPendingCommand(pending.key, pending.value);
+                  unawaited(
+                    _removeFirebaseCommandRecord(pending.key, pending.value),
+                  );
+                  if (mounted) {
+                    _showCommandMessage(
+                      pending.key,
+                      'The pump command was accepted but never finished. Check its state and try again.',
+                    );
+                    setState(() {});
+                  }
+                });
+              }
+            } else {
+              _commandTimeouts.remove(pending.value)?.cancel();
               _commandTimeouts[pending.value] = Timer(
                 _actuatorPulseGrace(pending.key),
                 () {
@@ -5086,7 +5122,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             changed = true;
             continue;
           }
-          if (!isTerminalCommandAckStatus(status)) continue;
+          if (!shouldReleasePendingCommand(status: status)) continue;
           final wasAcceptedOrRunning = _commandsAcceptedOrRunning.remove(
             pending.value,
           );
@@ -5802,6 +5838,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     _commandTimeouts[commandId]?.cancel();
     _commandTimeouts[commandId] = Timer(commandAckTimeout, () {
       if (_pendingCommandIds[actuatorName] != commandId) return;
+      if (!shouldReleasePendingCommand(timedOut: true)) return;
       final wasAcceptedOrSeen =
           _commandsAcceptedOrRunning.remove(commandId) ||
           _actuatorsSeenRunning.remove(key);

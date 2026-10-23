@@ -245,5 +245,21 @@ void main() {
       expect(isTerminalCommandAckStatus('timed_out'), isTrue);
       expect(isValidCommandAckStatus('failed'), isFalse);
     });
+
+    test('releases pending command state after terminal ack or timeout', () {
+      expect(shouldReleasePendingCommand(status: 'accepted'), isFalse);
+      expect(shouldReleasePendingCommand(status: 'running'), isFalse);
+      expect(shouldReleasePendingCommand(status: 'rejected'), isTrue);
+      expect(shouldReleasePendingCommand(status: 'timed_out'), isTrue);
+      expect(shouldReleasePendingCommand(timedOut: true), isTrue);
+    });
+
+    test('releases confirmed water starts and terminal failures', () {
+      expect(isConfirmedWaterPumpOnAck('waterPump1', 'accepted'), isFalse);
+      expect(isConfirmedWaterPumpOnAck('waterPump1', 'running'), isTrue);
+      expect(isConfirmedWaterPumpOnAck('phUp1', 'running'), isFalse);
+      expect(isTerminalCommandAckStatus('rejected'), isTrue);
+      expect(isTerminalCommandAckStatus('timed_out'), isTrue);
+    });
   });
 }
