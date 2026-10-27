@@ -49,6 +49,44 @@ void main() {
     expect(local.growLightOn, isTrue);
   });
 
+  test('temperature status uses live validity and the strict hot threshold', () {
+    expect(
+      temperatureStatusLabel(temperature: 28, valid: true, fresh: true),
+      'Normal',
+    );
+    expect(
+      temperatureStatusLabel(temperature: 28.1, valid: true, fresh: true),
+      'Too hot',
+    );
+    expect(
+      temperatureStatusLabel(temperature: 24, valid: true, fresh: false),
+      'Unavailable',
+    );
+    expect(
+      temperatureStatusLabel(temperature: double.nan, valid: true, fresh: true),
+      'Unavailable',
+    );
+    expect(
+      GrowBedReading.fromMap({'temp': 'invalid'}).temperatureValid,
+      isFalse,
+    );
+    expect(
+      GrowBedReading.fromMap({
+        'temp': 24,
+        'tempValid': false,
+      }).temperatureValid,
+      isFalse,
+    );
+  });
+
+  test('pH threshold settings reject non-finite, out-of-range, and crossed pairs', () {
+    expect(isValidPhThresholds(5.5, 7.0), isTrue);
+    expect(isValidPhThresholds(double.nan, 7), isFalse);
+    expect(isValidPhThresholds(3.9, 7), isFalse);
+    expect(isValidPhThresholds(5.5, 9.1), isFalse);
+    expect(isValidPhThresholds(7, 7), isFalse);
+  });
+
   test('local flat status parses actuator values and wins while fresh', () {
     final local = HydrodeckTelemetry.fromJson({
       'waterPump1': 1,
@@ -288,7 +326,17 @@ void main() {
     expect(find.text('Home'), findsOneWidget);
     expect(find.text('Grow Bed 1 Metrics'), findsOneWidget);
     expect(find.text('Grow Bed 2 Metrics'), findsOneWidget);
+    expect(find.byIcon(Icons.science_outlined), findsNWidgets(2));
+    expect(find.byIcon(Icons.water_drop_outlined), findsNWidgets(4));
+    expect(find.byIcon(Icons.device_thermostat), findsNWidgets(2));
+    expect(find.byIcon(Icons.water), findsNothing);
+    expect(find.text('Unavailable'), findsNWidgets(2));
+    expect(find.text('Low water level'), findsNWidgets(2));
     expect(find.text('RESERVOIR'), findsOneWidget);
+    expect(find.byIcon(Icons.science_outlined), findsNWidgets(2));
+    expect(find.byIcon(Icons.water_drop_outlined), findsNWidgets(4));
+    expect(find.byIcon(Icons.device_thermostat), findsNWidgets(2));
+    expect(find.text('Unavailable'), findsNWidgets(2));
     expect(find.text('RAIN offline'), findsOneWidget);
     expect(
       tester.getTopLeft(find.text('RESERVOIR')).dy,

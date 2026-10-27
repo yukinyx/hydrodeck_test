@@ -1,4 +1,5 @@
 ﻿#include <Arduino.h>
+#include <math.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_now.h>
@@ -289,6 +290,12 @@ float maxPhThreshold = 7.0;
 unsigned long lastPhLimitPoll = 0;
 const unsigned long phLimitPollInterval = 5000;
 bool phLimitRequestPending = false;
+unsigned long phLimitRequestStartedAt = 0;
+uint32_t phLimitRequestSequence = 0;
+String phLimitRequestUid;
+unsigned long lastPhLimitRejectLogAt = 0;
+const unsigned long phLimitRequestTimeoutMs = 15000UL;
+const unsigned long phLimitRejectLogIntervalMs = 30000UL;
 bool rainNodeOnline = false;
 bool rainPump1On = false;
 bool rainPump2On = false;
@@ -1039,6 +1046,21 @@ String reservoirLevelFromSensors(bool fullWet) {
   return fullWet ? "full" : "not_full";
 }
 
+bool validPhThresholds(float minimum, float maximum) {
+  return isfinite(minimum) && isfinite(maximum) &&
+      minimum >= 4.0f && minimum <= 7.0f &&
+      maximum >= 6.0f && maximum <= 9.0f && minimum < maximum;
+}
+
+void logRejectedPhThresholds(const char* reason) {
+  const unsigned long now = millis();
+  if (lastPhLimitRejectLogAt != 0 &&
+      now - lastPhLimitRejectLogAt < phLimitRejectLogIntervalMs) return;
+  lastPhLimitRejectLogAt = now;
+  Serial.printf("pH thresholds rejected reason=%s; keeping last-known-good\n",
+      reason);
+}
+
 void serviceRainNodeHealth(unsigned long now) {
   if (!rainNodeOnline) {
     for (const int pumpNum : {1, 5}) {
@@ -1599,42 +1621,78 @@ void requestRemoteActuatorCommand() {
 }
 
 void processPhLimitResult(AsyncResult& result) {
-  phLimitRequestPending = false;
-  if (!result.isError() && result.available()) {
-    const String payload = result.to<RealtimeDatabaseResult>().to<String>();
-    DynamicJsonDocument settingsDocument(512);
-    const DeserializationError parseError = deserializeJson(settingsDocument, payload);
-    if (!parseError && settingsDocument.is<JsonObject>()) {
-      JsonObject settings = settingsDocument.as<JsonObject>();
-      const JsonVariant minimumValue = settings["minPh"];
-      const JsonVariant maximumValue = settings["maxPh"];
-      const bool minimumIsNumber = minimumValue.is<float>() || minimumValue.is<int>();
-      const bool maximumIsNumber = maximumValue.is<float>() || maximumValue.is<int>();
-      if (minimumIsNumber && maximumIsNumber) {
-        const float minimum = minimumValue.as<float>();
-        const float maximum = maximumValue.as<float>();
-        if (minimum > 0.0f && minimum < maximum && maximum <= 14.0f &&
-            (minimum != minPhThreshold || maximum != maxPhThreshold)) {
-          minPhThreshold = minimum;
-          maxPhThreshold = maximum;
-          Serial.printf(
-            "pH thresholds updated min=%.2f max=%.2f; bed1 pH=%.2f bed2 pH=%.2f\n",
-            minPhThreshold,
-            maxPhThreshold,
-            currentPhValue1,
-            currentPhValue2
-          );
-        }
-      }
-    }
+  if (result.uid() != phLimitRequestUid) {
     result.clear();
+    return;
   }
+  phLimitRequestPending = false;
+  if (result.isError()) {
+    Serial.printf("pH threshold read failed code=%d; keeping last-known-good\n",
+        result.error().code());
+    result.clear();
+    return;
+  }
+  if (!result.available()) {
+    logRejectedPhThresholds("empty_response");
+    result.clear();
+    return;
+  }
+
+  const String payload = result.to<RealtimeDatabaseResult>().to<String>();
+  DynamicJsonDocument settingsDocument(512);
+  const DeserializationError parseError = deserializeJson(settingsDocument, payload);
+  if (parseError || !settingsDocument.is<JsonObject>()) {
+    logRejectedPhThresholds("malformed_response");
+    result.clear();
+    return;
+  }
+  JsonObject settings = settingsDocument.as<JsonObject>();
+  const JsonVariant minimumValue = settings["minPh"];
+  const JsonVariant maximumValue = settings["maxPh"];
+  const bool minimumIsNumber = minimumValue.is<float>() || minimumValue.is<int>();
+  const bool maximumIsNumber = maximumValue.is<float>() || maximumValue.is<int>();
+  if (!minimumIsNumber || !maximumIsNumber) {
+    logRejectedPhThresholds("non_numeric");
+    result.clear();
+    return;
+  }
+  const float minimum = minimumValue.as<float>();
+  const float maximum = maximumValue.as<float>();
+  if (!validPhThresholds(minimum, maximum)) {
+    logRejectedPhThresholds("out_of_range_or_order");
+    result.clear();
+    return;
+  }
+  if (minimum != minPhThreshold || maximum != maxPhThreshold) {
+    minPhThreshold = minimum;
+    maxPhThreshold = maximum;
+    Serial.printf(
+      "pH thresholds updated min=%.2f max=%.2f; bed1 pH=%.2f bed2 pH=%.2f\n",
+      minPhThreshold,
+      maxPhThreshold,
+      currentPhValue1,
+      currentPhValue2
+    );
+  } else {
+    Serial.printf("pH thresholds accepted min=%.2f max=%.2f\n",
+        minimum, maximum);
+  }
+  result.clear();
 }
 
 void requestPhLimit() {
   if (!firebaseInitialized || !app.ready() || phLimitRequestPending) return;
   phLimitRequestPending = true;
-  Database.get(aClient, "/hydrodeck/settings", processPhLimitResult, false, "phLimits");
+  phLimitRequestStartedAt = millis();
+  phLimitRequestSequence++;
+  phLimitRequestUid = "phLimits_" + String(phLimitRequestSequence);
+  Database.get(
+    aClient,
+    "/hydrodeck/settings",
+    processPhLimitResult,
+    false,
+    phLimitRequestUid
+  );
 }
 
 void processActiveBatchResult(AsyncResult& result) {
@@ -1925,7 +1983,9 @@ void handleSettings() {
   }
   const float minimum = server.arg("minPh").toFloat();
   const float maximum = server.arg("maxPh").toFloat();
-  if (minimum <= 0.0f || maximum > 14.0f || minimum >= maximum) {
+  if (!validPhThresholds(minimum, maximum)) {
+    Serial.printf("pH thresholds rejected via local settings min=%.2f max=%.2f\n",
+        minimum, maximum);
     server.send(400, "text/plain", "Invalid pH thresholds");
     return;
   }
@@ -1943,6 +2003,10 @@ void handleSettings() {
 
 void handleCombinedStatus() {
   const unsigned long now = millis();
+  const bool temperature1Valid = temperatureSensorValid1 &&
+      now - lastTemperatureValidAt1 <= 5000UL;
+  const bool temperature2Valid = temperatureSensorValid2 &&
+      now - lastTemperatureValidAt2 <= 5000UL;
   const bool heartbeatKnown = lastFirebaseHeartbeatSuccessAt != 0;
   const unsigned long heartbeatAge = heartbeatKnown
       ? now - lastFirebaseHeartbeatSuccessAt : 0;
@@ -1955,10 +2019,12 @@ void handleCombinedStatus() {
   json += "\"rainNodeOnline\":" + String(rainNodeOnline ? "true" : "false") + ",";
   json += "\"water1\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\",";
   json += "\"temp1\":" + String(currentTemperature1, 1) + ",";
+  json += "\"temp1Valid\":" + String(temperature1Valid ? "true" : "false") + ",";
   json += "\"ph1\":" + String(currentPhValue1, 2) + ",";
   json += "\"tds1\":" + String(currentTdsValue1, 0) + ",";
   json += "\"water2\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\",";
   json += "\"temp2\":" + String(currentTemperature2, 1) + ",";
+  json += "\"temp2Valid\":" + String(temperature2Valid ? "true" : "false") + ",";
   json += "\"ph2\":" + String(currentPhValue2, 2) + ",";
   json += "\"tds2\":" + String(currentTdsValue2, 0) + ",";
   json += "\"nutrient1\":" + String(digitalRead(nutrientPump1Pin) == PUMP_ON ? 1 : 0) + ",";
@@ -2365,6 +2431,12 @@ void loop() {
     requestRemoteActuatorCommand();
   }
 
+  if (phLimitRequestPending &&
+      now - phLimitRequestStartedAt >= phLimitRequestTimeoutMs) {
+    phLimitRequestPending = false;
+    Serial.println("pH threshold read timed out; keeping last-known-good and retrying");
+  }
+
   if (!remoteCommandPending && pendingCommandCleanupWrites == 0) {
     if (now - lastPhLimitPoll >= phLimitPollInterval) {
       lastPhLimitPoll = now;
@@ -2486,10 +2558,18 @@ void loop() {
     liveTelemetryJson += "\"tds1\":" + String(currentTdsValue1, 0) + ",";
     liveTelemetryJson += "\"ph1\":" + String(currentPhValue1, 2) + ",";
     liveTelemetryJson += "\"temp1\":" + String(currentTemperature1, 1) + ",";
+    const bool temperature1Valid = temperatureSensorValid1 &&
+      now - lastTemperatureValidAt1 <= 5000UL;
+    liveTelemetryJson += "\"temp1Valid\":" +
+      String(temperature1Valid ? "true" : "false") + ",";
     liveTelemetryJson += "\"water1\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\",";
     liveTelemetryJson += "\"tds2\":" + String(currentTdsValue2, 0) + ",";
     liveTelemetryJson += "\"ph2\":" + String(currentPhValue2, 2) + ",";
     liveTelemetryJson += "\"temp2\":" + String(currentTemperature2, 1) + ",";
+    const bool temperature2Valid = temperatureSensorValid2 &&
+      now - lastTemperatureValidAt2 <= 5000UL;
+    liveTelemetryJson += "\"temp2Valid\":" +
+      String(temperature2Valid ? "true" : "false") + ",";
     liveTelemetryJson += "\"water2\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\",";
     liveTelemetryJson += "\"actuators\":{";
     liveTelemetryJson += "\"waterPump1\":" + String(rainPump1On ? "true" : "false") + ",";

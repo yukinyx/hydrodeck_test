@@ -66,7 +66,7 @@
         "$setting": {
           ".read": "auth != null",
           ".write": "auth != null",
-          ".validate": "newData.isNumber()"
+          ".validate": "newData.isNumber() && (($setting === 'minPh' && newData.val() >= 4 && newData.val() <= 7 && newData.parent().child('maxPh').isNumber() && newData.val() < newData.parent().child('maxPh').val()) || ($setting === 'maxPh' && newData.val() >= 6 && newData.val() <= 9 && newData.parent().child('minPh').isNumber() && newData.parent().child('minPh').val() < newData.val()) || ($setting !== 'minPh' && $setting !== 'maxPh'))"
         }
       },
       "waterPump1": { ".read": "auth != null", ".write": "auth != null", ".validate": "newData.isBoolean()" },

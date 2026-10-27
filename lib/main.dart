@@ -33,6 +33,33 @@ int? _cachedServerTimeOffsetMs;
 DateTime? _serverClockAnchorUtc;
 Stopwatch? _serverClockStopwatch;
 const int _deviceHeartbeatGraceSeconds = 10;
+const double _minimumPhSetting = 4.0;
+const double _maximumPhSetting = 7.0;
+const double _minimumMaxPhSetting = 6.0;
+const double _maximumMaxPhSetting = 9.0;
+
+bool isValidPhThresholds(double minimum, double maximum) =>
+    minimum.isFinite &&
+    maximum.isFinite &&
+    minimum >= _minimumPhSetting &&
+    minimum <= _maximumPhSetting &&
+    maximum >= _minimumMaxPhSetting &&
+    maximum <= _maximumMaxPhSetting &&
+    minimum < maximum;
+
+bool isValidTemperatureReading(double temperature) =>
+    temperature.isFinite && temperature > -50.0 && temperature <= 125.0;
+
+String temperatureStatusLabel({
+  required double temperature,
+  required bool valid,
+  required bool fresh,
+}) {
+  if (!valid || !fresh || !isValidTemperatureReading(temperature)) {
+    return 'Unavailable';
+  }
+  return temperature > 28.0 ? 'Too hot' : 'Normal';
+}
 
 DateTime _philippineTime(DateTime timestamp) => manilaDateTime(timestamp);
 
@@ -618,6 +645,7 @@ class DatabaseHelper {
 
   // Settings Limits Persistence
   Future<void> saveSettingsConfig(double minPh, double maxPh) async {
+    if (!isValidPhThresholds(minPh, maxPh)) return;
     final db = await instance.database;
     if (db == null) return;
     await db.insert('settings_config', {
@@ -636,10 +664,11 @@ class DatabaseHelper {
       whereArgs: [1],
     );
     if (result.isNotEmpty) {
-      return {
-        'minPh': (result.first['minPh'] as num).toDouble(),
-        'maxPh': (result.first['maxPh'] as num).toDouble(),
-      };
+      final minimum = (result.first['minPh'] as num).toDouble();
+      final maximum = (result.first['maxPh'] as num).toDouble();
+      if (isValidPhThresholds(minimum, maximum)) {
+        return {'minPh': minimum, 'maxPh': maximum};
+      }
     }
     return {'minPh': 5.5, 'maxPh': 7.0};
   }
@@ -766,28 +795,37 @@ String normalizeReservoirLevel(dynamic value) => switch (
 
 class GrowBedReading {
   final double temperature;
+  final bool temperatureValid;
   final double ph;
   final double tds;
   final bool waterFull;
 
   const GrowBedReading({
     required this.temperature,
+    this.temperatureValid = true,
     required this.ph,
     required this.tds,
     required this.waterFull,
   });
 
   factory GrowBedReading.empty() => const GrowBedReading(
-    temperature: 25.0,
+    temperature: 0.0,
+    temperatureValid: false,
     ph: 6.0,
     tds: 0.0,
     waterFull: false,
   );
 
   factory GrowBedReading.fromMap(Map<String, dynamic> map) {
-    final temperature = (map['temp'] is num)
-        ? (map['temp'] as num).toDouble()
-        : double.tryParse((map['temp'] ?? '25.0').toString()) ?? 25.0;
+    final rawTemperature = map['temp'];
+    final parsedTemperature = rawTemperature is num
+      ? rawTemperature.toDouble()
+      : double.tryParse(rawTemperature?.toString() ?? '');
+    final temperatureValid =
+      parsedTemperature != null &&
+      isValidTemperatureReading(parsedTemperature) &&
+      map['tempValid'] != false;
+    final temperature = temperatureValid ? parsedTemperature : 0.0;
     final ph = (map['ph'] is num)
         ? (map['ph'] as num).toDouble()
         : double.tryParse((map['ph'] ?? '6.0').toString()) ?? 6.0;
@@ -803,6 +841,7 @@ class GrowBedReading {
     };
     return GrowBedReading(
       temperature: temperature,
+      temperatureValid: temperatureValid,
       ph: ph,
       tds: tds,
       waterFull: waterFull,
@@ -811,6 +850,7 @@ class GrowBedReading {
 
   Map<String, dynamic> toMap() => {
     'temp': temperature,
+    'tempValid': temperatureValid,
     'ph': ph,
     'tds': tds,
     'water': waterFull ? 'full' : 'low',
@@ -872,29 +912,6 @@ class HydrodeckTelemetry {
     required this.actuatorStates,
   });
 
-  static double _readDouble(
-    Map<String, dynamic> json,
-    String key, {
-    double fallback = 0.0,
-  }) {
-    final value = json[key];
-    if (value is num) return value.toDouble();
-    if (value is String) return double.tryParse(value) ?? fallback;
-    return fallback;
-  }
-
-  static bool _readWaterFlag(Map<String, dynamic> json, String key) {
-    final value = json[key];
-    if (value is bool) return value;
-    if (value is num) return value != 0;
-    if (value is String) {
-      return value.toLowerCase() == 'full' ||
-          value == '1' ||
-          value.toLowerCase() == 'on';
-    }
-    return false;
-  }
-
   static bool _readBoolLike(
     Map<String, dynamic> map,
     List<String> keys, {
@@ -930,8 +947,11 @@ class HydrodeckTelemetry {
       'temp':
         wireMap['temp1'] ??
         wireMap['bed1']?['temp'] ??
-        wireMap['set1']?['temp'] ??
-        25.0,
+        wireMap['set1']?['temp'],
+      'tempValid':
+        wireMap['temp1Valid'] ??
+        wireMap['bed1']?['tempValid'] ??
+        wireMap['set1']?['tempValid'],
       'ph':
         wireMap['ph1'] ??
         wireMap['bed1']?['ph'] ??
@@ -953,8 +973,11 @@ class HydrodeckTelemetry {
       'temp':
         wireMap['temp2'] ??
         wireMap['bed2']?['temp'] ??
-        wireMap['set2']?['temp'] ??
-        25.0,
+        wireMap['set2']?['temp'],
+      'tempValid':
+        wireMap['temp2Valid'] ??
+        wireMap['bed2']?['tempValid'] ??
+        wireMap['set2']?['tempValid'],
       'ph':
         wireMap['ph2'] ??
         wireMap['bed2']?['ph'] ??
@@ -972,19 +995,8 @@ class HydrodeckTelemetry {
         'low',
     };
 
-    final bed1 = GrowBedReading(
-      temperature: _readDouble(bed1Map, 'temp', fallback: 25.0),
-      ph: _readDouble(bed1Map, 'ph', fallback: 6.0),
-      tds: _readDouble(bed1Map, 'tds', fallback: 0.0),
-      waterFull: _readWaterFlag(bed1Map, 'water'),
-    );
-
-    final bed2 = GrowBedReading(
-      temperature: _readDouble(bed2Map, 'temp', fallback: 25.0),
-      ph: _readDouble(bed2Map, 'ph', fallback: 6.0),
-      tds: _readDouble(bed2Map, 'tds', fallback: 0.0),
-      waterFull: _readWaterFlag(bed2Map, 'water'),
-    );
+    final bed1 = GrowBedReading.fromMap(bed1Map);
+    final bed2 = GrowBedReading.fromMap(bed2Map);
 
     final actuatorMap = Map<String, dynamic>.from(
       wireMap['actuators'] is Map ? wireMap['actuators'] : {},
@@ -1162,16 +1174,19 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
   service.on('updateLimits').listen((event) {
     if (event != null) {
-      if (event['minPh'] != null) {
-        minPhThreshold = (event['minPh'] as num).toDouble();
+      final minimumValue = event['minPh'];
+      final maximumValue = event['maxPh'];
+      if (minimumValue is num && maximumValue is num) {
+        final minimum = minimumValue.toDouble();
+        final maximum = maximumValue.toDouble();
+        if (isValidPhThresholds(minimum, maximum)) {
+          minPhThreshold = minimum;
+          maxPhThreshold = maximum;
+          unawaited(
+            DatabaseHelper.instance.saveSettingsConfig(minimum, maximum),
+          );
+        }
       }
-      if (event['maxPh'] != null) {
-        maxPhThreshold = (event['maxPh'] as num).toDouble();
-      }
-      DatabaseHelper.instance.saveSettingsConfig(
-        minPhThreshold,
-        maxPhThreshold,
-      );
     }
   });
 
@@ -1227,13 +1242,15 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     final reservoirLevel = reservoir.level;
     final rainNodeOnline = reservoir.online;
     final bed1 = {
-      'temp': data['temp1'] ?? data['bed1']?['temp'] ?? 25.0,
+      'temp': data['temp1'] ?? data['bed1']?['temp'],
+      'tempValid': data['temp1Valid'] ?? data['bed1']?['tempValid'],
       'ph': data['ph1'] ?? data['bed1']?['ph'] ?? 6.0,
       'tds': data['tds1'] ?? data['bed1']?['tds'] ?? 0.0,
       'water': data['water1'] ?? data['bed1']?['water'] ?? 'low',
     };
     final bed2 = {
-      'temp': data['temp2'] ?? data['bed2']?['temp'] ?? 25.0,
+      'temp': data['temp2'] ?? data['bed2']?['temp'],
+      'tempValid': data['temp2Valid'] ?? data['bed2']?['tempValid'],
       'ph': data['ph2'] ?? data['bed2']?['ph'] ?? 6.0,
       'tds': data['tds2'] ?? data['bed2']?['tds'] ?? 0.0,
       'water': data['water2'] ?? data['bed2']?['water'] ?? 'low',
@@ -4947,9 +4964,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             if (minValue is num && maxValue is num) {
               final candidateMin = minValue.toDouble();
               final candidateMax = maxValue.toDouble();
-              if (candidateMin > 0 &&
-                  candidateMin < candidateMax &&
-                  candidateMax <= 14) {
+                if (isValidPhThresholds(candidateMin, candidateMax)) {
                 sharedMinPh = candidateMin;
                 sharedMaxPh = candidateMax;
               }
@@ -5018,6 +5033,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   Future<void> _applySharedPhThresholds(double minimum, double maximum) async {
+    if (!isValidPhThresholds(minimum, maximum)) return;
     _hasSharedPhThresholds = true;
     final changed = minimum != _minPhThreshold || maximum != _maxPhThreshold;
     if (!mounted) return;
@@ -5043,6 +5059,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     double minimum,
     double maximum,
   ) async {
+    if (!isValidPhThresholds(minimum, maximum)) return false;
     var posted = false;
     try {
       try {
@@ -5522,6 +5539,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       _lastFirebaseTelemetryAt != null &&
       DateTime.now().difference(_lastFirebaseTelemetryAt!).inSeconds <=
           _deviceHeartbeatGraceSeconds;
+
+    bool get _hasFreshSensorTelemetry =>
+      _hasFreshLocalTelemetry || _hasFreshFirebaseTelemetry;
 
   Future<void> _loadStoredLogsAndSettings() async {
     final activeBatchNumber =
@@ -6512,6 +6532,18 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   Future<void> _publishPhThresholds() async {
+    if (!isValidPhThresholds(_minPhThreshold, _maxPhThreshold)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Use a minimum pH from 4.0 to 7.0 and a maximum from 6.0 to 9.0, with minimum below maximum.',
+            ),
+          ),
+        );
+      }
+      return;
+    }
     try {
       try {
         await WiFiForIoTPlugin.forceWifiUsage(false);
@@ -6532,6 +6564,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       }
     }
     await _postPhThresholdsToLocalEsp32(_minPhThreshold, _maxPhThreshold);
+  }
+
+  void _updatePhThresholds(double minimum, double maximum) {
+    if (!isValidPhThresholds(minimum, maximum)) return;
+    setState(() {
+      _minPhThreshold = minimum;
+      _maxPhThreshold = maximum;
+    });
+    unawaited(DatabaseHelper.instance.saveSettingsConfig(minimum, maximum));
+    _schedulePhThresholdPublish();
+    if (_supportsBackgroundService) {
+      FlutterBackgroundService().invoke('updateLimits', {
+        'minPh': minimum,
+        'maxPh': maximum,
+      });
+    }
   }
 
   void _schedulePhThresholdPublish() {
@@ -6892,7 +6940,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     final isPhOptimal =
         data.ph >= _minPhThreshold && data.ph <= _maxPhThreshold;
     final isTdsOptimal = data.tds < 900;
-    final waterLabel = data.waterFull ? 'Water full' : 'Needs water';
+    final temperatureStatus = temperatureStatusLabel(
+      temperature: data.temperature,
+      valid: data.temperatureValid,
+      fresh: _hasFreshSensorTelemetry,
+    );
+    final temperatureHot = temperatureStatus == 'Too hot';
+    final temperatureUnavailable = temperatureStatus == 'Unavailable';
+    final waterLabel = data.waterFull
+        ? 'Full water level'
+        : 'Low water level';
     return Column(
       children: [
         Row(
@@ -6904,6 +6961,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 isPhOptimal ? 'Normal' : 'Unstable',
                 isPhOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
                 isPhOptimal ? Colors.green : Colors.orange,
+                icon: Icons.science_outlined,
+                iconColor: isPhOptimal ? Colors.green : Colors.orange,
+                iconSemanticLabel: 'pH measurement',
               ),
             ),
             const SizedBox(width: 16),
@@ -6916,6 +6976,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                     ? const Color(0xFFE8F7ED)
                     : const Color(0xFFFFF3E0),
                 isTdsOptimal ? Colors.green : Colors.orange,
+                icon: Icons.water_drop_outlined,
+                iconColor: const Color(0xFF168AAD),
+                iconSemanticLabel: 'Total dissolved solids',
               ),
             ),
           ],
@@ -6926,10 +6989,29 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             Expanded(
               child: _buildCleanCard(
                 'WATER TEMP',
-                '${data.temperature.toStringAsFixed(1)}°C',
-                'Live',
-                const Color(0xFFE8F7ED),
-                Colors.green,
+                temperatureUnavailable
+                  ? '—'
+                  : '${data.temperature.toStringAsFixed(1)}°C',
+                temperatureStatus,
+                temperatureHot
+                  ? const Color(0xFFFFEBEE)
+                  : temperatureUnavailable
+                  ? const Color(0xFFF0F0F0)
+                  : const Color(0xFFE8F4FD),
+                temperatureHot
+                  ? Colors.red.shade700
+                  : temperatureUnavailable
+                  ? Colors.grey
+                  : Colors.blue.shade700,
+                icon: temperatureHot
+                  ? Icons.thermostat
+                  : Icons.device_thermostat,
+                iconColor: temperatureHot
+                  ? Colors.red.shade700
+                  : temperatureUnavailable
+                  ? Colors.grey
+                  : Colors.blue.shade700,
+                iconSemanticLabel: 'Thermometer, $temperatureStatus',
               ),
             ),
             const SizedBox(width: 16),
@@ -6937,11 +7019,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               child: _buildCleanCard(
                 'BED WATER LEVEL',
                 waterLabel,
-                data.waterFull ? 'Optimal' : 'Warning',
+                data.waterFull ? 'Full' : 'Low',
                 data.waterFull
                     ? const Color(0xFFE8F7ED)
                     : const Color(0xFFFFF3E0),
                 data.waterFull ? Colors.green : Colors.orange,
+                icon: data.waterFull ? Icons.water : Icons.water_drop_outlined,
+                iconColor: data.waterFull ? Colors.blue : Colors.blueGrey,
+                iconSemanticLabel: waterLabel,
               ),
             ),
           ],
@@ -7556,25 +7641,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 Slider(
                   value: _minPhThreshold,
                   min: 4.0,
-                  max: 7.0,
-                  divisions: 30,
+                  max: (_maxPhThreshold - 0.1).clamp(4.1, 7.0).toDouble(),
+                    divisions: (((_maxPhThreshold - 0.1)
+                            .clamp(4.1, 7.0)
+                            .toDouble() -
+                          4.0) *
+                        10)
+                      .round(),
                   activeColor: Colors.orange,
-                  onChanged: (val) {
-                    setState(() {
-                      _minPhThreshold = val;
-                    });
-                    DatabaseHelper.instance.saveSettingsConfig(
-                      _minPhThreshold,
-                      _maxPhThreshold,
-                    );
-                    _schedulePhThresholdPublish();
-                    if (_supportsBackgroundService) {
-                      FlutterBackgroundService().invoke('updateLimits', {
-                        'minPh': _minPhThreshold,
-                        'maxPh': _maxPhThreshold,
-                      });
-                    }
-                  },
+                  onChanged: (val) =>
+                      _updatePhThresholds(val, _maxPhThreshold),
                 ),
               ],
             ),
@@ -7608,26 +7684,17 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 ),
                 Slider(
                   value: _maxPhThreshold,
-                  min: 6.0,
+                  min: (_minPhThreshold + 0.1).clamp(6.0, 8.9).toDouble(),
                   max: 9.0,
-                  divisions: 30,
+                    divisions: ((9.0 -
+                          (_minPhThreshold + 0.1)
+                            .clamp(6.0, 8.9)
+                            .toDouble()) *
+                        10)
+                      .round(),
                   activeColor: Colors.green,
-                  onChanged: (val) {
-                    setState(() {
-                      _maxPhThreshold = val;
-                    });
-                    DatabaseHelper.instance.saveSettingsConfig(
-                      _minPhThreshold,
-                      _maxPhThreshold,
-                    );
-                    _schedulePhThresholdPublish();
-                    if (_supportsBackgroundService) {
-                      FlutterBackgroundService().invoke('updateLimits', {
-                        'minPh': _minPhThreshold,
-                        'maxPh': _maxPhThreshold,
-                      });
-                    }
-                  },
+                  onChanged: (val) =>
+                      _updatePhThresholds(_minPhThreshold, val),
                 ),
               ],
             ),
@@ -7686,6 +7753,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     String? badgeText,
     Color bg,
     Color text,
+    {IconData? icon, Color? iconColor, String? iconSemanticLabel}
   ) {
     return Container(
       width: double.infinity,
@@ -7704,13 +7772,26 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            title,
-            style: const TextStyle(
-              fontSize: 10,
-              fontWeight: FontWeight.bold,
-              color: Colors.grey,
-            ),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.grey,
+                  ),
+                ),
+              ),
+              if (icon != null)
+                Icon(
+                  icon,
+                  size: 21,
+                  color: iconColor ?? Colors.blueGrey,
+                  semanticLabel: iconSemanticLabel,
+                ),
+            ],
           ),
           const SizedBox(height: 6),
           Text(
