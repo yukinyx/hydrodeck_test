@@ -22,6 +22,7 @@ import 'package:flutter/services.dart';
 import 'history_interval.dart';
 import 'login_validation.dart';
 import 'command_ack_policy.dart';
+import 'wifi_provisioning_policy.dart';
 
 bool get _supportsBackgroundService =>
     !kIsWeb &&
@@ -1794,8 +1795,43 @@ class _SignupScreenState extends State<SignupScreen> {
   final _password = TextEditingController();
   final _confirm = TextEditingController();
   final _pin = TextEditingController();
+  final _emailFocus = FocusNode();
+  final _phoneFocus = FocusNode();
+  final _passwordFocus = FocusNode();
+  final _confirmFocus = FocusNode();
+  final _pinFocus = FocusNode();
+  String? _emailError;
+  String? _phoneError;
+  String? _passwordError;
+  String? _confirmError;
+  String? _pinError;
+  bool _emailTouched = false;
+  bool _phoneTouched = false;
+  bool _passwordTouched = false;
+  bool _confirmTouched = false;
+  bool _pinTouched = false;
   bool _busy = false;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _emailFocus.addListener(
+      () { if (!_emailFocus.hasFocus) _validateSignupEmail(onBlur: true); },
+    );
+    _phoneFocus.addListener(
+      () { if (!_phoneFocus.hasFocus) _validateSignupPhone(onBlur: true); },
+    );
+    _passwordFocus.addListener(
+      () { if (!_passwordFocus.hasFocus) _validateSignupPassword(onBlur: true); },
+    );
+    _confirmFocus.addListener(
+      () { if (!_confirmFocus.hasFocus) _validateSignupConfirmation(onBlur: true); },
+    );
+    _pinFocus.addListener(
+      () { if (!_pinFocus.hasFocus) _validateSignupPin(onBlur: true); },
+    );
+  }
 
   @override
   void dispose() {
@@ -1804,33 +1840,78 @@ class _SignupScreenState extends State<SignupScreen> {
     _password.dispose();
     _confirm.dispose();
     _pin.dispose();
+    _emailFocus.dispose();
+    _phoneFocus.dispose();
+    _passwordFocus.dispose();
+    _confirmFocus.dispose();
+    _pinFocus.dispose();
     super.dispose();
+  }
+
+  // Keep each field's inline validation quiet until it has lost focus once.
+  void _validateSignupEmail({bool onBlur = false}) {
+    if (onBlur) _emailTouched = true;
+    if (_emailTouched) {
+      setState(() => _emailError = validateEmailField(_email.text));
+    }
+  }
+
+  void _validateSignupPhone({bool onBlur = false}) {
+    if (onBlur) _phoneTouched = true;
+    if (_phoneTouched) {
+      setState(() => _phoneError = validateSignupPhoneField(_phone.text));
+    }
+  }
+
+  void _validateSignupPassword({bool onBlur = false}) {
+    if (onBlur) _passwordTouched = true;
+    if (_passwordTouched) {
+      setState(() => _passwordError = validateSignupPasswordField(_password.text));
+    }
+    if (_confirmTouched) _validateSignupConfirmation();
+  }
+
+  void _validateSignupConfirmation({bool onBlur = false}) {
+    if (onBlur) _confirmTouched = true;
+    if (_confirmTouched) {
+      setState(
+        () => _confirmError = validateConfirmPasswordField(
+          _password.text,
+          _confirm.text,
+        ),
+      );
+    }
+  }
+
+  void _validateSignupPin({bool onBlur = false}) {
+    if (onBlur) _pinTouched = true;
+    if (_pinTouched) {
+      setState(
+        () => _pinError =
+            _pin.text == '6967' ? null : 'The access PIN is incorrect.',
+      );
+    }
   }
 
   Future<void> _signup() async {
     final email = _email.text.trim();
-    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
-      setState(() => _error = 'Enter a valid email address.');
-      return;
-    }
     final phone = _phone.text.trim();
-    if (!RegExp(r'^09\d{9}$').hasMatch(phone)) {
-      setState(
-        () => _error = 'Phone number must be 11 digits and start with 09.',
-      );
-      return;
-    }
-    if (_password.text.length < 6) {
-      setState(() => _error = 'Password must be at least 6 characters.');
-      return;
-    }
-    if (_password.text != _confirm.text) {
-      setState(() => _error = 'Passwords do not match.');
-      return;
-    }
-    if (_pin.text != '6967') {
-      setState(() => _error = 'The access PIN is incorrect.');
+    _emailTouched = _phoneTouched = _passwordTouched =
+        _confirmTouched = _pinTouched = true;
+    _emailError = validateEmailField(email);
+    _phoneError = validateSignupPhoneField(phone);
+    _passwordError = validateSignupPasswordField(_password.text);
+    _confirmError = validateConfirmPasswordField(_password.text, _confirm.text);
+    _pinError = _pin.text == '6967' ? null : 'The access PIN is incorrect.';
+    if (_emailError != null ||
+        _phoneError != null ||
+        _passwordError != null ||
+        _confirmError != null ||
+        _pinError != null) {
+      setState(() {});
+      if (_pinError != null) {
       _pin.clear();
+      }
       return;
     }
 
@@ -1879,6 +1960,10 @@ class _SignupScreenState extends State<SignupScreen> {
         'Email',
         Icons.email_outlined,
         keyboard: TextInputType.emailAddress,
+        hintText: 'example@gmail.com',
+        focusNode: _emailFocus,
+        errorText: _emailError,
+        onChanged: (_) => _validateSignupEmail(),
       ),
       _field(
         _phone,
@@ -1886,15 +1971,40 @@ class _SignupScreenState extends State<SignupScreen> {
         Icons.phone_outlined,
         keyboard: TextInputType.phone,
         maxLength: 11,
+        hintText: '09XXXXXXXXX',
+        focusNode: _phoneFocus,
+        errorText: _phoneError,
+        onChanged: (_) => _validateSignupPhone(),
       ),
-      _field(_password, 'Password', Icons.lock_outline, obscure: true),
-      _field(_confirm, 'Confirm password', Icons.lock_outline, obscure: true),
+      _field(
+        _password,
+        'Password',
+        Icons.lock_outline,
+        obscure: true,
+        hintText: '********',
+        focusNode: _passwordFocus,
+        errorText: _passwordError,
+        onChanged: (_) => _validateSignupPassword(),
+      ),
+      _field(
+        _confirm,
+        'Confirm password',
+        Icons.lock_outline,
+        obscure: true,
+        hintText: '********',
+        focusNode: _confirmFocus,
+        errorText: _confirmError,
+        onChanged: (_) => _validateSignupConfirmation(),
+      ),
       _field(
         _pin,
         'Hydrodeck access PIN',
         Icons.key_outlined,
         keyboard: TextInputType.number,
         obscure: true,
+        focusNode: _pinFocus,
+        errorText: _pinError,
+        onChanged: (_) => _validateSignupPin(),
       ),
     ],
     actionLabel: 'Sign up',
@@ -1921,26 +2031,65 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final _email = TextEditingController();
   final _password = TextEditingController();
+  final _emailFocus = FocusNode();
+  final _passwordFocus = FocusNode();
+  String? _emailError;
+  String? _passwordError;
+  bool _emailTouched = false;
+  bool _passwordTouched = false;
   bool _busy = false;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _emailFocus.addListener(
+      () { if (!_emailFocus.hasFocus) _validateLoginEmail(onBlur: true); },
+    );
+    _passwordFocus.addListener(
+      () { if (!_passwordFocus.hasFocus) _validateLoginPassword(onBlur: true); },
+    );
+  }
 
   @override
   void dispose() {
     _email.dispose();
     _password.dispose();
+    _emailFocus.dispose();
+    _passwordFocus.dispose();
     super.dispose();
+  }
+
+  // Inline login errors are updated on blur and then kept current while editing.
+  void _validateLoginEmail({bool onBlur = false}) {
+    if (onBlur) _emailTouched = true;
+    if (_emailTouched) {
+      setState(() {
+        _emailError = validateEmailField(_email.text);
+        _error = null;
+      });
+    }
+  }
+
+  void _validateLoginPassword({bool onBlur = false}) {
+    if (onBlur) _passwordTouched = true;
+    if (_passwordTouched) {
+      setState(() {
+        _passwordError = validatePasswordField(_password.text);
+        _error = null;
+      });
+    }
   }
 
   Future<void> _login() async {
     if (_busy) return;
     final email = _email.text.trim();
     final password = _password.text;
-    final validationError = validateLoginFields(
-      email: _email.text,
-      password: password,
-    );
-    if (validationError != null) {
-      setState(() => _error = validationError);
+    _emailTouched = _passwordTouched = true;
+    _emailError = validateEmailField(email);
+    _passwordError = validatePasswordField(password);
+    if (_emailError != null || _passwordError != null) {
+      setState(() => _error = null);
       return;
     }
     setState(() {
@@ -1977,8 +2126,21 @@ class _LoginScreenState extends State<LoginScreen> {
         'Email',
         Icons.email_outlined,
         keyboard: TextInputType.emailAddress,
+        hintText: 'example@gmail.com',
+        focusNode: _emailFocus,
+        errorText: _emailError,
+        onChanged: (_) => _validateLoginEmail(),
       ),
-      _field(_password, 'Password', Icons.lock_outline, obscure: true),
+      _field(
+        _password,
+        'Password',
+        Icons.lock_outline,
+        obscure: true,
+        hintText: '********',
+        focusNode: _passwordFocus,
+        errorText: _passwordError,
+        onChanged: (_) => _validateLoginPassword(),
+      ),
     ],
     actionLabel: 'Log in',
     onAction: _login,
@@ -2462,20 +2624,32 @@ Widget _field(
   bool obscure = false,
   TextInputType? keyboard,
   int? maxLength,
+  String? hintText,
+  FocusNode? focusNode,
+  String? errorText,
+  ValueChanged<String>? onChanged,
 }) {
   if (obscure) {
     return _PasswordVisibilityField(
       controller: controller,
       label: label,
       icon: icon,
+      hintText: hintText,
+      focusNode: focusNode,
+      errorText: errorText,
+      onChanged: onChanged,
     );
   }
   return TextField(
     controller: controller,
     keyboardType: keyboard,
     maxLength: maxLength,
+    focusNode: focusNode,
+    onChanged: onChanged,
     decoration: InputDecoration(
       labelText: label,
+      hintText: hintText,
+      errorText: errorText,
       prefixIcon: Icon(icon),
       border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
     ),
@@ -2486,11 +2660,19 @@ class _PasswordVisibilityField extends StatefulWidget {
   final TextEditingController controller;
   final String label;
   final IconData icon;
+  final String? hintText;
+  final FocusNode? focusNode;
+  final String? errorText;
+  final ValueChanged<String>? onChanged;
 
   const _PasswordVisibilityField({
     required this.controller,
     required this.label,
     required this.icon,
+    this.hintText,
+    this.focusNode,
+    this.errorText,
+    this.onChanged,
   });
 
   @override
@@ -2504,9 +2686,13 @@ class _PasswordVisibilityFieldState extends State<_PasswordVisibilityField> {
   @override
   Widget build(BuildContext context) => TextField(
     controller: widget.controller,
+    focusNode: widget.focusNode,
     obscureText: _obscure,
+    onChanged: widget.onChanged,
     decoration: InputDecoration(
       labelText: widget.label,
+      hintText: widget.hintText,
+      errorText: widget.errorText,
       prefixIcon: Icon(widget.icon),
       border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
       suffixIcon: IconButton(
@@ -5139,7 +5325,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   if (mounted) {
                     _showCommandMessage(
                       pending.key,
-                      'The pump command was accepted but never finished. Check its state and try again.',
+                      friendlyCommandFailureMessage(status: 'unconfirmed'),
                     );
                     setState(() {});
                   }
@@ -5152,7 +5338,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 () {
                   if (_pendingCommandIds[pending.key] != pending.value) return;
                   _clearPendingCommand(pending.key, pending.value);
-                  if (mounted) setState(() {});
+                  if (mounted) {
+                    _showCommandMessage(
+                      pending.key,
+                      friendlyCommandFailureMessage(status: 'unconfirmed'),
+                    );
+                    setState(() {});
+                  }
                 },
               );
             }
@@ -5160,15 +5352,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             continue;
           }
           if (!shouldReleasePendingCommand(status: status)) continue;
-          final wasAcceptedOrRunning = _commandsAcceptedOrRunning.remove(
-            pending.value,
-          );
+          _commandsAcceptedOrRunning.remove(pending.value);
           _pendingCommandIds.remove(pending.key);
           _commandTimeouts.remove(pending.value)?.cancel();
           unawaited(_removeFirebaseCommandRecord(pending.key, pending.value));
           final busyKey = _getActuatorBusyKey(pending.key);
-          final actuatorWasSeen =
-              busyKey != null && _actuatorsSeenRunning.remove(busyKey);
+          if (busyKey != null) _actuatorsSeenRunning.remove(busyKey);
           if (busyKey != null) {
             if (pending.key.startsWith('waterPump') && status == 'completed') {
               _controlStates[busyKey] =
@@ -5191,15 +5380,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           }
           if (status == 'rejected') {
             unawaited(_showCommandRejection(pending.key, pending.value));
-            } else if (status == 'timed_out' &&
-              (pending.key.startsWith('waterPump') ||
-                !wasAcceptedOrRunning || actuatorWasSeen)) {
-            unawaited(
-              _showCommandRejection(
-                pending.key,
-                pending.value,
-                fallback: 'The ESP32 stopped this command unexpectedly.',
-              ),
+          } else if (status == 'timed_out') {
+            _showCommandMessage(
+              pending.key,
+              friendlyCommandFailureMessage(status: 'timed_out'),
             );
           }
           changed = true;
@@ -5215,12 +5399,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     return _actuatorControlKeys[actuatorName];
   }
 
-  String _friendlyCommandRejection(String reason) => switch (reason.trim()) {
-    'rain_node_offline' => 'Rainwater unit offline.',
-    'rain_node_no_confirm' => 'Rainwater unit did not confirm the pump.',
-    'max_run' => 'The pump reached its maximum run time.',
-    _ => 'The ESP32 rejected this command.',
-  };
+  String _friendlyCommandRejection(String reason) =>
+      friendlyCommandFailureMessage(status: 'rejected', reason: reason);
 
   Future<void> _showCommandRejection(
     String actuatorName,
@@ -5875,9 +6055,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   void _showCommandMessage(String actuatorName, String message) {
     if (!mounted) return;
-    final label = actuatorName == 'growLight'
-        ? 'Grow light'
-        : actuatorName.replaceAll(RegExp(r'([0-9])'), r' $1');
+    final label = commandActuatorLabel(actuatorName);
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text('$label: $message')));
@@ -5909,12 +6087,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       _pendingActuatorStates.remove(key);
       _actuatorBusy[key] = false;
       unawaited(commandRef.remove().catchError((_) {}));
-      if (!wasAcceptedOrSeen) {
-        _showCommandMessage(
-          actuatorName,
-          'The ESP32 did not accept or start this command in time.',
-        );
-      }
+      _showCommandMessage(
+        actuatorName,
+        friendlyCommandFailureMessage(
+          status: wasAcceptedOrSeen ? 'unconfirmed' : 'timed_out',
+        ),
+      );
       if (mounted) setState(() {});
     });
   }
@@ -5974,7 +6152,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     _commandTimeouts[commandId] = Timer(completionGrace, () {
       if (_pendingCommandIds[actuatorName] != commandId) return;
       _clearPendingCommand(actuatorName, commandId);
-      if (mounted) setState(() {});
+      if (mounted) {
+        _showCommandMessage(
+          actuatorName,
+          friendlyCommandFailureMessage(status: 'unconfirmed'),
+        );
+        setState(() {});
+      }
     });
     if (mounted) setState(() {});
   }
@@ -6042,7 +6226,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     required String commandId,
     required bool requestedOn,
   }) async {
-    var lastFailure = 'No ESP32 local HTTP target responded.';
+    var lastFailure = 'ESP32_OFFLINE:No ESP32 local HTTP target responded.';
     try {
       try {
         await WiFiForIoTPlugin.forceWifiUsage(true);
@@ -6076,10 +6260,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           if (response.statusCode == 409) {
             return 'ESP32_REJECTED:${response.body}';
           }
-          lastFailure = 'ESP32 returned HTTP ${response.statusCode}.';
+          lastFailure = response.statusCode >= 500
+              ? 'ESP32_OFFLINE:ESP32 returned HTTP ${response.statusCode}.'
+              : 'ESP32_REJECTED:ESP32 returned HTTP ${response.statusCode}.';
+        } on TimeoutException {
+          lastFailure = 'ESP32_TIMEOUT:The ESP32 request timed out.';
         } catch (_) {
-          lastFailure =
-              'ESP32 local HTTP request timed out or was unreachable.';
+          lastFailure = 'ESP32_OFFLINE:The ESP32 could not be reached.';
         }
       }
     } finally {
@@ -6260,7 +6447,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       final firebaseMessage = firebaseFailure == null
           ? 'Firebase was not reachable.'
           : _firebaseWriteFailureMessage(firebaseFailure);
-      _showCommandMessage(actuatorName, '$firebaseMessage $localFailure');
+      final localMessage = localFailure.startsWith('ESP32_TIMEOUT:')
+          ? friendlyCommandFailureMessage(status: 'timed_out')
+          : friendlyCommandFailureMessage(status: 'offline');
+      _showCommandMessage(actuatorName, '$firebaseMessage $localMessage');
       if (mounted) setState(() {});
       return;
     }
@@ -6501,13 +6691,41 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             ),
           )
           .timeout(const Duration(seconds: 10));
-      if (response.statusCode != 200) throw Exception(response.body);
-      if (mounted) {
-        setState(
-          () => _hotspotStatus =
-              'Wi-Fi sent. Returning your phone to its normal network...',
+      var statusCode = _readProvisioningCode(response.body);
+      if (response.statusCode != 200 &&
+          statusCode != 'missing_credentials' &&
+          statusCode != 'invalid_credentials') {
+        throw Exception(
+          wifiProvisioningMessage(statusCode),
         );
       }
+
+      // Keep using the setup hotspot while the ESP32 tests credentials and reports
+      // the most specific disconnect reason its Wi-Fi driver can identify.
+      final timer = Stopwatch()..start();
+      while (isWifiProvisioningPending(statusCode) &&
+          timer.elapsed < const Duration(seconds: 35)) {
+        if (mounted) {
+          setState(
+            () => _hotspotStatus = wifiProvisioningMessage(statusCode),
+          );
+        }
+        await Future<void>.delayed(const Duration(seconds: 1));
+        final statusResponse = await http
+            .get(
+              Uri.parse('http://192.168.4.1/provision/status'),
+              headers: {'Connection': 'close'},
+            )
+            .timeout(const Duration(seconds: 3));
+        if (statusResponse.statusCode != 200) {
+          throw Exception('Could not read the ESP32 Wi-Fi status.');
+        }
+        statusCode = _readProvisioningCode(statusResponse.body);
+      }
+      if (isWifiProvisioningPending(statusCode)) statusCode = 'timeout';
+
+      final resultMessage = wifiProvisioningMessage(statusCode);
+      if (mounted) setState(() => _hotspotStatus = resultMessage);
       await WiFiForIoTPlugin.forceWifiUsage(false);
       await WiFiForIoTPlugin.disconnect();
       try {
@@ -6515,20 +6733,32 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       } catch (_) {
         // Android/iOS may restrict programmatic removal; disconnect still succeeds.
       }
-      if (mounted) {
+      if (mounted && statusCode == 'connected') {
         setState(
           () => _hotspotStatus =
-              'ESP32 is joining $ssid. Reconnect to your home Wi-Fi on this phone.',
+              '$resultMessage Reconnect this phone to your home Wi-Fi.',
         );
       }
     } catch (error) {
-      setState(() => _hotspotStatus = 'Hotspot setup failed: $error');
+      if (mounted) {
+        setState(
+          () => _hotspotStatus =
+              'Could not check the ESP32 Wi-Fi result: $error',
+        );
+      }
     } finally {
       try {
         await WiFiForIoTPlugin.forceWifiUsage(false);
       } catch (_) {}
       if (mounted) setState(() => _isHotspotConnecting = false);
     }
+  }
+
+  String _readProvisioningCode(String responseBody) {
+    final response = Map<String, dynamic>.from(
+      jsonDecode(responseBody) as Map,
+    );
+    return response['status']?.toString() ?? 'unknown';
   }
 
   Future<void> _publishPhThresholds() async {

@@ -1,6 +1,39 @@
 import 'package:firebase_auth/firebase_auth.dart';
 
 final RegExp loginEmailPattern = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
+final RegExp signupPhonePattern = RegExp(r'^09\d{9}$');
+
+String? validateEmailField(String email) {
+  if (email.trim().isEmpty) return 'Please enter your email address.';
+  if (!loginEmailPattern.hasMatch(email.trim())) {
+    return 'Please enter a valid email address.';
+  }
+  return null;
+}
+
+String? validatePasswordField(String password) => password.isEmpty
+    ? 'Please enter your password.'
+    : null;
+
+String? validateSignupPhoneField(String phone) {
+  if (phone.trim().isEmpty) return 'Please enter your phone number.';
+  if (!signupPhonePattern.hasMatch(phone.trim())) {
+    return 'Phone number must be 11 digits and start with 09.';
+  }
+  return null;
+}
+
+String? validateSignupPasswordField(String password) {
+  if (password.isEmpty) return 'Please enter a password.';
+  if (password.length < 6) return 'Password must be at least 6 characters.';
+  return null;
+}
+
+String? validateConfirmPasswordField(String password, String confirmation) {
+  if (confirmation.isEmpty) return 'Please confirm your password.';
+  if (password != confirmation) return 'Passwords do not match.';
+  return null;
+}
 
 String? validateLoginFields({
   required String email,
@@ -16,10 +49,7 @@ String? validateLoginFields({
   if (password.isEmpty) {
     return 'Please enter your password.';
   }
-  if (!loginEmailPattern.hasMatch(trimmedEmail)) {
-    return 'Please enter a valid email address.';
-  }
-  return null;
+  return validateEmailField(trimmedEmail);
 }
 
 String friendlyLoginAuthMessage(String code) {

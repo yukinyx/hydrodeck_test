@@ -5,6 +5,7 @@ import 'package:hydrodeck_test/command_ack_policy.dart';
 import 'package:hydrodeck_test/history_interval.dart';
 import 'package:hydrodeck_test/login_validation.dart';
 import 'package:hydrodeck_test/pump_control_policy.dart';
+import 'package:hydrodeck_test/wifi_provisioning_policy.dart';
 
 void main() {
   sqfliteFfiInit();
@@ -234,6 +235,23 @@ void main() {
       );
     });
 
+    test('validates signup phone, password, and confirmation fields', () {
+      expect(validateSignupPhoneField(''), 'Please enter your phone number.');
+      expect(
+        validateSignupPhoneField('09123456789'),
+        isNull,
+      );
+      expect(
+        validateSignupPhoneField('08123456789'),
+        'Phone number must be 11 digits and start with 09.',
+      );
+      expect(
+        validateSignupPasswordField('short'),
+        'Password must be at least 6 characters.',
+      );
+      expect(validateConfirmPasswordField('secret1', 'secret2'), 'Passwords do not match.');
+    });
+
     test('recognizes command lifecycle and terminal ack states', () {
       for (final status in commandAckStatuses) {
         expect(isValidCommandAckStatus(status), isTrue);
@@ -284,6 +302,44 @@ void main() {
       expect(isConfirmedWaterPumpOnAck('phUp1', 'running'), isFalse);
       expect(isTerminalCommandAckStatus('rejected'), isTrue);
       expect(isTerminalCommandAckStatus('timed_out'), isTrue);
+    });
+
+    test('maps Wi-Fi provisioning results to accurate messages', () {
+      expect(isWifiProvisioningPending('testing'), isTrue);
+      expect(isWifiProvisioningPending('connected'), isFalse);
+      expect(wifiProvisioningMessage('connected'), contains('successfully'));
+      expect(
+        wifiProvisioningMessage('authentication_failed'),
+        contains('check the Wi-Fi password'),
+      );
+      expect(
+        wifiProvisioningMessage('network_unavailable'),
+        contains('Could not find'),
+      );
+      expect(wifiProvisioningMessage('connection_failed'), contains('found'));
+      expect(wifiProvisioningMessage('timeout'), contains('timed out'));
+    });
+
+    test('names command targets and distinguishes command failure outcomes', () {
+      expect(commandActuatorLabel('waterPump1'), 'Water pump — grow bed 1');
+      expect(commandActuatorLabel('phUp2'), 'pH up pump — grow bed 2');
+      expect(commandActuatorLabel('nutrient1'), 'Nutrient pump — grow bed 1');
+      expect(
+        friendlyCommandFailureMessage(status: 'rejected', reason: 'max_run'),
+        contains('maximum run time'),
+      );
+      expect(
+        friendlyCommandFailureMessage(status: 'timed_out'),
+        contains('timed out'),
+      );
+      expect(
+        friendlyCommandFailureMessage(status: 'offline'),
+        contains('offline or unreachable'),
+      );
+      expect(
+        friendlyCommandFailureMessage(status: 'unconfirmed'),
+        contains('not confirmed'),
+      );
     });
   });
 }

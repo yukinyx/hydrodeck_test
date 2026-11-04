@@ -410,4 +410,65 @@ void main() {
       ),
     );
   });
+
+  testWidgets('login fields validate on blur and update after correction', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: LoginScreen(onSignup: () {}, onAuthenticated: (_) {}),
+      ),
+    );
+
+    expect(find.text('Please enter a valid email address.'), findsNothing);
+    final fields = find.byType(TextField);
+    await tester.tap(fields.first);
+    await tester.enterText(fields.first, 'not-an-email');
+    await tester.tap(fields.at(1));
+    await tester.pump();
+    expect(find.text('Please enter a valid email address.'), findsOneWidget);
+
+    await tester.tap(fields.first);
+    await tester.enterText(fields.first, 'grower@example.com');
+    await tester.pump();
+    expect(find.text('Please enter a valid email address.'), findsNothing);
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is TextField &&
+            widget.decoration?.hintText == 'example@gmail.com',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is TextField && widget.decoration?.hintText == '********',
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('signup validates fields on blur and clears corrected errors', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SignupScreen(onLogin: () {}, onAuthenticated: (_) {}),
+      ),
+    );
+
+    final fields = find.byType(TextField);
+    expect(find.text('Please enter a valid email address.'), findsNothing);
+    await tester.tap(fields.first);
+    await tester.enterText(fields.first, 'not-an-email');
+    await tester.tap(fields.at(1));
+    await tester.pump();
+    expect(find.text('Please enter a valid email address.'), findsOneWidget);
+
+    await tester.tap(fields.first);
+    await tester.enterText(fields.first, 'grower@example.com');
+    await tester.pump();
+    expect(find.text('Please enter a valid email address.'), findsNothing);
+  });
 }

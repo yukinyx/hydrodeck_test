@@ -209,6 +209,8 @@ IPAddress apSubnet(255, 255, 255, 0);
 bool restartAfterProvisioning = false;
 unsigned long restartAt = 0;
 bool provisioningPending = false;
+String provisioningStatus = "idle";
+uint16_t provisioningDisconnectReason = 0;
 const char* remoteActuatorNames[] = {
   "waterPump1", "phUp1", "phDown1", "nutrient1",
   "waterPump2", "phUp2", "phDown2", "nutrient2", "growLight"
@@ -1955,7 +1957,8 @@ void handleRootIdent() {
 
 void handleProvision() {
   if (!server.hasArg("ssid") || !server.hasArg("password")) {
-    server.send(400, "text/plain", "Missing Wi-Fi credentials");
+    server.send(400, "application/json",
+        "{\"status\":\"missing_credentials\",\"reason\":0}");
     return;
   }
   String newSsid = server.arg("ssid");
@@ -1963,7 +1966,8 @@ void handleProvision() {
   newSsid.trim();
   newPassword.trim();
   if (newSsid.isEmpty() || newSsid.length() >= sizeof(ssid) || newPassword.length() >= sizeof(password)) {
-    server.send(400, "text/plain", "Invalid Wi-Fi credentials");
+    server.send(400, "application/json",
+        "{\"status\":\"invalid_credentials\",\"reason\":0}");
     return;
   }
   newSsid.toCharArray(ssid, sizeof(ssid));
@@ -1973,7 +1977,16 @@ void handleProvision() {
   provisioningPending = true;
   wifiConnectInProgress = false;
   firebaseInitialized = false;
-  server.send(200, "text/plain", "ESP32 is connecting to Wi-Fi");
+  provisioningStatus = "testing";
+  provisioningDisconnectReason = 0;
+  server.send(200, "application/json",
+      "{\"status\":\"testing\",\"reason\":0}");
+}
+
+void handleProvisionStatus() {
+  String json = "{\"status\":\"" + provisioningStatus +
+      "\",\"reason\":" + String(provisioningDisconnectReason) + "}";
+  server.send(200, "application/json", json);
 }
 
 void handleSettings() {
@@ -2207,6 +2220,31 @@ void processMainWifiDiagnostics() {
           WiFi.disconnectReasonName(reason), WiFi.channel());
       firebaseInitialized = false;
         lastFirebaseTelemetryJson = "";
+      if (provisioningPending && wifiConnectInProgress) {
+        provisioningDisconnectReason = diagnostic.disconnectReason;
+        // ESP-IDF reason codes 201-205 distinguish missing AP, auth, and association failures.
+        switch (diagnostic.disconnectReason) {
+          case 201:  // WIFI_REASON_NO_AP_FOUND
+            provisioningStatus = "network_unavailable";
+            break;
+          case 15:   // WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT
+          case 202: // WIFI_REASON_AUTH_FAIL
+          case 204: // WIFI_REASON_HANDSHAKE_TIMEOUT
+            provisioningStatus = "authentication_failed";
+            break;
+          case 203: // WIFI_REASON_ASSOC_FAIL
+          case 205: // WIFI_REASON_CONNECTION_FAIL
+            provisioningStatus = "connection_failed";
+            break;
+          default:
+            break;
+        }
+        if (provisioningStatus != "testing") {
+          provisioningPending = false;
+          wifiConnectInProgress = false;
+          lastWifiRetry = millis();
+        }
+      }
     } else if (diagnostic.kind == 2) {
       Serial.printf("MAIN Wi-Fi associated channel=%d\n", WiFi.channel());
     } else if (diagnostic.kind == 3) {
@@ -2364,6 +2402,7 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRootIdent);
   server.on("/provision", HTTP_GET, handleProvision);
+  server.on("/provision/status", HTTP_GET, handleProvisionStatus);
   server.on("/settings", HTTP_GET, handleSettings);
   server.on("/status", HTTP_GET, handleCombinedStatus);
   server.on("/control", HTTP_GET, handleControl); // Control via URL e.g. /control?actuator=phUp1&state=1 OR /control?command=PH_ADJUST:1:UP
@@ -2397,11 +2436,14 @@ void loop() {
     } else if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == String(ssid)) {
       provisioningPending = false;
       wifiConnectInProgress = false;
+      provisioningStatus = "connected";
+      provisioningDisconnectReason = 0;
       initializeFirebase();
       Serial.println("Replacement Wi-Fi connected; setup hotspot remains available.");
     } else if (now - wifiConnectStarted >= wifiConnectTimeout) {
       wifiConnectInProgress = false;
       provisioningPending = false;
+      provisioningStatus = "timeout";
       lastWifiRetry = now;
       Serial.println("New Wi-Fi attempt timed out; setup hotspot remains available.");
     }
