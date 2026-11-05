@@ -23,6 +23,8 @@ import 'history_interval.dart';
 import 'login_validation.dart';
 import 'command_ack_policy.dart';
 import 'wifi_provisioning_policy.dart';
+import 'hotspot_attempt_policy.dart';
+import 'device_presence_policy.dart';
 
 bool get _supportsBackgroundService =>
     !kIsWeb &&
@@ -33,7 +35,7 @@ bool get _supportsBackgroundService =>
 int? _cachedServerTimeOffsetMs;
 DateTime? _serverClockAnchorUtc;
 Stopwatch? _serverClockStopwatch;
-const int _deviceHeartbeatGraceSeconds = 10;
+const int _deviceHeartbeatGraceSeconds = 60;
 const double _minimumPhSetting = 4.0;
 const double _maximumPhSetting = 7.0;
 const double _minimumMaxPhSetting = 6.0;
@@ -722,7 +724,6 @@ class NotificationHelper {
       notificationDetails: details,
     );
   }
-
 }
 
 class ReservoirReading {
@@ -786,13 +787,12 @@ class ReservoirReading {
   }
 }
 
-String normalizeReservoirLevel(dynamic value) => switch (
-  value?.toString().trim().toLowerCase()
-) {
-  'full' => 'full',
-  'not_full' || 'above_50' || '50_or_below' => 'not_full',
-  _ => 'not_full',
-};
+String normalizeReservoirLevel(dynamic value) =>
+    switch (value?.toString().trim().toLowerCase()) {
+      'full' => 'full',
+      'not_full' || 'above_50' || '50_or_below' => 'not_full',
+      _ => 'not_full',
+    };
 
 class GrowBedReading {
   final double temperature;
@@ -820,12 +820,12 @@ class GrowBedReading {
   factory GrowBedReading.fromMap(Map<String, dynamic> map) {
     final rawTemperature = map['temp'];
     final parsedTemperature = rawTemperature is num
-      ? rawTemperature.toDouble()
-      : double.tryParse(rawTemperature?.toString() ?? '');
+        ? rawTemperature.toDouble()
+        : double.tryParse(rawTemperature?.toString() ?? '');
     final temperatureValid =
-      parsedTemperature != null &&
-      isValidTemperatureReading(parsedTemperature) &&
-      map['tempValid'] != false;
+        parsedTemperature != null &&
+        isValidTemperatureReading(parsedTemperature) &&
+        map['tempValid'] != false;
     final temperature = temperatureValid ? parsedTemperature : 0.0;
     final ph = (map['ph'] is num)
         ? (map['ph'] as num).toDouble()
@@ -883,14 +883,12 @@ bool shouldApplyFirebaseDeviceState({required bool localTelemetryFresh}) =>
 bool shouldShowWifiSetupPrompt({
   required bool localDeviceReachable,
   required bool cloudReachable,
-}) =>
-    !localDeviceReachable && !cloudReachable;
+}) => !localDeviceReachable && !cloudReachable;
 
 bool reportedActuatorStateConfirmsRequest({
   required bool requestedState,
   required bool reportedState,
-}) =>
-    requestedState == reportedState;
+}) => requestedState == reportedState;
 
 class HydrodeckTelemetry {
   final GrowBedReading bed1;
@@ -946,54 +944,54 @@ class HydrodeckTelemetry {
 
     final bed1Map = {
       'temp':
-        wireMap['temp1'] ??
-        wireMap['bed1']?['temp'] ??
-        wireMap['set1']?['temp'],
+          wireMap['temp1'] ??
+          wireMap['bed1']?['temp'] ??
+          wireMap['set1']?['temp'],
       'tempValid':
-        wireMap['temp1Valid'] ??
-        wireMap['bed1']?['tempValid'] ??
-        wireMap['set1']?['tempValid'],
+          wireMap['temp1Valid'] ??
+          wireMap['bed1']?['tempValid'] ??
+          wireMap['set1']?['tempValid'],
       'ph':
-        wireMap['ph1'] ??
-        wireMap['bed1']?['ph'] ??
-        wireMap['set1']?['ph'] ??
-        6.0,
+          wireMap['ph1'] ??
+          wireMap['bed1']?['ph'] ??
+          wireMap['set1']?['ph'] ??
+          6.0,
       'tds':
-        wireMap['tds1'] ??
-        wireMap['bed1']?['tds'] ??
-        wireMap['set1']?['tds'] ??
-        0.0,
+          wireMap['tds1'] ??
+          wireMap['bed1']?['tds'] ??
+          wireMap['set1']?['tds'] ??
+          0.0,
       'water':
-        wireMap['water1'] ??
-        wireMap['bed1']?['water'] ??
-        wireMap['set1']?['water'] ??
-        'low',
+          wireMap['water1'] ??
+          wireMap['bed1']?['water'] ??
+          wireMap['set1']?['water'] ??
+          'low',
     };
 
     final bed2Map = {
       'temp':
-        wireMap['temp2'] ??
-        wireMap['bed2']?['temp'] ??
-        wireMap['set2']?['temp'],
+          wireMap['temp2'] ??
+          wireMap['bed2']?['temp'] ??
+          wireMap['set2']?['temp'],
       'tempValid':
-        wireMap['temp2Valid'] ??
-        wireMap['bed2']?['tempValid'] ??
-        wireMap['set2']?['tempValid'],
+          wireMap['temp2Valid'] ??
+          wireMap['bed2']?['tempValid'] ??
+          wireMap['set2']?['tempValid'],
       'ph':
-        wireMap['ph2'] ??
-        wireMap['bed2']?['ph'] ??
-        wireMap['set2']?['ph'] ??
-        6.0,
+          wireMap['ph2'] ??
+          wireMap['bed2']?['ph'] ??
+          wireMap['set2']?['ph'] ??
+          6.0,
       'tds':
-        wireMap['tds2'] ??
-        wireMap['bed2']?['tds'] ??
-        wireMap['set2']?['tds'] ??
-        0.0,
+          wireMap['tds2'] ??
+          wireMap['bed2']?['tds'] ??
+          wireMap['set2']?['tds'] ??
+          0.0,
       'water':
-        wireMap['water2'] ??
-        wireMap['bed2']?['water'] ??
-        wireMap['set2']?['water'] ??
-        'low',
+          wireMap['water2'] ??
+          wireMap['bed2']?['water'] ??
+          wireMap['set2']?['water'] ??
+          'low',
     };
 
     final bed1 = GrowBedReading.fromMap(bed1Map);
@@ -1454,15 +1452,8 @@ void onBackgroundServiceStart(ServiceInstance service) async {
           firebaseConnected = true;
           final lastSeen = data['lastSeen'];
           final heartbeatMillis = _parseHeartbeatMillis(lastSeen);
-          final heartbeatFresh =
-              heartbeatMillis != null &&
-              DateTime.now()
-                      .difference(
-                        DateTime.fromMillisecondsSinceEpoch(heartbeatMillis),
-                      )
-                      .inSeconds <=
-                  _deviceHeartbeatGraceSeconds;
-                  firebaseHeartbeatFresh = heartbeatFresh;
+          final heartbeatFresh = isDeviceHeartbeatFresh(heartbeatMillis);
+          firebaseHeartbeatFresh = heartbeatFresh;
           isConnected =
               data['wifiConnected'] == true &&
               data['firebaseReady'] == true &&
@@ -1816,21 +1807,21 @@ class _SignupScreenState extends State<SignupScreen> {
   @override
   void initState() {
     super.initState();
-    _emailFocus.addListener(
-      () { if (!_emailFocus.hasFocus) _validateSignupEmail(onBlur: true); },
-    );
-    _phoneFocus.addListener(
-      () { if (!_phoneFocus.hasFocus) _validateSignupPhone(onBlur: true); },
-    );
-    _passwordFocus.addListener(
-      () { if (!_passwordFocus.hasFocus) _validateSignupPassword(onBlur: true); },
-    );
-    _confirmFocus.addListener(
-      () { if (!_confirmFocus.hasFocus) _validateSignupConfirmation(onBlur: true); },
-    );
-    _pinFocus.addListener(
-      () { if (!_pinFocus.hasFocus) _validateSignupPin(onBlur: true); },
-    );
+    _emailFocus.addListener(() {
+      if (!_emailFocus.hasFocus) _validateSignupEmail(onBlur: true);
+    });
+    _phoneFocus.addListener(() {
+      if (!_phoneFocus.hasFocus) _validateSignupPhone(onBlur: true);
+    });
+    _passwordFocus.addListener(() {
+      if (!_passwordFocus.hasFocus) _validateSignupPassword(onBlur: true);
+    });
+    _confirmFocus.addListener(() {
+      if (!_confirmFocus.hasFocus) _validateSignupConfirmation(onBlur: true);
+    });
+    _pinFocus.addListener(() {
+      if (!_pinFocus.hasFocus) _validateSignupPin(onBlur: true);
+    });
   }
 
   @override
@@ -1866,7 +1857,9 @@ class _SignupScreenState extends State<SignupScreen> {
   void _validateSignupPassword({bool onBlur = false}) {
     if (onBlur) _passwordTouched = true;
     if (_passwordTouched) {
-      setState(() => _passwordError = validateSignupPasswordField(_password.text));
+      setState(
+        () => _passwordError = validateSignupPasswordField(_password.text),
+      );
     }
     if (_confirmTouched) _validateSignupConfirmation();
   }
@@ -1887,8 +1880,9 @@ class _SignupScreenState extends State<SignupScreen> {
     if (onBlur) _pinTouched = true;
     if (_pinTouched) {
       setState(
-        () => _pinError =
-            _pin.text == '6967' ? null : 'The access PIN is incorrect.',
+        () => _pinError = _pin.text == '6967'
+            ? null
+            : 'The access PIN is incorrect.',
       );
     }
   }
@@ -1896,8 +1890,8 @@ class _SignupScreenState extends State<SignupScreen> {
   Future<void> _signup() async {
     final email = _email.text.trim();
     final phone = _phone.text.trim();
-    _emailTouched = _phoneTouched = _passwordTouched =
-        _confirmTouched = _pinTouched = true;
+    _emailTouched = _phoneTouched = _passwordTouched = _confirmTouched =
+        _pinTouched = true;
     _emailError = validateEmailField(email);
     _phoneError = validateSignupPhoneField(phone);
     _passwordError = validateSignupPasswordField(_password.text);
@@ -1910,7 +1904,7 @@ class _SignupScreenState extends State<SignupScreen> {
         _pinError != null) {
       setState(() {});
       if (_pinError != null) {
-      _pin.clear();
+        _pin.clear();
       }
       return;
     }
@@ -2043,12 +2037,12 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   void initState() {
     super.initState();
-    _emailFocus.addListener(
-      () { if (!_emailFocus.hasFocus) _validateLoginEmail(onBlur: true); },
-    );
-    _passwordFocus.addListener(
-      () { if (!_passwordFocus.hasFocus) _validateLoginPassword(onBlur: true); },
-    );
+    _emailFocus.addListener(() {
+      if (!_emailFocus.hasFocus) _validateLoginEmail(onBlur: true);
+    });
+    _passwordFocus.addListener(() {
+      if (!_passwordFocus.hasFocus) _validateLoginPassword(onBlur: true);
+    });
   }
 
   @override
@@ -5030,7 +5024,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   late TextEditingController _wifiSsidController;
   late TextEditingController _wifiPasswordController;
-  bool _isHotspotConnecting = false;
+  final HotspotAttemptGate _hotspotAttemptGate = HotspotAttemptGate();
+  bool get _isHotspotConnecting => _hotspotAttemptGate.isActive;
   String _hotspotStatus = 'ESP32 hotspot not connected';
 
   double _minPhThreshold = 5.5;
@@ -5132,14 +5127,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           final payload = Map<String, dynamic>.from(value);
           final lastSeen = payload['lastSeen'];
           final heartbeatMillis = _parseHeartbeatMillis(lastSeen);
-          final heartbeatFresh =
-              heartbeatMillis != null &&
-              DateTime.now()
-                      .difference(
-                        DateTime.fromMillisecondsSinceEpoch(heartbeatMillis),
-                      )
-                      .inSeconds <=
-                  _deviceHeartbeatGraceSeconds;
+          final heartbeatFresh = isDeviceHeartbeatFresh(heartbeatMillis);
           final telemetry = HydrodeckTelemetry.fromJson(payload);
           final settings = payload['settings'];
           double? sharedMinPh;
@@ -5150,7 +5138,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             if (minValue is num && maxValue is num) {
               final candidateMin = minValue.toDouble();
               final candidateMax = maxValue.toDouble();
-                if (isValidPhThresholds(candidateMin, candidateMax)) {
+              if (isValidPhThresholds(candidateMin, candidateMax)) {
                 sharedMinPh = candidateMin;
                 sharedMaxPh = candidateMax;
               }
@@ -5186,17 +5174,29 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   ? Map<String, dynamic>.from(payload['actuators'] as Map)
                   : payload;
               _updateActuatorFromFirebase(
-                'bed1_water', 'waterPump1', actuators,
+                'bed1_water',
+                'waterPump1',
+                actuators,
               );
               _updateActuatorFromFirebase('bed1_ph_up', 'phUp1', actuators);
               _updateActuatorFromFirebase('bed1_ph_down', 'phDown1', actuators);
-              _updateActuatorFromFirebase('bed1_nutrient', 'nutrient1', actuators);
               _updateActuatorFromFirebase(
-                'bed2_water', 'waterPump2', actuators,
+                'bed1_nutrient',
+                'nutrient1',
+                actuators,
+              );
+              _updateActuatorFromFirebase(
+                'bed2_water',
+                'waterPump2',
+                actuators,
               );
               _updateActuatorFromFirebase('bed2_ph_up', 'phUp2', actuators);
               _updateActuatorFromFirebase('bed2_ph_down', 'phDown2', actuators);
-              _updateActuatorFromFirebase('bed2_nutrient', 'nutrient2', actuators);
+              _updateActuatorFromFirebase(
+                'bed2_nutrient',
+                'nutrient2',
+                actuators,
+              );
               _applyGrowLightTelemetry(telemetry.growLightOn);
             }
             _updateConnectionStatus();
@@ -5296,9 +5296,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             _pendingCommandIds.remove(pending.key);
             _commandsAcceptedOrRunning.remove(pending.value);
             _commandTimeouts.remove(pending.value)?.cancel();
-            unawaited(
-              _removeFirebaseCommandRecord(pending.key, pending.value),
-            );
+            unawaited(_removeFirebaseCommandRecord(pending.key, pending.value));
             if (busyKey != null) {
               _controlStates[busyKey] = true;
               _actuatorBusy[busyKey] = false;
@@ -5309,8 +5307,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             continue;
           }
           if (status == 'accepted' || status == 'running') {
-            final firstAcceptance =
-                _commandsAcceptedOrRunning.add(pending.value);
+            final firstAcceptance = _commandsAcceptedOrRunning.add(
+              pending.value,
+            );
             final busyKey = _getActuatorBusyKey(pending.key);
             if (busyKey != null) _actuatorBusy[busyKey] = true;
             if (pending.key.startsWith('waterPump')) {
@@ -5454,19 +5453,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     });
   }
 
-  void _updateActuatorStates(
-    Map<String, bool> states, {
-    bool isLocal = false,
-  }) {
+  void _updateActuatorStates(Map<String, bool> states, {bool isLocal = false}) {
     for (final entry in states.entries) {
       final key = _actuatorControlKeys[entry.key];
       if (key != null) {
-        _updateActuatorFromFirebase(
-          key,
-          entry.key,
-          {entry.key: entry.value},
-          isLocal: isLocal,
-        );
+        _updateActuatorFromFirebase(key, entry.key, {
+          entry.key: entry.value,
+        }, isLocal: isLocal);
       }
     }
   }
@@ -5476,8 +5469,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     String actuatorName,
     Map<String, dynamic> actuators, {
     bool isLocal = false,
-  }
-  ) {
+  }) {
     if (!actuators.containsKey(actuatorName)) return;
     final value = HydrodeckTelemetry._readBoolLike(actuators, [actuatorName]);
     if (actuatorName == 'growLight') {
@@ -5662,14 +5654,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               ? Map<String, dynamic>.from(snapshot.value as Map)
               : <String, dynamic>{};
           final heartbeatMillis = _parseHeartbeatMillis(statusData['lastSeen']);
-          freshDeviceHeartbeat =
-              heartbeatMillis != null &&
-              DateTime.now()
-                      .difference(
-                        DateTime.fromMillisecondsSinceEpoch(heartbeatMillis),
-                      )
-                      .inSeconds <=
-                  _deviceHeartbeatGraceSeconds;
+          freshDeviceHeartbeat = isDeviceHeartbeatFresh(heartbeatMillis);
           if (freshDeviceHeartbeat) {
             deviceReachable = true;
             _lastFirebaseTelemetryAt = DateTime.now();
@@ -5720,7 +5705,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       DateTime.now().difference(_lastFirebaseTelemetryAt!).inSeconds <=
           _deviceHeartbeatGraceSeconds;
 
-    bool get _hasFreshSensorTelemetry =>
+  bool get _hasFreshSensorTelemetry =>
       _hasFreshLocalTelemetry || _hasFreshFirebaseTelemetry;
 
   Future<void> _loadStoredLogsAndSettings() async {
@@ -5894,7 +5879,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       ) {
         if (event != null && mounted) {
           final isLocalUpdate = event['source'] == 'local';
-          final applyDeviceState = isLocalUpdate ||
+          final applyDeviceState =
+              isLocalUpdate ||
               (event['source'] == 'firebase' &&
                   shouldApplyFirebaseDeviceState(
                     localTelemetryFresh: _hasFreshLocalTelemetry,
@@ -5941,19 +5927,39 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   event['actuators'] as Map,
                 );
                 _updateActuatorFromFirebase(
-                  'bed1_water', 'waterPump1', actuatorMap,
+                  'bed1_water',
+                  'waterPump1',
+                  actuatorMap,
                   isLocal: isLocalUpdate,
                 );
                 _updateActuatorFromFirebase('bed1_ph_up', 'phUp1', actuatorMap);
-                _updateActuatorFromFirebase('bed1_ph_down', 'phDown1', actuatorMap);
-                _updateActuatorFromFirebase('bed1_nutrient', 'nutrient1', actuatorMap);
                 _updateActuatorFromFirebase(
-                  'bed2_water', 'waterPump2', actuatorMap,
+                  'bed1_ph_down',
+                  'phDown1',
+                  actuatorMap,
+                );
+                _updateActuatorFromFirebase(
+                  'bed1_nutrient',
+                  'nutrient1',
+                  actuatorMap,
+                );
+                _updateActuatorFromFirebase(
+                  'bed2_water',
+                  'waterPump2',
+                  actuatorMap,
                   isLocal: isLocalUpdate,
                 );
                 _updateActuatorFromFirebase('bed2_ph_up', 'phUp2', actuatorMap);
-                _updateActuatorFromFirebase('bed2_ph_down', 'phDown2', actuatorMap);
-                _updateActuatorFromFirebase('bed2_nutrient', 'nutrient2', actuatorMap);
+                _updateActuatorFromFirebase(
+                  'bed2_ph_down',
+                  'phDown2',
+                  actuatorMap,
+                );
+                _updateActuatorFromFirebase(
+                  'bed2_nutrient',
+                  'nutrient2',
+                  actuatorMap,
+                );
               }
             }
             if (event['water'] != null) {
@@ -6284,7 +6290,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         ? (_controlStates[key] ?? false)
         : (_pendingActuatorStates[key] ?? _controlStates[key] ?? false);
     final requestedOn = isWaterPump || isGrowLight ? !currentState : true;
-    if (isWaterPump && _pendingCommandIds.containsKey(actuatorName) &&
+    if (isWaterPump &&
+        _pendingCommandIds.containsKey(actuatorName) &&
         (_pendingActuatorStates[key] == false || requestedOn)) {
       return;
     }
@@ -6299,8 +6306,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       );
       return;
     }
-    if (!isWaterPump && (_pendingCommandIds.containsKey(actuatorName) ||
-        _actuatorBusy[key] == true)) {
+    if (!isWaterPump &&
+        (_pendingCommandIds.containsKey(actuatorName) ||
+            _actuatorBusy[key] == true)) {
       _showCommandMessage(
         actuatorName,
         'Already running. Wait for this pulse to finish.',
@@ -6338,13 +6346,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     final commandRef = commandQueue.child(commandId);
     final commandValue = requestedOn ? '1' : '0';
 
-    _trackPendingCommand(
-      key,
-      actuatorName,
-      commandId,
-      commandRef,
-      requestedOn,
-    );
+    _trackPendingCommand(key, actuatorName, commandId, commandRef, requestedOn);
     if (mounted) setState(() {});
 
     final localTelemetryFresh =
@@ -6457,30 +6459,42 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   Future<void> _connectToEsp32Hotspot() async {
-    if (_isHotspotConnecting) return;
+    if (!_hotspotAttemptGate.tryBegin()) return;
     setState(() {
-      _isHotspotConnecting = true;
       _hotspotStatus = 'Connecting to $_esp32Hotspot...';
     });
+    var failureStage = HotspotFailureStage.connection;
     try {
-      await WiFiForIoTPlugin.connect(
+      final connected = await WiFiForIoTPlugin.connect(
         _esp32Hotspot,
         password: _esp32HotspotPassword,
         security: NetworkSecurity.WPA,
         joinOnce: true,
-      );
-      await WiFiForIoTPlugin.forceWifiUsage(true);
+      ).timeout(const Duration(seconds: 20));
+      if (!connected) throw StateError('Hotspot connection failed');
+      await WiFiForIoTPlugin.forceWifiUsage(
+        true,
+      ).timeout(const Duration(seconds: 5));
       final response = await http
           .get(
             Uri.parse('http://192.168.4.1/status'),
             headers: {'Connection': 'close'},
           )
           .timeout(const Duration(seconds: 5));
+      failureStage = HotspotFailureStage.response;
       if (response.statusCode != 200) {
-        throw Exception('ESP32 did not respond on its hotspot.');
+        throw const FormatException('Unexpected ESP32 status response');
+      }
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map ||
+          !(decoded.containsKey('wifiConnected') ||
+              decoded.containsKey('reservoir') ||
+              decoded.containsKey('temp1') ||
+              decoded.containsKey('bed1'))) {
+        throw const FormatException('Malformed ESP32 status response');
       }
       final telemetry = HydrodeckTelemetry.fromJson(
-        Map<String, dynamic>.from(jsonDecode(response.body) as Map),
+        Map<String, dynamic>.from(decoded),
       );
       await DatabaseHelper.instance.saveActiveIp('192.168.4.1');
       if (!mounted) return;
@@ -6499,15 +6513,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       if (_supportsBackgroundService) {
         FlutterBackgroundService().invoke('updateIp', {'ip': '192.168.4.1'});
       }
-    } catch (error) {
+    } catch (_) {
       if (mounted) {
-        setState(() => _hotspotStatus = 'Hotspot connection failed: $error');
+        setState(() => _hotspotStatus = hotspotFailureMessage(failureStage));
       }
     } finally {
       try {
         await WiFiForIoTPlugin.forceWifiUsage(false);
       } catch (_) {}
-      if (mounted) setState(() => _isHotspotConnecting = false);
+      _hotspotAttemptGate.finish();
+      if (mounted) setState(() {});
     }
   }
 
@@ -6581,14 +6596,17 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                               setDialogState(() {
                                 scanning = false;
                                 scanMessage = matches.isEmpty
-                                    ? 'ESP32 hotspot not found. Power it on and scan again.'
+                                    ? hotspotFailureMessage(
+                                        HotspotFailureStage.discovery,
+                                      )
                                     : null;
                               });
                             } catch (_) {
                               setDialogState(() {
                                 scanning = false;
-                                scanMessage =
-                                    'Wi-Fi scan unavailable. Enable Wi-Fi/location access, or connect to $_esp32Hotspot manually.';
+                                scanMessage = hotspotFailureMessage(
+                                  HotspotFailureStage.discovery,
+                                );
                               });
                             }
                           },
@@ -6672,18 +6690,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       return;
     }
 
+    if (!_hotspotAttemptGate.tryBegin()) return;
     setState(() {
-      _isHotspotConnecting = true;
       _hotspotStatus = 'Connecting to $hotspotSsid...';
     });
+    var failureStage = HotspotFailureStage.connection;
     try {
-      await WiFiForIoTPlugin.connect(
+      final connected = await WiFiForIoTPlugin.connect(
         hotspotSsid,
         password: _esp32HotspotPassword,
         security: NetworkSecurity.WPA,
         joinOnce: true,
-      );
-      await WiFiForIoTPlugin.forceWifiUsage(true);
+      ).timeout(const Duration(seconds: 20));
+      if (!connected) throw StateError('Hotspot connection failed');
+      await WiFiForIoTPlugin.forceWifiUsage(
+        true,
+      ).timeout(const Duration(seconds: 5));
       final response = await http
           .get(
             Uri.parse(
@@ -6691,13 +6713,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             ),
           )
           .timeout(const Duration(seconds: 10));
+      failureStage = HotspotFailureStage.response;
       var statusCode = _readProvisioningCode(response.body);
       if (response.statusCode != 200 &&
           statusCode != 'missing_credentials' &&
           statusCode != 'invalid_credentials') {
-        throw Exception(
-          wifiProvisioningMessage(statusCode),
-        );
+        throw Exception(wifiProvisioningMessage(statusCode));
       }
 
       // Keep using the setup hotspot while the ESP32 tests credentials and reports
@@ -6706,9 +6727,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       while (isWifiProvisioningPending(statusCode) &&
           timer.elapsed < const Duration(seconds: 35)) {
         if (mounted) {
-          setState(
-            () => _hotspotStatus = wifiProvisioningMessage(statusCode),
-          );
+          setState(() => _hotspotStatus = wifiProvisioningMessage(statusCode));
         }
         await Future<void>.delayed(const Duration(seconds: 1));
         final statusResponse = await http
@@ -6741,24 +6760,34 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       }
     } catch (error) {
       if (mounted) {
-        setState(
-          () => _hotspotStatus =
-              'Could not check the ESP32 Wi-Fi result: $error',
-        );
+        setState(() => _hotspotStatus = hotspotFailureMessage(failureStage));
       }
     } finally {
       try {
         await WiFiForIoTPlugin.forceWifiUsage(false);
       } catch (_) {}
-      if (mounted) setState(() => _isHotspotConnecting = false);
+      _hotspotAttemptGate.finish();
+      if (mounted) setState(() {});
     }
   }
 
   String _readProvisioningCode(String responseBody) {
-    final response = Map<String, dynamic>.from(
-      jsonDecode(responseBody) as Map,
-    );
-    return response['status']?.toString() ?? 'unknown';
+    final response = Map<String, dynamic>.from(jsonDecode(responseBody) as Map);
+    final status = response['status'];
+    const knownStatuses = {
+      'testing',
+      'connected',
+      'network_unavailable',
+      'authentication_failed',
+      'connection_failed',
+      'timeout',
+      'missing_credentials',
+      'invalid_credentials',
+    };
+    if (status is! String || !knownStatuses.contains(status)) {
+      throw const FormatException('Malformed ESP32 provisioning response');
+    }
+    return status;
   }
 
   Future<void> _publishPhThresholds() async {
@@ -6930,8 +6959,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   // Home screen
   Widget _buildHomeScreen(String waterLabel) {
     final statusColor = _connectionStatus == 'ESP32 offline'
-      ? Colors.orange
-      : Colors.green;
+        ? Colors.orange
+        : Colors.green;
     final isBed1Warning =
         _bed1.ph < _minPhThreshold || _bed1.ph > _maxPhThreshold;
     final isBed2Warning =
@@ -7177,9 +7206,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     );
     final temperatureHot = temperatureStatus == 'Too hot';
     final temperatureUnavailable = temperatureStatus == 'Unavailable';
-    final waterLabel = data.waterFull
-        ? 'Full water level'
-        : 'Low water level';
+    final waterLabel = data.waterFull ? 'Full water level' : 'Low water level';
     return Column(
       children: [
         Row(
@@ -7220,27 +7247,27 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               child: _buildCleanCard(
                 'WATER TEMP',
                 temperatureUnavailable
-                  ? '—'
-                  : '${data.temperature.toStringAsFixed(1)}°C',
+                    ? '—'
+                    : '${data.temperature.toStringAsFixed(1)}°C',
                 temperatureStatus,
                 temperatureHot
-                  ? const Color(0xFFFFEBEE)
-                  : temperatureUnavailable
-                  ? const Color(0xFFF0F0F0)
-                  : const Color(0xFFE8F4FD),
+                    ? const Color(0xFFFFEBEE)
+                    : temperatureUnavailable
+                    ? const Color(0xFFF0F0F0)
+                    : const Color(0xFFE8F4FD),
                 temperatureHot
-                  ? Colors.red.shade700
-                  : temperatureUnavailable
-                  ? Colors.grey
-                  : Colors.blue.shade700,
+                    ? Colors.red.shade700
+                    : temperatureUnavailable
+                    ? Colors.grey
+                    : Colors.blue.shade700,
                 icon: temperatureHot
-                  ? Icons.thermostat
-                  : Icons.device_thermostat,
+                    ? Icons.thermostat
+                    : Icons.device_thermostat,
                 iconColor: temperatureHot
-                  ? Colors.red.shade700
-                  : temperatureUnavailable
-                  ? Colors.grey
-                  : Colors.blue.shade700,
+                    ? Colors.red.shade700
+                    : temperatureUnavailable
+                    ? Colors.grey
+                    : Colors.blue.shade700,
                 iconSemanticLabel: 'Thermometer, $temperatureStatus',
               ),
             ),
@@ -7391,33 +7418,38 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   height: 48,
                   child: ElevatedButton(
                     key: nutrient
-                      ? null
-                      : ValueKey('water-pump-$bedIndex-toggle'),
-                    onPressed: nutrient
-                      ? (_actuatorBusy[key] == true || _chemicalPumpBusy
-                          ? null
-                          : () => _toggleActuator(key, actuator))
-                      : (commandPending &&
-                          (!isOn || _pendingActuatorStates[key] == false)
                         ? null
-                        : (!isOn &&
-                              (!rainNodeOnline ||
-                                _otherWaterPumpIsRunning(actuator))
-                            ? null
-                            : () => _toggleActuator(key, actuator))),
+                        : ValueKey('water-pump-$bedIndex-toggle'),
+                    onPressed: nutrient
+                        ? (_actuatorBusy[key] == true || _chemicalPumpBusy
+                              ? null
+                              : () => _toggleActuator(key, actuator))
+                        : (commandPending &&
+                                  (!isOn ||
+                                      _pendingActuatorStates[key] == false)
+                              ? null
+                              : (!isOn &&
+                                        (!rainNodeOnline ||
+                                            _otherWaterPumpIsRunning(actuator))
+                                    ? null
+                                    : () => _toggleActuator(key, actuator))),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: !nutrient && isOn
-                        ? const Color(0xFF2DC867)
-                        : !nutrient && needsWater
-                        ? Colors.amber.shade300
-                        : Colors.grey.shade200,
+                          ? const Color(0xFF2DC867)
+                          : !nutrient && needsWater
+                          ? Colors.amber.shade300
+                          : Colors.grey.shade200,
                       foregroundColor: !nutrient && isOn
-                        ? Colors.white
-                        : Colors.black87,
+                          ? Colors.white
+                          : Colors.black87,
                       padding: const EdgeInsets.symmetric(horizontal: 8),
                     ),
                     child: Text(
-                      nutrient ? 'ADD' : isOn ? 'ON' : 'OFF',
+                      nutrient
+                          ? 'ADD'
+                          : isOn
+                          ? 'ON'
+                          : 'OFF',
                       style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
                   ),
@@ -7872,15 +7904,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   value: _minPhThreshold,
                   min: 4.0,
                   max: (_maxPhThreshold - 0.1).clamp(4.1, 7.0).toDouble(),
-                    divisions: (((_maxPhThreshold - 0.1)
-                            .clamp(4.1, 7.0)
-                            .toDouble() -
-                          4.0) *
-                        10)
-                      .round(),
+                  divisions:
+                      (((_maxPhThreshold - 0.1).clamp(4.1, 7.0).toDouble() -
+                                  4.0) *
+                              10)
+                          .round(),
                   activeColor: Colors.orange,
-                  onChanged: (val) =>
-                      _updatePhThresholds(val, _maxPhThreshold),
+                  onChanged: (val) => _updatePhThresholds(val, _maxPhThreshold),
                 ),
               ],
             ),
@@ -7916,15 +7946,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   value: _maxPhThreshold,
                   min: (_minPhThreshold + 0.1).clamp(6.0, 8.9).toDouble(),
                   max: 9.0,
-                    divisions: ((9.0 -
-                          (_minPhThreshold + 0.1)
-                            .clamp(6.0, 8.9)
-                            .toDouble()) *
-                        10)
-                      .round(),
+                  divisions:
+                      ((9.0 -
+                                  (_minPhThreshold + 0.1)
+                                      .clamp(6.0, 8.9)
+                                      .toDouble()) *
+                              10)
+                          .round(),
                   activeColor: Colors.green,
-                  onChanged: (val) =>
-                      _updatePhThresholds(_minPhThreshold, val),
+                  onChanged: (val) => _updatePhThresholds(_minPhThreshold, val),
                 ),
               ],
             ),
@@ -7982,9 +8012,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     String value,
     String? badgeText,
     Color bg,
-    Color text,
-    {IconData? icon, Color? iconColor, String? iconSemanticLabel}
-  ) {
+    Color text, {
+    IconData? icon,
+    Color? iconColor,
+    String? iconSemanticLabel,
+  }) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),

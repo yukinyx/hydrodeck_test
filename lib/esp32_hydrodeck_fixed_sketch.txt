@@ -178,6 +178,7 @@ bool firebaseInitialized = false;
 bool wifiConnectInProgress = false;
 bool mdnsStarted = false;
 bool firebaseHeartbeatPending = false;
+bool provisioningApRunning = false;
 bool lastLoggedFirebaseReady = false;
 unsigned long lastWifiRetry = 0;
 unsigned long lastFirebaseInitAttemptAt = 0;
@@ -256,7 +257,9 @@ const char* SNAPSHOT_QUEUE_KEYS[SNAPSHOT_QUEUE_LIMIT] = {
 const unsigned long SNAPSHOT_UPLOAD_TIMEOUT_MS = 15000UL;
 const unsigned long SNAPSHOT_UPLOAD_RETRY_MS = 30000UL;
 String activeCommandIds[8];
-const unsigned long firebaseHeartbeatInterval = 5000;
+const unsigned long firebaseHeartbeatInterval = 15000UL;
+const unsigned long firebaseHeartbeatTimeout = 45000UL;
+const unsigned long firebaseHeartbeatFreshWindow = 60000UL;
 OneWire oneWire1(DS18B20_PIN1);
 DallasTemperature sensors1(&oneWire1);
 
@@ -1843,7 +1846,7 @@ void processQueuedSnapshotUpload(AsyncResult& result) {
 }
 
 void serviceQueuedSnapshotUpload(unsigned long now) {
-  if (!firebaseInitialized || !app.ready() || firebaseHeartbeatPending) return;
+  if (!firebaseInitialized || !app.ready()) return;
   if (snapshotUploadPending) {
     if (now - snapshotUploadStartedAt < SNAPSHOT_UPLOAD_TIMEOUT_MS) return;
     Serial.printf("Snapshot upload timed out identity=%s; retry queued\n",
@@ -2023,7 +2026,8 @@ void handleCombinedStatus() {
   const bool heartbeatKnown = lastFirebaseHeartbeatSuccessAt != 0;
   const unsigned long heartbeatAge = heartbeatKnown
       ? now - lastFirebaseHeartbeatSuccessAt : 0;
-  const bool heartbeatFresh = heartbeatKnown && heartbeatAge <= 10000UL;
+  const bool heartbeatFresh = heartbeatKnown &&
+      heartbeatAge <= firebaseHeartbeatFreshWindow;
   String json = "{";
   json += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"full\":" +
       String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
@@ -2059,7 +2063,8 @@ void handleCombinedStatus() {
 }
 
 void maintainProvisioningHotspot() {
-  if (WiFi.getMode() == WIFI_AP_STA && WiFi.softAPIP() == apIp) return;
+  if (WiFi.getMode() == WIFI_AP_STA && provisioningApRunning &&
+      WiFi.softAPIP() == apIp) return;
 
   const unsigned long now = millis();
   if (lastHotspotAttempt != 0 && now - lastHotspotAttempt < hotspotRetryInterval) return;
@@ -2070,11 +2075,15 @@ void maintainProvisioningHotspot() {
       Serial.println("Failed to enable AP+STA mode; hotspot startup will retry.");
       return;
     }
-    delay(100);
+    Serial.println("Wi-Fi mode restored to AP+STA.");
   }
 
   WiFi.setSleep(false);
-  WiFi.softAPdisconnect(false);
+  if (WiFi.softAPIP() != IPAddress(0, 0, 0, 0) &&
+      WiFi.softAPIP() != apIp) {
+    Serial.println("Setup AP has an unexpected IP; restarting AP service.");
+    WiFi.softAPdisconnect(false);
+  }
   if (!WiFi.softAPConfig(apIp, apGateway, apSubnet)) {
     Serial.println("Failed to configure the ESP32 hotspot IP; startup will retry.");
     return;
@@ -2082,13 +2091,11 @@ void maintainProvisioningHotspot() {
 
   const bool started = WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4);
   if (!started || WiFi.softAPIP() != apIp) {
+    provisioningApRunning = false;
     Serial.println("Failed to start ESP32-HYDRODECK hotspot; startup will retry.");
     return;
   }
-  Serial.print("ESP32 hotspot is broadcasting: ");
-  Serial.print(AP_SSID);
-  Serial.print(" at ");
-  Serial.println(WiFi.softAPIP());
+  provisioningApRunning = true;
 }
 
 // HTTP API Control Handlers
@@ -2195,7 +2202,11 @@ void processFirebaseResult(AsyncResult& firebaseResult) {
 void onMainWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (wifiDiagnosticQueue == nullptr) return;
   WifiDiagnosticEvent diagnostic = {};
-  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+  if (event == ARDUINO_EVENT_WIFI_AP_START) {
+    diagnostic.kind = 4;
+  } else if (event == ARDUINO_EVENT_WIFI_AP_STOP) {
+    diagnostic.kind = 5;
+  } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     diagnostic.kind = 1;
     diagnostic.disconnectReason = info.wifi_sta_disconnected.reason;
   } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
@@ -2250,6 +2261,12 @@ void processMainWifiDiagnostics() {
     } else if (diagnostic.kind == 3) {
       Serial.printf("MAIN Wi-Fi got IP channel=%d RSSI=%d\n",
           WiFi.channel(), WiFi.RSSI());
+    } else if (diagnostic.kind == 4) {
+      provisioningApRunning = true;
+      Serial.printf("ESP32 setup AP started at %s\n", WiFi.softAPIP().toString().c_str());
+    } else if (diagnostic.kind == 5) {
+      provisioningApRunning = false;
+      Serial.println("ESP32 setup AP stopped; recovery will be attempted.");
     }
   }
 }
@@ -2489,27 +2506,28 @@ void loop() {
       lastActiveBatchPoll = now;
       requestActiveBatchNumber();
     }
-    if (firebaseInitialized && app.ready() && !firebaseHeartbeatPending &&
-      !snapshotUploadPending &&
-        now - lastFirebaseHeartbeat >= firebaseHeartbeatInterval) {
-      lastFirebaseHeartbeat = now;
-      firebaseHeartbeatStartedAt = now;
-      firebaseHeartbeatPending = true;
-      Database.set<object_t>(
-        aClient,
-        "/hydrodeck/lastSeen",
-        object_t("{\".sv\":\"timestamp\"}"),
-        processFirebaseHeartbeatResult,
-        "deviceHeartbeat"
-      );
-    }
+  }
+
+  // Keep presence writes independent of sensor changes, command queues, and snapshot uploads.
+  if (firebaseInitialized && app.ready() && !firebaseHeartbeatPending &&
+      now - lastFirebaseHeartbeat >= firebaseHeartbeatInterval) {
+    lastFirebaseHeartbeat = now;
+    firebaseHeartbeatStartedAt = now;
+    firebaseHeartbeatPending = true;
+    Database.set<object_t>(
+      aClient,
+      "/hydrodeck/lastSeen",
+      object_t("{\".sv\":\"timestamp\"}"),
+      processFirebaseHeartbeatResult,
+      "deviceHeartbeat"
+    );
   }
 
   requestIntervalSnapshot();
   serviceQueuedSnapshotUpload(now);
 
   if (firebaseHeartbeatPending &&
-      now - firebaseHeartbeatStartedAt >= firebaseHeartbeatInterval * 3UL) {
+      now - firebaseHeartbeatStartedAt >= firebaseHeartbeatTimeout) {
     firebaseHeartbeatPending = false;
     Serial.println("Firebase heartbeat callback timed out; retrying");
   }
@@ -2629,7 +2647,7 @@ void loop() {
     liveTelemetryJson += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
     liveTelemetryJson += "\"firebaseReady\":" + String(firebaseInitialized && app.ready() ? "true" : "false") + ",";
     const bool firebaseHeartbeatFresh = lastFirebaseHeartbeatSuccessAt != 0 &&
-      now - lastFirebaseHeartbeatSuccessAt <= 10000UL;
+      now - lastFirebaseHeartbeatSuccessAt <= firebaseHeartbeatFreshWindow;
     liveTelemetryJson += "\"firebaseHeartbeatFresh\":" +
       String(firebaseHeartbeatFresh ? "true" : "false");
     liveTelemetryJson += "}";

@@ -5,10 +5,60 @@ import 'package:hydrodeck_test/command_ack_policy.dart';
 import 'package:hydrodeck_test/history_interval.dart';
 import 'package:hydrodeck_test/login_validation.dart';
 import 'package:hydrodeck_test/pump_control_policy.dart';
+import 'package:hydrodeck_test/device_presence_policy.dart';
+import 'package:hydrodeck_test/hotspot_attempt_policy.dart';
 import 'package:hydrodeck_test/wifi_provisioning_policy.dart';
 
 void main() {
   sqfliteFfiInit();
+
+  group('hotspot retry and device presence', () {
+    test('hotspot failures stay friendly and a finished attempt can retry', () {
+      final gate = HotspotAttemptGate();
+      expect(gate.tryBegin(), isTrue);
+      expect(gate.isActive, isTrue);
+      expect(gate.tryBegin(), isFalse);
+      expect(
+        hotspotFailureMessage(HotspotFailureStage.discovery),
+        'Failed to find or connect to the ESP32. Please try again.',
+      );
+      expect(
+        hotspotFailureMessage(HotspotFailureStage.connection),
+        hotspotFailureMessage(HotspotFailureStage.discovery),
+      );
+
+      gate.finish();
+      expect(gate.isActive, isFalse);
+      expect(gate.tryBegin(), isTrue);
+      gate.finish();
+    });
+
+    test('heartbeat grace includes normal delay and rejects stale or missing data', () {
+      final now = DateTime.utc(2026, 11, 4, 8);
+      expect(
+        isDeviceHeartbeatFresh(
+          now.subtract(const Duration(seconds: 55)).millisecondsSinceEpoch,
+          now: now,
+        ),
+        isTrue,
+      );
+      expect(
+        isDeviceHeartbeatFresh(
+          now.subtract(const Duration(seconds: 61)).millisecondsSinceEpoch,
+          now: now,
+        ),
+        isFalse,
+      );
+      expect(isDeviceHeartbeatFresh(null, now: now), isFalse);
+      expect(
+        isDeviceHeartbeatFresh(
+          now.add(const Duration(seconds: 6)).millisecondsSinceEpoch,
+          now: now,
+        ),
+        isFalse,
+      );
+    });
+  });
 
   group('Manila history intervals', () {
     test('uses fixed half-hour keys and UTC instants', () {
