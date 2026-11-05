@@ -26,6 +26,7 @@ import 'wifi_provisioning_policy.dart';
 import 'hotspot_attempt_policy.dart';
 import 'device_presence_policy.dart';
 import 'critical_ph_policy.dart';
+import 'planting_navigation.dart';
 
 bool get _supportsBackgroundService =>
     !kIsWeb &&
@@ -3243,9 +3244,6 @@ class ActivePlantingSession {
   });
 }
 
-bool shouldShowStartPlantingScreen(ActivePlantingSession? activeSession) =>
-    activeSession == null;
-
 class CloudHistory {
   final List<PlantingRecord> runs;
   final List<HistoricalData> logs;
@@ -4442,9 +4440,9 @@ class MainGatekeeper extends StatefulWidget {
 class _MainGatekeeperState extends State<MainGatekeeper> {
   bool _isLoading = true;
 
-  bool _isPlantingActive = false;
-  DateTime? _plantingStartDate;
-  int? _activeBatchNumber;
+  final PlantingNavigationState _plantingNavigation =
+      PlantingNavigationState();
+  ActivePlantingSession? _activePlantingSession;
   List<PlantingRecord> _pastPlantingRuns = [];
 
   String _activeEsp32Ip = "hydrodeck.local";
@@ -4522,9 +4520,7 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
         _pastPlantingRuns = pastRuns
           ..sort((a, b) => a.batchNumber.compareTo(b.batchNumber));
         _activeEsp32Ip = savedIp;
-        _plantingStartDate = activeSession?.startDate;
-        _activeBatchNumber = activeSession?.batchNumber;
-        _isPlantingActive = activeSession != null;
+        _activePlantingSession = activeSession;
         _isLoading = false;
       });
     }
@@ -4577,12 +4573,12 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
           await DatabaseHelper.instance.saveActiveSession(start, batch);
           unawaited(publishActiveBatchNumber(batch));
           if (!mounted) return;
-          final isNewSession =
-              !_isPlantingActive || _activeBatchNumber != batch;
+          final isNewSession = _activePlantingSession?.batchNumber != batch;
           setState(() {
-            _isPlantingActive = true;
-            _plantingStartDate = start;
-            _activeBatchNumber = batch;
+            _activePlantingSession = ActivePlantingSession(
+              batchNumber: batch,
+              startDate: start,
+            );
           });
           if (isNewSession && _supportsBackgroundService) {
             await initializeBackgroundService();
@@ -4593,8 +4589,8 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
           return;
         }
 
+        final end = _parseFirebaseTimestamp(data['endedAt']);
         if (batch != null && start != null) {
-          final end = _parseFirebaseTimestamp(data['endedAt']);
           if (end != null) {
             final record = PlantingRecord(
               batchNumber: batch,
@@ -4612,13 +4608,12 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
           }
         }
 
-        if (batch == _activeBatchNumber) {
+        if (batch == _activePlantingSession?.batchNumber && end != null) {
           await DatabaseHelper.instance.clearActiveSession();
           if (!mounted) return;
           setState(() {
-            _isPlantingActive = false;
-            _plantingStartDate = null;
-            _activeBatchNumber = null;
+            _activePlantingSession = null;
+            _plantingNavigation.showStartContinue();
           });
           if (_supportsBackgroundService) {
             FlutterBackgroundService().invoke('setPlantingState', {
@@ -4652,30 +4647,25 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     }
 
     setState(() {
-      _plantingStartDate = activeSession.startDate;
-      _activeBatchNumber = activeSession.batchNumber;
-      _isPlantingActive = true;
+      _activePlantingSession = activeSession;
+      _plantingNavigation.showDashboard();
     });
   }
 
   void _endPlanting() async {
-    if (_plantingStartDate == null) return;
+    final activeSession = _activePlantingSession;
+    if (activeSession == null) return;
 
     final now = await getServerNow();
-    int totalDays = (now.difference(_plantingStartDate!).inDays + 1).clamp(
+    int totalDays = (now.difference(activeSession.startDate).inDays + 1).clamp(
       1,
       999999,
     );
 
-    final batchNumber =
-        _activeBatchNumber ??
-        await DatabaseHelper.instance.getActiveBatchNumber() ??
-        (_pastPlantingRuns.isEmpty
-            ? 1
-            : _pastPlantingRuns.last.batchNumber + 1);
+    final batchNumber = activeSession.batchNumber;
     final newRecord = PlantingRecord(
       batchNumber: batchNumber,
-      startDate: _plantingStartDate!,
+      startDate: activeSession.startDate,
       endDate: now,
       totalDays: totalDays,
     );
@@ -4700,9 +4690,8 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
 
     setState(() {
       _pastPlantingRuns.add(newRecord);
-      _isPlantingActive = false;
-      _plantingStartDate = null;
-      _activeBatchNumber = null;
+      _activePlantingSession = null;
+      _plantingNavigation.showStartContinue();
     });
   }
 
@@ -4716,16 +4705,8 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
       );
     }
 
-    final activeSession =
-        _isPlantingActive &&
-            _plantingStartDate != null &&
-            _activeBatchNumber != null
-        ? ActivePlantingSession(
-            batchNumber: _activeBatchNumber!,
-            startDate: _plantingStartDate!,
-          )
-        : null;
-    if (shouldShowStartPlantingScreen(activeSession)) {
+    final activeSession = _activePlantingSession;
+    if (_plantingNavigation.page == PlantingNavigationPage.startContinue) {
       return StartPlantingScreen(
         onStart: _startPlanting,
         onContinue: _startPlanting,
