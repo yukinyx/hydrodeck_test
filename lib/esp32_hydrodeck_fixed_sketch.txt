@@ -212,6 +212,10 @@ unsigned long restartAt = 0;
 bool provisioningPending = false;
 String provisioningStatus = "idle";
 uint16_t provisioningDisconnectReason = 0;
+String provisioningRequestId;
+bool provisioningScanPending = false;
+bool provisioningScanStarted = false;
+bool provisioningNetworkFound = false;
 const char* remoteActuatorNames[] = {
   "waterPump1", "phUp1", "phDown1", "nutrient1",
   "waterPump2", "phUp2", "phDown2", "nutrient2", "growLight"
@@ -2131,9 +2135,29 @@ void handleRootIdent() {
 }
 
 void handleProvision() {
-  if (!server.hasArg("ssid") || !server.hasArg("password")) {
+  const String requestId = server.arg("requestId");
+  if (requestId.isEmpty()) {
     server.send(400, "application/json",
-        "{\"status\":\"missing_credentials\",\"reason\":0}");
+        "{\"status\":\"invalid_request\",\"reason\":0}");
+    return;
+  }
+  if (requestId == provisioningRequestId) {
+    String response = "{\"status\":\"" + provisioningStatus +
+        "\",\"reason\":" + String(provisioningDisconnectReason) +
+        ",\"requestId\":\"" + provisioningRequestId + "\"}";
+    server.send(202, "application/json", response);
+    return;
+  }
+  if (provisioningPending) {
+    String response = "{\"status\":\"busy\",\"reason\":0,\"requestId\":\"" +
+        requestId + "\"}";
+    server.send(409, "application/json", response);
+    return;
+  }
+  if (!server.hasArg("ssid") || !server.hasArg("password")) {
+    String response = "{\"status\":\"missing_credentials\",\"reason\":0,\"requestId\":\"" +
+        requestId + "\"}";
+    server.send(400, "application/json", response);
     return;
   }
   String newSsid = server.arg("ssid");
@@ -2141,26 +2165,39 @@ void handleProvision() {
   newSsid.trim();
   newPassword.trim();
   if (newSsid.isEmpty() || newSsid.length() >= sizeof(ssid) || newPassword.length() >= sizeof(password)) {
-    server.send(400, "application/json",
-        "{\"status\":\"invalid_credentials\",\"reason\":0}");
+    String response = "{\"status\":\"invalid_credentials\",\"reason\":0,\"requestId\":\"" +
+        requestId + "\"}";
+    server.send(400, "application/json", response);
     return;
   }
   newSsid.toCharArray(ssid, sizeof(ssid));
   newPassword.toCharArray(password, sizeof(password));
   wifiPreferences.putString("ssid", ssid);
   wifiPreferences.putString("password", password);
+  provisioningRequestId = requestId;
   provisioningPending = true;
+  provisioningScanPending = true;
+  provisioningScanStarted = false;
+  provisioningNetworkFound = false;
   wifiConnectInProgress = false;
   firebaseInitialized = false;
-  provisioningStatus = "testing";
+  provisioningStatus = "received";
   provisioningDisconnectReason = 0;
-  server.send(200, "application/json",
-      "{\"status\":\"testing\",\"reason\":0}");
+  String response = "{\"status\":\"received\",\"reason\":0,\"requestId\":\"" +
+      provisioningRequestId + "\"}";
+  server.send(202, "application/json", response);
 }
 
 void handleProvisionStatus() {
+  if (!server.hasArg("requestId") ||
+      server.arg("requestId") != provisioningRequestId) {
+    server.send(404, "application/json",
+        "{\"status\":\"unknown_request\",\"reason\":0}");
+    return;
+  }
   String json = "{\"status\":\"" + provisioningStatus +
-      "\",\"reason\":" + String(provisioningDisconnectReason) + "}";
+      "\",\"reason\":" + String(provisioningDisconnectReason) +
+      ",\"requestId\":\"" + provisioningRequestId + "\"}";
   server.send(200, "application/json", json);
 }
 
@@ -2415,17 +2452,19 @@ void processMainWifiDiagnostics() {
         lastFirebaseTelemetryJson = "";
       if (provisioningPending && wifiConnectInProgress) {
         provisioningDisconnectReason = diagnostic.disconnectReason;
-        // ESP-IDF reason codes 201-205 distinguish missing AP, auth, and association failures.
+        // Only a definitive auth-fail reason maps to the password-specific result.
         switch (diagnostic.disconnectReason) {
           case 201:  // WIFI_REASON_NO_AP_FOUND
-            provisioningStatus = "network_unavailable";
+            provisioningStatus = provisioningNetworkFound
+                ? "connection_failed"
+                : "network_unavailable";
             break;
-          case 15:   // WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT
-          case 202: // WIFI_REASON_AUTH_FAIL
-          case 204: // WIFI_REASON_HANDSHAKE_TIMEOUT
+          case 202:  // WIFI_REASON_AUTH_FAIL
             provisioningStatus = "authentication_failed";
             break;
+          case 15:   // WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT
           case 203: // WIFI_REASON_ASSOC_FAIL
+          case 204: // WIFI_REASON_HANDSHAKE_TIMEOUT
           case 205: // WIFI_REASON_CONNECTION_FAIL
             provisioningStatus = "connection_failed";
             break;
@@ -2618,7 +2657,7 @@ void setup() {
   Serial.println("Connecting to home Wi-Fi in the background; hotspot remains available.");
 
   server.on("/", HTTP_GET, handleRootIdent);
-  server.on("/provision", HTTP_GET, handleProvision);
+  server.on("/provision", HTTP_POST, handleProvision);
   server.on("/provision/status", HTTP_GET, handleProvisionStatus);
   server.on("/settings", HTTP_GET, handleSettings);
   server.on("/status", HTTP_GET, handleCombinedStatus);
@@ -2645,12 +2684,57 @@ void loop() {
 
   // Apply replacement Wi-Fi credentials without disabling the setup AP.
   if (provisioningPending) {
-    if (!wifiConnectInProgress) {
+    if (provisioningScanPending) {
+      if (!provisioningScanStarted) {
+        provisioningStatus = "scanning";
+        const int scanStartResult = WiFi.scanNetworks(true, true);
+        if (scanStartResult == WIFI_SCAN_FAILED) {
+          Serial.println("Provisioning Wi-Fi scan could not start; attempting connection.");
+          provisioningNetworkFound = true;
+          provisioningScanPending = false;
+          provisioningStatus = "testing";
+        } else {
+          provisioningScanStarted = true;
+        }
+      } else {
+        const int scanResult = WiFi.scanComplete();
+        if (scanResult == WIFI_SCAN_RUNNING) {
+          provisioningStatus = "scanning";
+        } else {
+          if (scanResult >= 0) {
+            for (int networkIndex = 0; networkIndex < scanResult; networkIndex++) {
+              if (WiFi.SSID(networkIndex) == String(ssid)) {
+                provisioningNetworkFound = true;
+                break;
+              }
+            }
+            WiFi.scanDelete();
+            if (!provisioningNetworkFound) {
+              provisioningStatus = "network_unavailable";
+              provisioningPending = false;
+              provisioningScanPending = false;
+              provisioningScanStarted = false;
+              provisioningDisconnectReason = 201;
+              Serial.println("Provisioned Wi-Fi SSID was not found in scan results.");
+            }
+          } else {
+            Serial.printf("Provisioning Wi-Fi scan unavailable result=%d; attempting connection.\n",
+                scanResult);
+            provisioningNetworkFound = true;
+          }
+          if (provisioningPending) {
+            provisioningScanPending = false;
+            provisioningScanStarted = false;
+            provisioningStatus = "testing";
+          }
+        }
+      }
+    } else if (!wifiConnectInProgress) {
       WiFi.disconnect(false, false);
       WiFi.begin(ssid, password);
       wifiConnectInProgress = true;
       wifiConnectStarted = now;
-      Serial.println("Trying the newly provisioned Wi-Fi network...");
+      Serial.println("Trying the newly provisioned Wi-Fi network; setup AP remains available.");
     } else if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == String(ssid)) {
       provisioningPending = false;
       wifiConnectInProgress = false;

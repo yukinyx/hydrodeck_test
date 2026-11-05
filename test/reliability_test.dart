@@ -469,19 +469,45 @@ void main() {
     });
 
     test('maps Wi-Fi provisioning results to accurate messages', () {
+      expect(isWifiProvisioningPending('received'), isTrue);
+      expect(isWifiProvisioningPending('scanning'), isTrue);
       expect(isWifiProvisioningPending('testing'), isTrue);
       expect(isWifiProvisioningPending('connected'), isFalse);
+      expect(isWifiProvisioningAccepted('received'), isTrue);
+      expect(isWifiProvisioningFinal('testing'), isFalse);
+      expect(isWifiProvisioningFinal('connected'), isTrue);
+      expect(isWifiProvisioningFinal('network_unavailable'), isTrue);
+      expect(isWifiProvisioningFinal('authentication_failed'), isTrue);
       expect(wifiProvisioningMessage('connected'), contains('successfully'));
       expect(
-        wifiProvisioningMessage('authentication_failed'),
-        contains('check the Wi-Fi password'),
+        wifiProvisioningMessage('network_unavailable'),
+        contains('The ESP32 could not find that Wi-Fi network'),
       );
       expect(
-        wifiProvisioningMessage('network_unavailable'),
-        contains('Could not find'),
+        wifiProvisioningMessage('authentication_failed'),
+        contains('Check the Wi-Fi password'),
       );
-      expect(wifiProvisioningMessage('connection_failed'), contains('found'));
-      expect(wifiProvisioningMessage('timeout'), contains('timed out'));
+      expect(
+        wifiProvisioningMessage('connection_failed'),
+        'The ESP32 could not connect to Wi-Fi. Please check the network details and try again.',
+      );
+    });
+
+    test('completion cleanup provides platform fallback only when needed', () {
+      expect(
+        completedProvisioningMessage(
+          result: 'connected',
+          disconnectedFromHotspot: true,
+        ),
+        'Connected to Wi-Fi successfully.',
+      );
+      expect(
+        completedProvisioningMessage(
+          result: 'authentication_failed',
+          disconnectedFromHotspot: false,
+        ),
+        contains('Switch your phone to the home Wi-Fi network manually.'),
+      );
     });
 
     test('names command targets and distinguishes command failure outcomes', () {

@@ -4,6 +4,30 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:hydrodeck_test/main.dart';
 
 void main() {
+  testWidgets('HydroDeck logo PNG renders within its square bounds', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Center(
+          child: SizedBox(
+            width: 112,
+            height: 112,
+            child: Image.asset(
+              'hydrodeck_logo.png',
+              fit: BoxFit.contain,
+              semanticLabel: 'HydroDeck logo',
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byType(Image), findsOneWidget);
+    expect(tester.getSize(find.byType(Image)), const Size(112, 112));
+  });
+
   test('active persisted session skips the Start Planting route', () {
     expect(
       shouldShowStartPlantingScreen(
@@ -49,43 +73,53 @@ void main() {
     expect(local.growLightOn, isTrue);
   });
 
-  test('temperature status uses live validity and the strict hot threshold', () {
-    expect(
-      temperatureStatusLabel(temperature: 28, valid: true, fresh: true),
-      'Normal',
-    );
-    expect(
-      temperatureStatusLabel(temperature: 28.1, valid: true, fresh: true),
-      'Too hot',
-    );
-    expect(
-      temperatureStatusLabel(temperature: 24, valid: true, fresh: false),
-      'Unavailable',
-    );
-    expect(
-      temperatureStatusLabel(temperature: double.nan, valid: true, fresh: true),
-      'Unavailable',
-    );
-    expect(
-      GrowBedReading.fromMap({'temp': 'invalid'}).temperatureValid,
-      isFalse,
-    );
-    expect(
-      GrowBedReading.fromMap({
-        'temp': 24,
-        'tempValid': false,
-      }).temperatureValid,
-      isFalse,
-    );
-  });
+  test(
+    'temperature status uses live validity and the strict hot threshold',
+    () {
+      expect(
+        temperatureStatusLabel(temperature: 28, valid: true, fresh: true),
+        'Normal',
+      );
+      expect(
+        temperatureStatusLabel(temperature: 28.1, valid: true, fresh: true),
+        'Too hot',
+      );
+      expect(
+        temperatureStatusLabel(temperature: 24, valid: true, fresh: false),
+        'Unavailable',
+      );
+      expect(
+        temperatureStatusLabel(
+          temperature: double.nan,
+          valid: true,
+          fresh: true,
+        ),
+        'Unavailable',
+      );
+      expect(
+        GrowBedReading.fromMap({'temp': 'invalid'}).temperatureValid,
+        isFalse,
+      );
+      expect(
+        GrowBedReading.fromMap({
+          'temp': 24,
+          'tempValid': false,
+        }).temperatureValid,
+        isFalse,
+      );
+    },
+  );
 
-  test('pH threshold settings reject non-finite, out-of-range, and crossed pairs', () {
-    expect(isValidPhThresholds(5.5, 7.0), isTrue);
-    expect(isValidPhThresholds(double.nan, 7), isFalse);
-    expect(isValidPhThresholds(3.9, 7), isFalse);
-    expect(isValidPhThresholds(5.5, 9.1), isFalse);
-    expect(isValidPhThresholds(7, 7), isFalse);
-  });
+  test(
+    'pH threshold settings reject non-finite, out-of-range, and crossed pairs',
+    () {
+      expect(isValidPhThresholds(5.5, 7.0), isTrue);
+      expect(isValidPhThresholds(double.nan, 7), isFalse);
+      expect(isValidPhThresholds(3.9, 7), isFalse);
+      expect(isValidPhThresholds(5.5, 9.1), isFalse);
+      expect(isValidPhThresholds(7, 7), isFalse);
+    },
+  );
 
   test('local flat status parses actuator values and wins while fresh', () {
     final local = HydrodeckTelemetry.fromJson({
@@ -101,14 +135,8 @@ void main() {
     expect(local.actuatorStates['phUp1'], isTrue);
     expect(local.actuatorStates['nutrient2'], isFalse);
     expect(local.growLightOn, isTrue);
-    expect(
-      shouldApplyFirebaseDeviceState(localTelemetryFresh: true),
-      isFalse,
-    );
-    expect(
-      shouldApplyFirebaseDeviceState(localTelemetryFresh: false),
-      isTrue,
-    );
+    expect(shouldApplyFirebaseDeviceState(localTelemetryFresh: true), isFalse);
+    expect(shouldApplyFirebaseDeviceState(localTelemetryFresh: false), isTrue);
     expect(
       shouldShowWifiSetupPrompt(
         localDeviceReachable: true,
@@ -256,11 +284,7 @@ void main() {
     'telemetry shares reservoir data across both beds and accepts legacy data',
     () {
       final current = HydrodeckTelemetry.fromJson({
-        'reservoir': {
-          'level': 'full',
-          'full': true,
-          'online': true,
-        },
+        'reservoir': {'level': 'full', 'full': true, 'online': true},
       });
       expect(current.reservoir.level, 'full');
       expect(current.reservoir.online, isTrue);

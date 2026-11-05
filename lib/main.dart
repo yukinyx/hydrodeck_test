@@ -4888,9 +4888,14 @@ class StartPlantingScreen extends StatelessWidget {
                       ),
                     ],
                   ),
-                  child: const Center(
-                    // Replace this Text with Image.asset(...) or any icon you prefer.
-                    child: Text('🥬', style: TextStyle(fontSize: 70)),
+                  child: Center(
+                    child: Image.asset(
+                      'hydrodeck_logo.png',
+                      width: 112,
+                      height: 112,
+                      fit: BoxFit.contain,
+                      semanticLabel: 'HydroDeck logo',
+                    ),
                   ),
                 ),
                 const SizedBox(height: 24),
@@ -5004,6 +5009,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   _firebaseCommandsSub; // Subscription for command status updates
   Timer? _connectionTimer;
   bool _wifiPromptShown = false;
+  bool _wifiProvisioningCompleted = false;
   bool _isRefreshingConnectivity = false;
   bool _connectivityProbeInProgress = false;
   bool _historyReconcileInFlight = false;
@@ -5069,6 +5075,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         } else {
           _offlineSince ??= DateTime.now();
           if (!_wifiPromptShown &&
+              !_wifiProvisioningCompleted &&
               shouldShowWifiSetupPrompt(
                 localDeviceReachable: _hasFreshLocalTelemetry,
                 cloudReachable: _hasFreshFirebaseTelemetry,
@@ -6532,7 +6539,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   void _showWifiSetupDialog() {
-    if (_wifiPromptShown || !mounted || _currentIndex != 0) return;
+    if (_wifiPromptShown ||
+        _wifiProvisioningCompleted ||
+        !mounted ||
+        _currentIndex != 0) {
+      return;
+    }
     _wifiPromptShown = true;
     showDialog(
       context: context,
@@ -6696,10 +6708,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     }
 
     if (!_hotspotAttemptGate.tryBegin()) return;
-    setState(() {
-      _hotspotStatus = 'Connecting to $hotspotSsid...';
-    });
+    setState(
+      () => _hotspotStatus =
+          'Connecting to the ESP32 and sending Wi-Fi details...',
+    );
     var failureStage = HotspotFailureStage.connection;
+    final requestId = DateTime.now().microsecondsSinceEpoch.toString();
+    var credentialsAccepted = false;
     try {
       final connected = await WiFiForIoTPlugin.connect(
         hotspotSsid,
@@ -6711,63 +6726,129 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       await WiFiForIoTPlugin.forceWifiUsage(
         true,
       ).timeout(const Duration(seconds: 5));
-      final response = await http
-          .get(
-            Uri.parse(
-              'http://192.168.4.1/provision?ssid=${Uri.encodeQueryComponent(ssid)}&password=${Uri.encodeQueryComponent(password)}',
-            ),
-          )
-          .timeout(const Duration(seconds: 10));
       failureStage = HotspotFailureStage.response;
-      var statusCode = _readProvisioningCode(response.body);
-      if (response.statusCode != 200 &&
-          statusCode != 'missing_credentials' &&
-          statusCode != 'invalid_credentials') {
-        throw Exception(wifiProvisioningMessage(statusCode));
+      Map<String, dynamic> responseData;
+      int responseStatus;
+      try {
+        final response = await http
+            .post(
+              Uri.parse('http://192.168.4.1/provision'),
+              headers: const {'Connection': 'close'},
+              body: {
+                'ssid': ssid,
+                'password': password,
+                'requestId': requestId,
+              },
+            )
+            .timeout(const Duration(seconds: 10));
+        responseData = _readProvisioningResponse(response.body);
+        responseStatus = response.statusCode;
+      } catch (_) {
+        // Recover if the ESP32 accepted the request but its POST response was lost.
+        final recoveredResponse = await http
+            .get(
+              Uri.https('192.168.4.1', '/provision/status', {
+                'requestId': requestId,
+              }),
+              headers: const {'Connection': 'close'},
+            )
+            .timeout(const Duration(seconds: 5));
+        responseData = _readProvisioningResponse(recoveredResponse.body);
+        responseStatus = recoveredResponse.statusCode == 200 ? 202 : 500;
+      }
+      var statusCode = responseData['status'] as String?;
+      if (statusCode == 'busy' && responseData['requestId'] == requestId) {
+        if (mounted) {
+          setState(() => _hotspotStatus = wifiProvisioningMessage(statusCode));
+        }
+        return;
+      }
+      if (responseData['requestId'] != requestId ||
+          !isWifiProvisioningAccepted(statusCode)) {
+        throw StateError('ESP32 did not confirm credential receipt');
+      }
+      if (responseStatus != 200 &&
+          responseStatus != 202 &&
+          !(responseStatus == 400 &&
+              (statusCode == 'missing_credentials' ||
+                  statusCode == 'invalid_credentials'))) {
+        throw StateError('ESP32 did not accept the provisioning request');
       }
 
-      // Keep using the setup hotspot while the ESP32 tests credentials and reports
-      // the most specific disconnect reason its Wi-Fi driver can identify.
+      // Start the connection-result timeout only after receipt is acknowledged.
+      credentialsAccepted = true;
+      if (mounted) {
+        setState(() => _hotspotStatus = wifiProvisioningMessage(statusCode));
+      }
       final timer = Stopwatch()..start();
+      var consecutivePollFailures = 0;
       while (isWifiProvisioningPending(statusCode) &&
-          timer.elapsed < const Duration(seconds: 35)) {
+          timer.elapsed < const Duration(seconds: 40)) {
         if (mounted) {
           setState(() => _hotspotStatus = wifiProvisioningMessage(statusCode));
         }
         await Future<void>.delayed(const Duration(seconds: 1));
-        final statusResponse = await http
-            .get(
-              Uri.parse('http://192.168.4.1/provision/status'),
-              headers: {'Connection': 'close'},
-            )
-            .timeout(const Duration(seconds: 3));
-        if (statusResponse.statusCode != 200) {
-          throw Exception('Could not read the ESP32 Wi-Fi status.');
+        try {
+          final statusResponse = await http
+              .get(
+                Uri.https('192.168.4.1', '/provision/status', {
+                  'requestId': requestId,
+                }),
+                headers: const {'Connection': 'close'},
+              )
+              .timeout(const Duration(seconds: 4));
+          responseData = _readProvisioningResponse(statusResponse.body);
+          if (statusResponse.statusCode != 200 ||
+              responseData['requestId'] != requestId) {
+            consecutivePollFailures++;
+            continue;
+          }
+          statusCode = responseData['status'] as String?;
+          consecutivePollFailures = 0;
+        } catch (_) {
+          consecutivePollFailures++;
+          if (consecutivePollFailures >= 4) break;
         }
-        statusCode = _readProvisioningCode(statusResponse.body);
       }
-      if (isWifiProvisioningPending(statusCode)) statusCode = 'timeout';
 
-      final resultMessage = wifiProvisioningMessage(statusCode);
-      if (mounted) setState(() => _hotspotStatus = resultMessage);
-      await WiFiForIoTPlugin.forceWifiUsage(false);
-      await WiFiForIoTPlugin.disconnect();
-      try {
-        await WiFiForIoTPlugin.removeWifiNetwork(hotspotSsid);
-      } catch (_) {
-        // Android/iOS may restrict programmatic removal; disconnect still succeeds.
+      if (isWifiProvisioningFinal(statusCode)) {
+        _wifiProvisioningCompleted = true;
+        _wifiPromptShown = true;
+        var disconnected = false;
+        try {
+          await WiFiForIoTPlugin.forceWifiUsage(false);
+          disconnected = await WiFiForIoTPlugin.disconnect()
+              .timeout(const Duration(seconds: 5));
+        } catch (_) {
+          disconnected = false;
+        }
+        if (mounted) {
+          setState(
+            () => _hotspotStatus = completedProvisioningMessage(
+              result: statusCode!,
+              disconnectedFromHotspot: disconnected,
+            ),
+          );
+        }
+      } else {
+        if (mounted) {
+          setState(
+            () => _hotspotStatus =
+                'The ESP32 received your Wi-Fi details, but the result could not be confirmed. '
+                'You can retry or check the ESP32 status.',
+          );
+        }
       }
-      if (mounted && statusCode == 'connected') {
+    } catch (_) {
+      if (mounted) {
         setState(
-          () => _hotspotStatus =
-              '$resultMessage Reconnect this phone to your home Wi-Fi.',
+          () => _hotspotStatus = credentialsAccepted
+              ? 'The ESP32 received your Wi-Fi details, but the result could not be confirmed. Retry or check status.'
+              : hotspotFailureMessage(failureStage),
         );
       }
-    } catch (error) {
-      if (mounted) {
-        setState(() => _hotspotStatus = hotspotFailureMessage(failureStage));
-      }
     } finally {
+      _wifiPromptShown = true;
       try {
         await WiFiForIoTPlugin.forceWifiUsage(false);
       } catch (_) {}
@@ -6776,10 +6857,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     }
   }
 
-  String _readProvisioningCode(String responseBody) {
+  Map<String, dynamic> _readProvisioningResponse(String responseBody) {
     final response = Map<String, dynamic>.from(jsonDecode(responseBody) as Map);
     final status = response['status'];
     const knownStatuses = {
+      'received',
+      'scanning',
       'testing',
       'connected',
       'network_unavailable',
@@ -6788,11 +6871,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       'timeout',
       'missing_credentials',
       'invalid_credentials',
+      'busy',
+      'unknown_request',
+      'invalid_request',
     };
     if (status is! String || !knownStatuses.contains(status)) {
       throw const FormatException('Malformed ESP32 provisioning response');
     }
-    return status;
+    return response;
   }
 
   Future<void> _publishPhThresholds() async {
@@ -7825,10 +7911,19 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                     onPressed: _isHotspotConnecting
                         ? null
                         : _connectAndProvisionWifi,
-                    icon: const Icon(Icons.wifi_find),
+                    icon: _isHotspotConnecting
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.wifi_find),
                     label: Text(
                       _isHotspotConnecting
-                          ? 'Connecting...'
+                          ? 'Sending...'
                           : 'Send Wi-Fi to ESP32',
                     ),
                     style: ElevatedButton.styleFrom(
