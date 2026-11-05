@@ -362,7 +362,7 @@ void main() {
     await tester.tap(find.text('DATA'));
     await tester.pumpAndSettle();
     expect(
-      find.text('Saved ESP32 snapshots (every 30 minutes, Manila time):'),
+      find.text('Saved ESP32 snapshots (every 20 minutes, Manila time):'),
       findsOneWidget,
     );
 

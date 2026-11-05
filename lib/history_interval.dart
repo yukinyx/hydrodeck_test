@@ -1,14 +1,14 @@
 import 'package:timezone/data/latest.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 
-/// Scheduled planting-session snapshots use fixed 30-minute clock boundaries
+/// Scheduled planting-session snapshots use fixed 20-minute clock boundaries
 /// in the IANA zone `Asia/Manila`.
 ///
 /// A scheduled record is labeled with the **interval start** (for example
-/// 10:00 or 10:30 PHT). Sensor fields are the readings captured at or near
+/// 10:00, 10:20, or 10:40 PHT). Sensor fields are the readings captured at or near
 /// that boundary from the authoritative source (ESP32 when available).
 /// Missed intervals are skipped; they are never backfilled with later values.
-const Duration historySnapshotInterval = Duration(minutes: 30);
+const Duration historySnapshotInterval = Duration(minutes: 20);
 const String manilaTimeZoneName = 'Asia/Manila';
 const String scheduledSnapshotRecordType = 'scheduled';
 const String eventSnapshotRecordType = 'event';
@@ -33,7 +33,7 @@ tz.TZDateTime manilaDateTime(DateTime timestamp) {
 
 DateTime _intervalStartManila(DateTime timestamp) {
   final manila = manilaDateTime(timestamp);
-  final slotMinute = manila.minute < 30 ? 0 : 30;
+  final slotMinute = manila.minute ~/ 20 * 20;
   return tz.TZDateTime(
     manilaLocation(),
     manila.year,
@@ -44,7 +44,30 @@ DateTime _intervalStartManila(DateTime timestamp) {
   );
 }
 
-/// UTC instant of the Manila half-hour interval that contains [timestamp].
+/// Keep legacy 30-minute identities stable when importing older history.
+DateTime _legacyHalfHourStartManila(DateTime timestamp) {
+  final manila = manilaDateTime(timestamp);
+  return tz.TZDateTime(
+    manilaLocation(),
+    manila.year,
+    manila.month,
+    manila.day,
+    manila.hour,
+    manila.minute < 30 ? 0 : 30,
+  );
+}
+
+DateTime legacyManilaHalfHourStartUtc(DateTime timestamp) =>
+    _legacyHalfHourStartManila(timestamp).toUtc();
+
+String legacyManilaHalfHourIntervalKey(DateTime timestamp) {
+  final start = _legacyHalfHourStartManila(timestamp);
+  String two(int value) => value.toString().padLeft(2, '0');
+  return '${start.year}${two(start.month)}${two(start.day)}_'
+      '${two(start.hour)}${two(start.minute)}';
+}
+
+/// UTC instant of the Manila 20-minute interval that contains [timestamp].
 DateTime manilaIntervalStartUtc(DateTime timestamp) {
   return _intervalStartManila(timestamp).toUtc();
 }
@@ -62,7 +85,7 @@ DateTime? utcFromManilaIntervalKey(String intervalKey) {
   return tz.TZDateTime(manilaLocation(), year, month, day, hour, minute).toUtc();
 }
 
-/// Stable Manila interval key, e.g. `20261017_1030`.
+/// Stable Manila interval key, e.g. `20261017_1020`.
 String manilaIntervalKey(DateTime timestamp) {
   final start = _intervalStartManila(timestamp);
   String two(int value) => value.toString().padLeft(2, '0');
@@ -70,7 +93,7 @@ String manilaIntervalKey(DateTime timestamp) {
       '${two(start.hour)}${two(start.minute)}';
 }
 
-/// Next exclusive Manila half-hour boundary after [timestamp], as UTC.
+/// Next exclusive Manila 20-minute boundary after [timestamp], as UTC.
 DateTime nextManilaIntervalUtc(DateTime timestamp) {
   final start = _intervalStartManila(timestamp);
   final next = start.add(historySnapshotInterval);

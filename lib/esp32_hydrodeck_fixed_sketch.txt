@@ -248,6 +248,10 @@ String pendingSnapshotUploadPayload;
 int pendingSnapshotUploadSlot = -1;
 uint32_t snapshotUploadSequence = 0;
 bool snapshotUploadPending = false;
+bool snapshotSavePending = false;
+bool snapshotCleanupPending = false;
+String snapshotSavePendingIdentity;
+String snapshotCleanupPendingIdentity;
 unsigned long snapshotUploadStartedAt = 0;
 unsigned long lastSnapshotUploadAttemptAt = 0;
 const uint8_t SNAPSHOT_QUEUE_LIMIT = 4;
@@ -256,6 +260,25 @@ const char* SNAPSHOT_QUEUE_KEYS[SNAPSHOT_QUEUE_LIMIT] = {
 };
 const unsigned long SNAPSHOT_UPLOAD_TIMEOUT_MS = 15000UL;
 const unsigned long SNAPSHOT_UPLOAD_RETRY_MS = 30000UL;
+const unsigned long SNAPSHOT_STORAGE_RETRY_MS = 5000UL;
+const unsigned long SNAPSHOT_UNAVAILABLE_LOG_INTERVAL_MS = 60000UL;
+unsigned long lastSnapshotUnavailableLogAt = 0;
+unsigned long lastSnapshotStorageRetryAt = 0;
+const uint8_t SNAPSHOT_STORAGE_ENQUEUE = 1;
+const uint8_t SNAPSHOT_STORAGE_REMOVE = 2;
+struct SnapshotStorageRequest {
+  uint8_t operation;
+  int8_t slot;
+  char identity[48];
+  char payload[768];
+};
+struct SnapshotStorageResult {
+  uint8_t operation;
+  bool success;
+  char identity[48];
+};
+QueueHandle_t snapshotStorageQueue = nullptr;
+QueueHandle_t snapshotStorageResultQueue = nullptr;
 String activeCommandIds[8];
 const unsigned long firebaseHeartbeatInterval = 15000UL;
 const unsigned long firebaseHeartbeatTimeout = 45000UL;
@@ -1727,7 +1750,7 @@ void requestActiveBatchNumber() {
 
 String currentManilaIntervalKey(const struct tm& localTime) {
   char key[16];
-  const int slotMinute = localTime.tm_min < 30 ? 0 : 30;
+  const int slotMinute = (localTime.tm_min / 20) * 20;
   snprintf(
     key,
     sizeof(key),
@@ -1796,13 +1819,85 @@ bool enqueueIntervalSnapshot(const String& identity, const String& snapshotJson)
     const char* key = snapshotQueueKey(slot);
     if (commandPreferences.getString(key, "").length() > 0) continue;
     if (commandPreferences.putString(key, snapshotJson) == 0) return false;
-    lastIntervalSnapshotIdentity = identity;
     commandPreferences.putString("snapLast", identity);
     rememberSnapshotIdentity(identity);
     return true;
   }
-  Serial.println("Snapshot queue full; newest scheduled snapshot dropped");
+  Serial.println("Snapshot queue full; scheduled snapshot remains eligible for retry");
   return false;
+}
+
+bool removeQueuedSnapshot(int slot, const String& identity, const String& payload) {
+  if (slot < 0 || slot >= SNAPSHOT_QUEUE_LIMIT) return false;
+  const char* key = snapshotQueueKey(slot);
+  const String queuedPayload = commandPreferences.getString(key, "");
+  if (queuedPayload.length() == 0) return true;
+  if (queuedPayload != payload ||
+      snapshotIdentityFromJson(queuedPayload) != identity) return false;
+  return commandPreferences.remove(key) ||
+      commandPreferences.getString(key, "").length() == 0;
+}
+
+// Keep NVS writes and acknowledgement cleanup off the sensor/control loop.
+void snapshotStorageTask(void* parameter) {
+  SnapshotStorageRequest request;
+  SnapshotStorageResult result;
+  for (;;) {
+    if (xQueueReceive(snapshotStorageQueue, &request, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    result.operation = request.operation;
+    result.identity[0] = '\0';
+    strncpy(result.identity, request.identity, sizeof(result.identity) - 1);
+    result.success = request.operation == SNAPSHOT_STORAGE_ENQUEUE
+        ? enqueueIntervalSnapshot(request.identity, request.payload)
+        : request.operation == SNAPSHOT_STORAGE_REMOVE &&
+            removeQueuedSnapshot(
+                request.slot,
+                request.identity,
+                request.payload);
+    if (xQueueSend(snapshotStorageResultQueue, &result, portMAX_DELAY) != pdTRUE) {
+      Serial.println("Snapshot storage result could not be reported.");
+    }
+  }
+}
+
+void processSnapshotStorageResults() {
+  SnapshotStorageResult result;
+  while (snapshotStorageResultQueue != nullptr &&
+      xQueueReceive(snapshotStorageResultQueue, &result, 0) == pdTRUE) {
+    const String identity = result.identity;
+    if (result.operation == SNAPSHOT_STORAGE_ENQUEUE &&
+        identity == snapshotSavePendingIdentity) {
+      snapshotSavePending = false;
+      snapshotSavePendingIdentity = "";
+      if (result.success) {
+        lastSnapshotScheduleAttemptIdentity = identity;
+        lastSnapshotStorageRetryAt = 0;
+        lastIntervalSnapshotIdentity = identity;
+        Serial.printf("Snapshot saved to persistent queue identity=%s\n",
+            identity.c_str());
+      } else {
+        lastSnapshotStorageRetryAt = millis();
+        Serial.printf("Snapshot could not be queued identity=%s\n",
+            identity.c_str());
+      }
+    } else if (result.operation == SNAPSHOT_STORAGE_REMOVE &&
+        identity == snapshotCleanupPendingIdentity) {
+      snapshotCleanupPending = false;
+      snapshotCleanupPendingIdentity = "";
+      if (result.success) {
+        Serial.printf("Snapshot queue item removed after Firebase confirmation identity=%s\n",
+            identity.c_str());
+        lastSnapshotUploadAttemptAt = 0;
+      } else {
+        Serial.printf("Snapshot queue cleanup failed identity=%s; retry queued\n",
+            identity.c_str());
+        lastSnapshotUploadAttemptAt = millis();
+      }
+    }
+  }
 }
 
 void processQueuedSnapshotUpload(AsyncResult& result) {
@@ -1826,16 +1921,32 @@ void processQueuedSnapshotUpload(AsyncResult& result) {
     snapshotUploadPending = false;
     lastSnapshotUploadAttemptAt = millis();
   } else if (slot >= 0 && commandPreferences.getString(queueKey, "") == payload) {
-    const bool removed = commandPreferences.remove(queueKey);
-    if (removed || commandPreferences.getString(queueKey, "").length() == 0) {
-      Serial.printf("Snapshot upload confirmed identity=%s\n", identity.c_str());
-      lastSnapshotUploadAttemptAt = 0;
-    } else {
-      Serial.printf("Snapshot queue cleanup failed identity=%s; retry later\n",
+    SnapshotStorageRequest request = {};
+    request.operation = SNAPSHOT_STORAGE_REMOVE;
+    request.slot = slot;
+    strncpy(request.identity, identity.c_str(), sizeof(request.identity) - 1);
+    strncpy(request.payload, payload.c_str(), sizeof(request.payload) - 1);
+    if (snapshotStorageQueue != nullptr &&
+        xQueueSend(snapshotStorageQueue, &request, 0) == pdTRUE) {
+      Serial.printf("Snapshot upload confirmed identity=%s; queue cleanup scheduled\n",
           identity.c_str());
+      snapshotCleanupPending = true;
+      snapshotCleanupPendingIdentity = identity;
+      snapshotUploadPending = false;
+    } else if (snapshotStorageQueue == nullptr) {
+      const bool removed = removeQueuedSnapshot(slot, identity, payload);
+      Serial.printf(
+          "Snapshot upload confirmed identity=%s; synchronous cleanup %s\n",
+          identity.c_str(),
+          removed ? "succeeded" : "will retry");
+      snapshotUploadPending = false;
+      lastSnapshotUploadAttemptAt = removed ? 0 : millis();
+    } else {
+      Serial.printf("Snapshot upload confirmed identity=%s; cleanup will retry\n",
+          identity.c_str());
+      snapshotUploadPending = false;
       lastSnapshotUploadAttemptAt = millis();
     }
-    snapshotUploadPending = false;
   } else {
     Serial.printf("Snapshot queue item changed before ACK identity=%s\n",
         identity.c_str());
@@ -1847,6 +1958,7 @@ void processQueuedSnapshotUpload(AsyncResult& result) {
 
 void serviceQueuedSnapshotUpload(unsigned long now) {
   if (!firebaseInitialized || !app.ready()) return;
+  if (snapshotCleanupPending) return;
   if (snapshotUploadPending) {
     if (now - snapshotUploadStartedAt < SNAPSHOT_UPLOAD_TIMEOUT_MS) return;
     Serial.printf("Snapshot upload timed out identity=%s; retry queued\n",
@@ -1908,30 +2020,62 @@ void serviceQueuedSnapshotUpload(unsigned long now) {
   );
 }
 
+void logSnapshotUnavailable(const char* reason) {
+  const unsigned long now = millis();
+  if (lastSnapshotUnavailableLogAt != 0 &&
+      now - lastSnapshotUnavailableLogAt < SNAPSHOT_UNAVAILABLE_LOG_INTERVAL_MS) {
+    return;
+  }
+  lastSnapshotUnavailableLogAt = now == 0 ? 1 : now;
+  Serial.printf("Scheduled snapshot unavailable: %s\n", reason);
+}
+
 void requestIntervalSnapshot() {
-  if (activeBatchNumber <= 0) return;
+  if (activeBatchNumber <= 0) {
+    logSnapshotUnavailable("active planting batch is unavailable");
+    return;
+  }
   struct tm localTime;
-  if (!getLocalTime(&localTime, 0) || localTime.tm_year < (2024 - 1900)) return;
-  if (localTime.tm_min != 0 && localTime.tm_min != 30) return;
+  if (!getLocalTime(&localTime, 0) || localTime.tm_year < (2024 - 1900)) {
+    logSnapshotUnavailable("valid Manila time is unavailable");
+    return;
+  }
+  if (localTime.tm_min % 20 != 0) return;
 
   const String intervalKey = currentManilaIntervalKey(localTime);
   const String intervalIdentity = intervalKey + "|" + String(activeBatchNumber);
-  if (intervalIdentity == lastSnapshotScheduleAttemptIdentity) return;
+  if (intervalIdentity == lastSnapshotScheduleAttemptIdentity ||
+      (snapshotSavePending && intervalIdentity == snapshotSavePendingIdentity)) {
+    return;
+  }
+  if (lastSnapshotStorageRetryAt != 0 &&
+      millis() - lastSnapshotStorageRetryAt < SNAPSHOT_STORAGE_RETRY_MS) return;
+
+  const unsigned long nowMs = millis();
+  if (!temperatureSensorValid1 || !temperatureSensorValid2 ||
+      !phSensorValid1 || !phSensorValid2 || !tdsSensorValid1 || !tdsSensorValid2 ||
+      !isfinite(currentTemperature1) || !isfinite(currentTemperature2) ||
+      !isfinite(currentPhValue1) || !isfinite(currentPhValue2) ||
+      currentPhValue1 < 0.0f || currentPhValue1 > 14.0f ||
+      currentPhValue2 < 0.0f || currentPhValue2 > 14.0f ||
+      !isfinite(currentTdsValue1) || !isfinite(currentTdsValue2) ||
+      nowMs - lastTemperatureValidAt1 > 5000UL ||
+      nowMs - lastTemperatureValidAt2 > 5000UL ||
+      nowMs - lastPhValidAt1 > 5000UL || nowMs - lastPhValidAt2 > 5000UL ||
+      nowMs - lastTdsValidAt1 > 5000UL || nowMs - lastTdsValidAt2 > 5000UL) {
+    logSnapshotUnavailable("one or more sensor readings are invalid or stale");
+    return;
+  }
   if (snapshotIdentityWasRecorded(intervalIdentity)) {
     lastSnapshotScheduleAttemptIdentity = intervalIdentity;
     return;
   }
 
-  const unsigned long nowMs = millis();
-  if (!temperatureSensorValid1 || !temperatureSensorValid2 ||
-      !phSensorValid1 || !phSensorValid2 || !tdsSensorValid1 || !tdsSensorValid2 ||
-      nowMs - lastTemperatureValidAt1 > 5000UL ||
-      nowMs - lastTemperatureValidAt2 > 5000UL ||
-      nowMs - lastPhValidAt1 > 5000UL || nowMs - lastPhValidAt2 > 5000UL ||
-      nowMs - lastTdsValidAt1 > 5000UL || nowMs - lastTdsValidAt2 > 5000UL) return;
-
-  lastSnapshotScheduleAttemptIdentity = intervalIdentity;
   const time_t capturedAt = time(nullptr);
+  if (capturedAt <= 0) {
+    logSnapshotUnavailable("snapshot timestamp is unavailable");
+    return;
+  }
   String snapshotJson = "{";
   snapshotJson += "\"intervalKey\":\"" + intervalKey + "\",";
   snapshotJson += "\"batchNumber\":" + String(activeBatchNumber) + ",";
@@ -1949,8 +2093,36 @@ void requestIntervalSnapshot() {
       String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
       String(rainNodeOnline ? "true" : "false") + "}}";
 
-  if (!enqueueIntervalSnapshot(intervalIdentity, snapshotJson)) {
-    Serial.printf("Snapshot identity=%s was not queued\n", intervalIdentity.c_str());
+  if (snapshotStorageQueue == nullptr || snapshotStorageResultQueue == nullptr) {
+    Serial.println("Snapshot storage worker unavailable; saving synchronously.");
+    if (enqueueIntervalSnapshot(intervalIdentity, snapshotJson)) {
+      lastIntervalSnapshotIdentity = intervalIdentity;
+      lastSnapshotScheduleAttemptIdentity = intervalIdentity;
+    } else {
+      lastSnapshotStorageRetryAt = millis();
+      Serial.printf("Snapshot identity=%s was not queued\n",
+          intervalIdentity.c_str());
+    }
+    return;
+  }
+
+  SnapshotStorageRequest request = {};
+  request.operation = SNAPSHOT_STORAGE_ENQUEUE;
+  request.slot = -1;
+  strncpy(request.identity, intervalIdentity.c_str(), sizeof(request.identity) - 1);
+  strncpy(request.payload, snapshotJson.c_str(), sizeof(request.payload) - 1);
+  if (snapshotJson.length() >= sizeof(request.payload)) {
+    lastSnapshotScheduleAttemptIdentity = intervalIdentity;
+    Serial.printf("Snapshot payload too large identity=%s; not queued\n",
+        intervalIdentity.c_str());
+    return;
+  }
+  if (xQueueSend(snapshotStorageQueue, &request, 0) == pdTRUE) {
+    snapshotSavePending = true;
+    snapshotSavePendingIdentity = intervalIdentity;
+  } else {
+    lastSnapshotStorageRetryAt = millis();
+    logSnapshotUnavailable("persistent queue worker is busy");
   }
 }
 
@@ -2023,6 +2195,14 @@ void handleCombinedStatus() {
       now - lastTemperatureValidAt1 <= 5000UL;
   const bool temperature2Valid = temperatureSensorValid2 &&
       now - lastTemperatureValidAt2 <= 5000UL;
+  const bool ph1Valid = phSensorValid1 &&
+      now - lastPhValidAt1 <= 5000UL &&
+      isfinite(currentPhValue1) && currentPhValue1 >= 0.0f &&
+      currentPhValue1 <= 14.0f;
+  const bool ph2Valid = phSensorValid2 &&
+      now - lastPhValidAt2 <= 5000UL &&
+      isfinite(currentPhValue2) && currentPhValue2 >= 0.0f &&
+      currentPhValue2 <= 14.0f;
   const bool heartbeatKnown = lastFirebaseHeartbeatSuccessAt != 0;
   const unsigned long heartbeatAge = heartbeatKnown
       ? now - lastFirebaseHeartbeatSuccessAt : 0;
@@ -2038,11 +2218,13 @@ void handleCombinedStatus() {
   json += "\"temp1\":" + String(currentTemperature1, 1) + ",";
   json += "\"temp1Valid\":" + String(temperature1Valid ? "true" : "false") + ",";
   json += "\"ph1\":" + String(currentPhValue1, 2) + ",";
+  json += "\"ph1Valid\":" + String(ph1Valid ? "true" : "false") + ",";
   json += "\"tds1\":" + String(currentTdsValue1, 0) + ",";
   json += "\"water2\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\",";
   json += "\"temp2\":" + String(currentTemperature2, 1) + ",";
   json += "\"temp2Valid\":" + String(temperature2Valid ? "true" : "false") + ",";
   json += "\"ph2\":" + String(currentPhValue2, 2) + ",";
+  json += "\"ph2Valid\":" + String(ph2Valid ? "true" : "false") + ",";
   json += "\"tds2\":" + String(currentTdsValue2, 0) + ",";
   json += "\"nutrient1\":" + String(digitalRead(nutrientPump1Pin) == PUMP_ON ? 1 : 0) + ",";
   json += "\"phUp1\":" + String(digitalRead(phUp1Pin) == PUMP_ON ? 1 : 0) + ",";
@@ -2389,6 +2571,24 @@ void setup() {
   // Wi-Fi and hotspot setup
   wifiPreferences.begin("wifi", false);
   commandPreferences.begin("pumpcmd", false);
+  snapshotStorageQueue = xQueueCreate(2, sizeof(SnapshotStorageRequest));
+  snapshotStorageResultQueue = xQueueCreate(2, sizeof(SnapshotStorageResult));
+  if (snapshotStorageQueue == nullptr || snapshotStorageResultQueue == nullptr ||
+      xTaskCreate(
+          snapshotStorageTask,
+          "snapshotStorage",
+          4096,
+          nullptr,
+          1,
+          nullptr) != pdPASS) {
+    if (snapshotStorageQueue != nullptr) vQueueDelete(snapshotStorageQueue);
+    if (snapshotStorageResultQueue != nullptr) {
+      vQueueDelete(snapshotStorageResultQueue);
+    }
+    snapshotStorageQueue = nullptr;
+    snapshotStorageResultQueue = nullptr;
+    Serial.println("Snapshot storage worker unavailable; synchronous fallback enabled.");
+  }
   setGrowLight(commandPreferences.getBool("growLightOn", false));
   activeBatchNumber = commandPreferences.getInt("activeBatch", 0);
   lastIntervalSnapshotIdentity = commandPreferences.getString(
@@ -2430,6 +2630,7 @@ void loop() {
   app.loop();
   server.handleClient();
   unsigned long now = millis();
+  processSnapshotStorageResults();
   processMainWifiDiagnostics();
   serviceConnectionDiagnostics(now);
   serviceRainNodeHealth(now);
@@ -2571,18 +2772,25 @@ void loop() {
     lastTdsValidAt2 = now;
   }
 
-  // Reading pH Sensors with 1-minute delay logic
+  // Keep pH validity tied to finite, in-range sensor conversions.
   if (now - lastPhCheck >= phInterval) {
     lastPhCheck = now;
-    currentPhValue1 = readPhSensor(PH_PIN1, slope1);
-    currentPhValue2 = readPhSensor(PH_PIN2, slope2);
-    phSensorValid1 = true;
-    phSensorValid2 = true;
-    lastPhValidAt1 = now;
-    lastPhValidAt2 = now;
-
-    serviceAutomaticPhControl(1, currentPhValue1, now);
-    serviceAutomaticPhControl(2, currentPhValue2, now);
+    const float phReading1 = readPhSensor(PH_PIN1, slope1);
+    const float phReading2 = readPhSensor(PH_PIN2, slope2);
+    phSensorValid1 = isfinite(phReading1) &&
+        phReading1 >= 0.0f && phReading1 <= 14.0f;
+    phSensorValid2 = isfinite(phReading2) &&
+        phReading2 >= 0.0f && phReading2 <= 14.0f;
+    if (phSensorValid1) {
+      currentPhValue1 = phReading1;
+      lastPhValidAt1 = now;
+      serviceAutomaticPhControl(1, currentPhValue1, now);
+    }
+    if (phSensorValid2) {
+      currentPhValue2 = phReading2;
+      lastPhValidAt2 = now;
+      serviceAutomaticPhControl(2, currentPhValue2, now);
+    }
   }
 
   servicePumpRuns();
@@ -2617,6 +2825,11 @@ void loop() {
     String liveTelemetryJson = "{";
     liveTelemetryJson += "\"tds1\":" + String(currentTdsValue1, 0) + ",";
     liveTelemetryJson += "\"ph1\":" + String(currentPhValue1, 2) + ",";
+    const bool ph1Valid = phSensorValid1 &&
+      now - lastPhValidAt1 <= 5000UL && isfinite(currentPhValue1) &&
+      currentPhValue1 >= 0.0f && currentPhValue1 <= 14.0f;
+    liveTelemetryJson += "\"ph1Valid\":" +
+      String(ph1Valid ? "true" : "false") + ",";
     liveTelemetryJson += "\"temp1\":" + String(currentTemperature1, 1) + ",";
     const bool temperature1Valid = temperatureSensorValid1 &&
       now - lastTemperatureValidAt1 <= 5000UL;
@@ -2625,6 +2838,11 @@ void loop() {
     liveTelemetryJson += "\"water1\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\",";
     liveTelemetryJson += "\"tds2\":" + String(currentTdsValue2, 0) + ",";
     liveTelemetryJson += "\"ph2\":" + String(currentPhValue2, 2) + ",";
+    const bool ph2Valid = phSensorValid2 &&
+      now - lastPhValidAt2 <= 5000UL && isfinite(currentPhValue2) &&
+      currentPhValue2 >= 0.0f && currentPhValue2 <= 14.0f;
+    liveTelemetryJson += "\"ph2Valid\":" +
+      String(ph2Valid ? "true" : "false") + ",";
     liveTelemetryJson += "\"temp2\":" + String(currentTemperature2, 1) + ",";
     const bool temperature2Valid = temperatureSensorValid2 &&
       now - lastTemperatureValidAt2 <= 5000UL;

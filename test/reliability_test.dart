@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'package:hydrodeck_test/command_ack_policy.dart';
+import 'package:hydrodeck_test/critical_ph_policy.dart';
 import 'package:hydrodeck_test/history_interval.dart';
 import 'package:hydrodeck_test/login_validation.dart';
 import 'package:hydrodeck_test/pump_control_policy.dart';
@@ -61,19 +62,36 @@ void main() {
   });
 
   group('Manila history intervals', () {
-    test('uses fixed half-hour keys and UTC instants', () {
-      final firstHalf = DateTime.utc(2026, 10, 17, 2, 15);
-      final secondHalf = DateTime.utc(2026, 10, 17, 2, 45);
-
-      expect(manilaIntervalKey(firstHalf), '20261017_1000');
-      expect(manilaIntervalKey(secondHalf), '20261017_1030');
+    test('uses fixed 20-minute Manila boundaries and UTC instants', () {
+      expect(manilaIntervalKey(DateTime.utc(2026, 10, 17, 2, 15)), '20261017_1000');
+      expect(manilaIntervalKey(DateTime.utc(2026, 10, 17, 2, 35)), '20261017_1020');
+      expect(manilaIntervalKey(DateTime.utc(2026, 10, 17, 2, 55)), '20261017_1040');
       expect(
         utcFromManilaIntervalKey('20261017_1030'),
         DateTime.utc(2026, 10, 17, 2, 30),
       );
       expect(
-        nextManilaIntervalUtc(firstHalf),
+        nextManilaIntervalUtc(DateTime.utc(2026, 10, 17, 2, 15)),
+        DateTime.utc(2026, 10, 17, 2, 20),
+      );
+    });
+
+    test('keeps legacy 30-minute record keys stable', () {
+      final oldRecordTime = DateTime.utc(2026, 10, 17, 2, 35);
+      expect(
+        legacyManilaHalfHourIntervalKey(oldRecordTime),
+        '20261017_1030',
+      );
+      expect(
+        legacyManilaHalfHourStartUtc(oldRecordTime),
         DateTime.utc(2026, 10, 17, 2, 30),
+      );
+      expect(
+        scheduledSnapshotRecordId(
+          batchNumber: 8,
+          intervalKey: legacyManilaHalfHourIntervalKey(oldRecordTime),
+        ),
+        'b8_scheduled_20261017_1030',
       );
     });
 
@@ -148,6 +166,102 @@ void main() {
         0,
       );
       expect(await database.query('historical_logs'), hasLength(1));
+    });
+
+    group('critical pH notifications', () {
+      test('requires over five continuous minutes and alerts once per episode', () {
+        final tracker = CriticalPhEpisode();
+        final startedAt = DateTime.utc(2026, 11, 5, 5);
+
+        expect(
+          tracker.shouldNotify(
+            ph: 5.0,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: startedAt,
+          ),
+          isFalse,
+        );
+        expect(
+          tracker.shouldNotify(
+            ph: 5.0,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: startedAt.add(const Duration(minutes: 5)),
+          ),
+          isFalse,
+        );
+        final firstAlert = startedAt.add(
+          const Duration(minutes: 5, milliseconds: 1),
+        );
+        expect(
+          tracker.shouldNotify(
+            ph: 5.0,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: firstAlert,
+          ),
+          isTrue,
+        );
+        tracker.markNotified();
+        expect(
+          tracker.shouldNotify(
+            ph: 5.0,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: firstAlert.add(const Duration(minutes: 10)),
+          ),
+          isFalse,
+        );
+      });
+
+      test('resets the episode for in-range or invalid readings', () {
+        final tracker = CriticalPhEpisode();
+        final startedAt = DateTime.utc(2026, 11, 5, 5);
+
+        tracker.shouldNotify(
+          ph: 5.0,
+          minimum: 5.5,
+          maximum: 7.0,
+          now: startedAt,
+        );
+        expect(
+          tracker.shouldNotify(
+            ph: 6.0,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: startedAt.add(const Duration(minutes: 3)),
+          ),
+          isFalse,
+        );
+        expect(
+          tracker.shouldNotify(
+            ph: 5.0,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: startedAt.add(const Duration(minutes: 8)),
+          ),
+          isFalse,
+        );
+        expect(
+          tracker.shouldNotify(
+            ph: double.nan,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: startedAt.add(const Duration(minutes: 14)),
+          ),
+          isFalse,
+        );
+        expect(
+          tracker.shouldNotify(
+            ph: 5.0,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: startedAt.add(const Duration(minutes: 19)),
+          ),
+          isFalse,
+        );
+      });
     });
   });
 

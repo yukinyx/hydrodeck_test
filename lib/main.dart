@@ -25,6 +25,7 @@ import 'command_ack_policy.dart';
 import 'wifi_provisioning_policy.dart';
 import 'hotspot_attempt_policy.dart';
 import 'device_presence_policy.dart';
+import 'critical_ph_policy.dart';
 
 bool get _supportsBackgroundService =>
     !kIsWeb &&
@@ -216,7 +217,7 @@ class DatabaseHelper {
         await db.delete('historical_logs', where: 'id = ?', whereArgs: [id]);
         continue;
       }
-      final intervalKey = manilaIntervalKey(timestamp);
+      final intervalKey = legacyManilaHalfHourIntervalKey(timestamp);
       final recordId = batch == null
           ? 'legacy_$id'
           : scheduledSnapshotRecordId(
@@ -233,7 +234,7 @@ class DatabaseHelper {
           'intervalKey': intervalKey,
           'recordType': scheduledSnapshotRecordType,
           'recordId': recordId,
-          'timestamp': manilaIntervalStartUtc(timestamp).toIso8601String(),
+          'timestamp': legacyManilaHalfHourStartUtc(timestamp).toIso8601String(),
         },
         where: 'id = ?',
         whereArgs: [id],
@@ -720,7 +721,7 @@ class NotificationHelper {
       id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
       title: '⚠️ Critical pH Alert',
       body:
-          'pH level has remained in critical range (${ph.toStringAsFixed(2)}) for over 20 seconds!',
+          'pH level has remained outside the configured range (${ph.toStringAsFixed(2)}) for more than 5 minutes.',
       notificationDetails: details,
     );
   }
@@ -1109,10 +1110,20 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   double minPhThreshold = 5.5;
   double maxPhThreshold = 7.0;
 
-  DateTime? criticalPhStart;
-  DateTime? lastAlertTime;
+  final criticalPhEpisode = CriticalPhEpisode();
 
   bool isPolling = false; // Prevents timer stack overlap
+
+  double? readValidBed2Ph(Map<String, dynamic> data) {
+    final bed2 = data['bed2'];
+    final bed2Map = bed2 is Map ? Map<String, dynamic>.from(bed2) : null;
+    final value = data['ph2'] ?? bed2Map?['ph'];
+    final valid = data['ph2Valid'] ?? bed2Map?['phValid'];
+    if (valid == false) return null;
+    final ph = value is num ? value.toDouble() : double.tryParse('$value');
+    if (ph == null || !ph.isFinite || ph < 0 || ph > 14) return null;
+    return ph;
+  }
 
   try {
     targetIp = await DatabaseHelper.instance.getActiveIp();
@@ -1301,6 +1312,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     isPolling = true;
 
     bool found = false;
+    double? currentPhReading;
     String telemetrySource = 'offline';
     bool firebaseHeartbeatFresh = false;
     String cleanTargetIp = sanitizeHost(targetIp);
@@ -1312,8 +1324,12 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     );
 
     if (primaryResult != null) {
+      final statusData = Map<String, dynamic>.from(
+        primaryResult['data'] as Map,
+      );
+      currentPhReading = readValidBed2Ph(statusData);
       final normalized = normalizeStatusPayload(
-        Map<String, dynamic>.from(primaryResult['data'] as Map),
+        statusData,
       );
       final bed1 = GrowBedReading.fromMap(
         normalized['bed1'] as Map<String, dynamic>,
@@ -1376,8 +1392,10 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       for (final res in results) {
         if (res != null) {
           final host = res['host'] as String;
+          final statusData = Map<String, dynamic>.from(res['data'] as Map);
+          currentPhReading = readValidBed2Ph(statusData);
           final normalized = normalizeStatusPayload(
-            Map<String, dynamic>.from(res['data'] as Map),
+            statusData,
           );
           final bed1 = GrowBedReading.fromMap(
             normalized['bed1'] as Map<String, dynamic>,
@@ -1440,6 +1458,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         );
         if (snapshot.exists && snapshot.value != null) {
           final data = Map<String, dynamic>.from(snapshot.value as Map);
+          currentPhReading = readValidBed2Ph(data);
           final telemetry = HydrodeckTelemetry.fromJson(data);
           lastBed1 = telemetry.bed1;
           lastBed2 = telemetry.bed2;
@@ -1469,30 +1488,16 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       telemetrySource = 'offline';
     }
 
-    bool isCritical = (lastPh < minPhThreshold || lastPh > maxPhThreshold);
-
-    if (isCritical) {
-      criticalPhStart ??= DateTime.now();
-      final durationInCritical = DateTime.now()
-          .difference(criticalPhStart!)
-          .inSeconds;
-
-      if (durationInCritical >= 20) {
-        bool shouldNotify = false;
-        if (lastAlertTime == null) {
-          shouldNotify = true;
-        } else if (DateTime.now().difference(lastAlertTime!).inSeconds >= 20) {
-          shouldNotify = true;
-        }
-
-        if (shouldNotify && isAppClosed) {
-          NotificationHelper.showPhAlertNotification(lastPh);
-          lastAlertTime = DateTime.now();
-        }
-      }
-    } else {
-      criticalPhStart = null;
-      lastAlertTime = null;
+    final notificationTime = DateTime.now();
+    if (criticalPhEpisode.shouldNotify(
+      ph: currentPhReading,
+      minimum: minPhThreshold,
+      maximum: maxPhThreshold,
+      now: notificationTime,
+    ) &&
+        isAppClosed) {
+      unawaited(NotificationHelper.showPhAlertNotification(currentPhReading!));
+      criticalPhEpisode.markNotified();
     }
 
     service.invoke('telemetryUpdate', {
@@ -3377,7 +3382,7 @@ Future<CloudHistory> downloadCloudHistory() async {
           final intervalKey =
               map['intervalKey']?.toString() ??
               map['minuteKey']?.toString() ??
-              manilaIntervalKey(timestamp);
+              legacyManilaHalfHourIntervalKey(timestamp);
           final recordId =
               map['recordId']?.toString() ??
               (batch == null
@@ -5818,7 +5823,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               final intervalKey =
                   map['intervalKey']?.toString() ??
                   map['minuteKey']?.toString() ??
-                  manilaIntervalKey(timestamp);
+                  legacyManilaHalfHourIntervalKey(timestamp);
               final recordId =
                   map['recordId']?.toString() ??
                   scheduledSnapshotRecordId(
@@ -7206,7 +7211,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     );
     final temperatureHot = temperatureStatus == 'Too hot';
     final temperatureUnavailable = temperatureStatus == 'Unavailable';
-    final waterLabel = data.waterFull ? 'Full water level' : 'Low water level';
+    final waterLabel = data.waterFull ? 'Water full' : 'Needs water';
     return Column(
       children: [
         Row(
@@ -7640,7 +7645,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             ),
           const SizedBox(height: 12),
           const Text(
-            'Saved ESP32 snapshots (every 30 minutes, Manila time):',
+            'Saved ESP32 snapshots (every 20 minutes, Manila time):',
             style: TextStyle(
               fontSize: 11,
               color: Colors.grey,
