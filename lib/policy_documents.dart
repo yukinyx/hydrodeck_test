@@ -59,7 +59,7 @@ HydroDeck is provided without a guarantee that every sensor reading, connection,
 
 To the extent permitted by Philippine law, the project team is not responsible for indirect or consequential losses, including lost yield, damaged plants, or lost income, arising from circumstances such as sensor errors, equipment or power failure, Wi-Fi or internet interruptions, app or cloud-service downtime, or missed or delayed alerts.
 
-Nothing in these Terms excludes liability that cannot legally be excluded or limits rights and remedies provided by applicable law. In particular, this section is not a waiver of future fraud claims or other non-waivable rights under Philippine law. See the Civil Code of the Philippines, including Articles 1170–1173. [Republic Act No. 386](https://elibrary.judiciary.gov.ph/thebookshelf/showdocs/2/53360)
+Nothing in these Terms excludes liability that cannot legally be excluded or limits rights and remedies provided by applicable law. In particular, this section is not a waiver of future fraud claims or other non-waivable rights under Philippine law. See the Civil Code of the Philippines, including Articles 1170–1173. [Republic Act No. 386]
 
 ## 11. Third-party services
 HydroDeck relies on third-party services, including Firebase for account authentication and cloud data and an email service for verification or one-time codes. Those services are subject to their own terms and privacy practices.
@@ -76,7 +76,7 @@ For questions about these Terms or HydroDeck, contact:
 **HydroDeck Project Team**
 College of Informatics and Computing Sciences
 Batangas State University–Malvar Campus
-Email: [**hydrodecknt@gmail.com**](mailto:hydrodecknt@gmail.com)''';
+Email: [**hydrodecknt@gmail.com**]''';
 
 const String privacyPolicyDocument = r'''# HydroDeck Privacy Policy
 **Last updated:** 6 November 2026
@@ -84,9 +84,9 @@ const String privacyPolicyDocument = r'''# HydroDeck Privacy Policy
 ## 1. Who is responsible for your information?
 HydroDeck is a student project developed by fourth-year Network Technology students from the College of Informatics and Computing Sciences, Batangas State University–Malvar Campus.
 
-**Official Personal Information Controller:** [Before publication, confirm with the university whether the controller is Batangas State University or the HydroDeck project team, and insert the approved name.]
+**Official Personal Information Controller:** Hydrodeck Project Team
 
-The HydroDeck Project Team can receive privacy questions at [**hydrodecknt@gmail.com**](mailto:hydrodecknt@gmail.com). [Confirm with the university whether a Data Protection Officer or other official privacy contact must also be listed.]
+The HydroDeck Project Team can receive privacy questions at [**hydrodecknt@gmail.com**]'. 
 
 ## 2. Information the app uses
 Depending on the features you use, HydroDeck may process:
@@ -129,9 +129,9 @@ The app uses local Wi-Fi communication and cloud services. The two ESP32 boards 
 ## 6. Retention and deletion
 The project keeps information only for as long as needed for the purposes described in this policy, subject to applicable legal requirements.
 
-**Retention schedule:** [Before publication, insert the confirmed retention periods for account/profile data, sensor and planting history, local device records, and backups.]
+**Retention schedule:** 365 days for account and its associated readings, history, and settings. The project team should confirm that the retention schedule is implemented in the app and cloud services.
 
-You may request deletion by using the app’s deletion feature, where available, or by emailing [**hydrodecknt@gmail.com**](mailto:hydrodecknt@gmail.com). The current app asks for email verification, records a pending deletion request with a date seven days later, and signs you out. The app code alone does not confirm that an automatic process deletes the Firebase Authentication account and all related records on that date. The responsible project administrator must process the request and confirm completion.
+You may request deletion by using the app’s deletion feature, where available, or by emailing [**hydrodecknt@gmail.com**]. The current app asks for email verification, records a pending deletion request with a date seven days later, and signs you out. The app code alone does not confirm that an automatic process deletes the Firebase Authentication account and all related records on that date. The responsible project administrator must process the request and confirm completion.
 
 Uninstalling the app may remove app-local information from the phone, but it does not by itself delete cloud information or credentials saved on the ESP32.
 
@@ -141,9 +141,9 @@ The project uses account authentication, Firebase access rules, local storage, a
 The app stores a configured app PIN in its local database. The project team should review and improve PIN protection before release. This policy does not claim that the PIN or all locally stored records are encrypted.
 
 ## 8. Your privacy rights and choices
-Under the Philippine Data Privacy Act, you may have rights to be informed, access and correct personal information, object to certain processing, request erasure or blocking where applicable, and seek data portability or file a complaint, subject to legal conditions. [RA 10173](https://officialgazette.gov.ph/2012/15/republic-act-no-10173) · [NPC data-subject rights](https://privacy.gov.ph/data-subject-rights/)
+Under the Philippine Data Privacy Act, you may have rights to be informed, access and correct personal information, object to certain processing, request erasure or blocking where applicable, and seek data portability or file a complaint, subject to legal conditions. [RA 10173] · [NPC data-subject rights]
 
-To make a request, email [**hydrodecknt@gmail.com**](mailto:hydrodecknt@gmail.com) from your registered email address and describe the request. Do not include your password or app PIN. The team may ask for reasonable verification before acting.
+To make a request, email [**hydrodecknt@gmail.com**] from your registered email address and describe the request. Do not include your password or app PIN. The team may ask for reasonable verification before acting.
 
 You may decline optional permissions or information, but Wi-Fi setup, notifications, biometric sign-in, cloud history, or other features may not work without the required information or permission.
 
@@ -161,9 +161,9 @@ For privacy requests or questions, contact:
 **HydroDeck Project Team**
 College of Informatics and Computing Sciences
 Batangas State University–Malvar Campus
-Email: [**hydrodecknt@gmail.com**](mailto:hydrodecknt@gmail.com)
+Email: [**hydrodecknt@gmail.com**]'
 
-**Official Personal Information Controller / Data Protection Officer:** [Insert the university-approved contact information before publication.]''';
+**Official Personal Information Controller / Data Protection Officer:** Hydrodeck Project Team''';
 
 class PolicyDocumentScreen extends StatelessWidget {
   final String title;

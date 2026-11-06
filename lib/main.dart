@@ -7895,17 +7895,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 20),
-          PolicySettingsSection(
-            onContactSupport: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => const SupportRequestScreen(),
-                ),
-              );
-            },
-          ),
-          const SizedBox(height: 24),
 
           const Text(
             'Network Configuration',
@@ -8133,6 +8122,17 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 ),
               ],
             ),
+          ),
+          const SizedBox(height: 24),
+          PolicySettingsSection(
+            onContactSupport: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => const SupportRequestScreen(),
+                ),
+              );
+            },
           ),
           const SizedBox(height: 32),
 
