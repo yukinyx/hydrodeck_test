@@ -1,3 +1,6 @@
+export 'policy_documents.dart';
+export 'support_request.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ui';
@@ -27,6 +30,8 @@ import 'hotspot_attempt_policy.dart';
 import 'device_presence_policy.dart';
 import 'critical_ph_policy.dart';
 import 'planting_navigation.dart';
+import 'policy_documents.dart';
+import 'support_request.dart';
 
 bool get _supportsBackgroundService =>
     !kIsWeb &&
@@ -1807,6 +1812,8 @@ class _SignupScreenState extends State<SignupScreen> {
   bool _passwordTouched = false;
   bool _confirmTouched = false;
   bool _pinTouched = false;
+  bool _acceptedPolicies = false;
+  bool _consentError = false;
   bool _busy = false;
   String? _error;
 
@@ -1843,6 +1850,17 @@ class _SignupScreenState extends State<SignupScreen> {
     _confirmFocus.dispose();
     _pinFocus.dispose();
     super.dispose();
+  }
+
+  bool _validatePolicyConsent() {
+    final accepted = _acceptedPolicies;
+    setState(() => _consentError = !accepted);
+    return accepted;
+  }
+
+  Future<void> _submitSignup() async {
+    if (!_validatePolicyConsent()) return;
+    await _signup();
   }
 
   // Keep each field's inline validation quiet until it has lost focus once.
@@ -1894,6 +1912,11 @@ class _SignupScreenState extends State<SignupScreen> {
   }
 
   Future<void> _signup() async {
+    if (!_acceptedPolicies) {
+      setState(() => _consentError = true);
+      return;
+    }
+
     final email = _email.text.trim();
     final phone = _phone.text.trim();
     _emailTouched = _phoneTouched = _passwordTouched = _confirmTouched =
@@ -1938,6 +1961,7 @@ class _SignupScreenState extends State<SignupScreen> {
               phone: phone,
               password: _password.text,
               pin: _pin.text,
+              acceptedPolicies: _acceptedPolicies,
               onLogin: widget.onLogin,
             ),
           ),
@@ -2008,7 +2032,47 @@ class _SignupScreenState extends State<SignupScreen> {
       ),
     ],
     actionLabel: 'Sign up',
-    onAction: _signup,
+    onAction: _submitSignup,
+    beforeAction: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 32,
+              height: 32,
+              child: Checkbox(
+                value: _acceptedPolicies,
+                activeColor: const Color(0xFF2DC867),
+                onChanged: (value) => setState(() {
+                  _acceptedPolicies = value ?? false;
+                  _consentError = false;
+                }),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.only(top: 5),
+                child: policyConsentText(
+                  onTermsTap: () => openTermsOfUse(context),
+                  onPrivacyTap: () => openPrivacyPolicy(context),
+                ),
+              ),
+            ),
+          ],
+        ),
+        if (_consentError)
+          const Padding(
+            padding: EdgeInsets.only(left: 40, top: 2),
+            child: Text(
+              'Accept the Terms of Use and Privacy Policy to sign up.',
+              style: TextStyle(color: Colors.red, fontSize: 12),
+            ),
+          ),
+      ],
+    ),
     footer: TextButton(
       onPressed: widget.onLogin,
       child: const Text('Already have an account? Log in'),
@@ -2292,6 +2356,7 @@ class OtpVerificationScreen extends StatefulWidget {
   final String? phone;
   final String? password;
   final String? pin;
+  final bool acceptedPolicies;
   final VoidCallback? onLogin;
   final VoidCallback? onDeleteConfirmed;
 
@@ -2302,6 +2367,7 @@ class OtpVerificationScreen extends StatefulWidget {
     this.phone,
     this.password,
     this.pin,
+    this.acceptedPolicies = false,
     this.onLogin,
     this.onDeleteConfirmed,
   });
@@ -2399,6 +2465,13 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
           setState(() => _error = 'Signup data is missing. Please try again.');
           return;
         }
+        if (!widget.acceptedPolicies) {
+          setState(
+            () => _error =
+                'Accept the Terms of Use and Privacy Policy before creating an account.',
+          );
+          return;
+        }
 
         final credential = await FirebaseAuth.instance
             .createUserWithEmailAndPassword(
@@ -2412,6 +2485,9 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
               'email': widget.email,
               'phone': phone,
               'createdAt': ServerValue.timestamp,
+              'termsOfUseVersion': termsOfUseVersion,
+              'privacyPolicyVersion': privacyPolicyVersion,
+              'policiesAcceptedAt': ServerValue.timestamp,
             });
 
         await FirebaseAuth.instance.signOut();
@@ -2649,6 +2725,7 @@ Widget _field(
     decoration: InputDecoration(
       labelText: label,
       hintText: hintText,
+      counterText: maxLength == null ? null : '',
       errorText: errorText,
       prefixIcon: Icon(icon),
       border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
@@ -2713,6 +2790,7 @@ class _AuthFormScaffold extends StatelessWidget {
   final List<Widget> fields;
   final VoidCallback onAction;
   final Widget footer;
+  final Widget? beforeAction;
   const _AuthFormScaffold({
     required this.title,
     required this.subtitle,
@@ -2722,6 +2800,7 @@ class _AuthFormScaffold extends StatelessWidget {
     required this.fields,
     required this.onAction,
     required this.footer,
+    this.beforeAction,
   });
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -2763,6 +2842,10 @@ class _AuthFormScaffold extends StatelessWidget {
                 ),
                 if (error != null)
                   Text(error!, style: const TextStyle(color: Colors.red)),
+                if (beforeAction != null) ...[
+                  const SizedBox(height: 8),
+                  beforeAction!,
+                ],
                 const SizedBox(height: 12),
                 ElevatedButton(
                   onPressed: busy ? null : onAction,
@@ -7812,6 +7895,17 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 20),
+          PolicySettingsSection(
+            onContactSupport: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => const SupportRequestScreen(),
+                ),
+              );
+            },
+          ),
+          const SizedBox(height: 24),
 
           const Text(
             'Network Configuration',
