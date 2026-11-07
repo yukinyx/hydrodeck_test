@@ -207,6 +207,59 @@ void main() {
     );
   });
 
+  test('offline messaging distinguishes Firebase and local ESP32 access', () {
+    expect(
+      dashboardOfflineBannerMessage(
+        firebaseConnected: true,
+        localDeviceReachable: false,
+      ),
+      isNull,
+    );
+    expect(
+      shouldShowOfflineHotspotPrompt(
+        firebaseConnected: true,
+        localDeviceReachable: false,
+      ),
+      isFalse,
+    );
+
+    final localOnlyMessage = dashboardOfflineBannerMessage(
+      firebaseConnected: false,
+      localDeviceReachable: true,
+    )!;
+    expect(localOnlyMessage, contains('pump control may still work'));
+    expect(
+      localOnlyMessage,
+      contains('Cloud logs and history cannot be loaded or synced'),
+    );
+    expect(
+      localOnlyMessage,
+      contains('history already saved on this phone is kept'),
+    );
+    expect(
+      shouldShowOfflineHotspotPrompt(
+        firebaseConnected: false,
+        localDeviceReachable: true,
+      ),
+      isFalse,
+    );
+
+    expect(
+      dashboardOfflineBannerMessage(
+        firebaseConnected: false,
+        localDeviceReachable: false,
+      ),
+      contains('Connect to the ESP32 hotspot'),
+    );
+    expect(
+      shouldShowOfflineHotspotPrompt(
+        firebaseConnected: false,
+        localDeviceReachable: false,
+      ),
+      isTrue,
+    );
+  });
+
   test('reservoir model prefers shared data and reads legacy bed fields', () {
     final shared = ReservoirReading.fromSources(
       shared: {'level': 'full', 'online': true},
@@ -343,7 +396,7 @@ void main() {
     expect(find.byIcon(Icons.device_thermostat), findsNWidgets(2));
     expect(find.byIcon(Icons.water), findsNothing);
     expect(find.text('Unavailable'), findsNWidgets(2));
-    expect(find.text('Low water level'), findsNWidgets(2));
+    expect(find.text('Needs water'), findsNWidgets(2));
     expect(find.text('RESERVOIR'), findsOneWidget);
     expect(find.byIcon(Icons.science_outlined), findsNWidgets(2));
     expect(find.byIcon(Icons.water_drop_outlined), findsNWidgets(4));
@@ -354,6 +407,24 @@ void main() {
       tester.getTopLeft(find.text('RESERVOIR')).dy,
       greaterThan(tester.getTopLeft(find.text('Grow Bed 2 Metrics')).dy),
     );
+
+    await tester.tap(find.byTooltip('Connection guide'));
+    await tester.pumpAndSettle();
+    expect(find.text('Connect the ESP32'), findsOneWidget);
+    expect(
+      find.textContaining(
+        'Wi-Fi alone does not mean internet or cloud access is working.',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.text(
+        'Grow-bed water level reports whether each bed sensor says Water full or Needs water.',
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
 
     await tester.tap(find.text('CONTROLS'));
     await tester.pumpAndSettle();
@@ -370,6 +441,27 @@ void main() {
     expect(find.text('OFF'), findsNWidgets(3));
     expect(find.byKey(const ValueKey('water-pump-1-toggle')), findsOneWidget);
     expect(find.byKey(const ValueKey('water-pump-2-toggle')), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Controls help'));
+    await tester.pumpAndSettle();
+    expect(
+      find.textContaining('Only one water pump may run at a time'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('Only one chemical dose runs at a time'),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('SETTINGS'));
+    await tester.pumpAndSettle();
+    expect(find.text('Network Configuration'), findsNothing);
+    expect(find.text('ESP32 IP or Hostname'), findsNothing);
+    expect(find.text('hydrodeck.local'), findsNothing);
+    expect(find.text('ESP32 Hotspot Setup'), findsOneWidget);
+    expect(find.text('Connect to ESP32 Hotspot'), findsOneWidget);
 
     await tester.tap(find.text('DATA'));
     await tester.pumpAndSettle();

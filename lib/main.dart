@@ -892,6 +892,26 @@ bool shouldShowWifiSetupPrompt({
   required bool cloudReachable,
 }) => !localDeviceReachable && !cloudReachable;
 
+bool shouldShowOfflineHotspotPrompt({
+  required bool? firebaseConnected,
+  required bool localDeviceReachable,
+}) => firebaseConnected == false && !localDeviceReachable;
+
+String? dashboardOfflineBannerMessage({
+  required bool? firebaseConnected,
+  required bool localDeviceReachable,
+}) {
+  if (firebaseConnected != false) return null;
+  return localDeviceReachable
+      ? 'Firebase cloud is unavailable. Connected locally: live ESP32 readings '
+            'and pump control may still work. Cloud logs and history cannot be '
+            'loaded or synced until cloud access returns; history already saved '
+            'on this phone is kept.'
+      : 'Internet/Firebase cloud is unavailable, and the ESP32 is not reachable '
+            'locally. Connect to the ESP32 hotspot to try local monitoring and '
+            'control.';
+}
+
 bool reportedActuatorStateConfirmsRequest({
   required bool requestedState,
   required bool reportedState,
@@ -1627,7 +1647,7 @@ void main() async {
     appEmail: 'hydrodecknt@gmail.com',
     otpLength: 6,
     otpType: OTPType.numeric,
-    expiry: 10 * 60 * 1000,
+    expiry: 0,
   );
   EmailOTP.setTemplate(
     template: '''
@@ -1943,10 +1963,11 @@ class _SignupScreenState extends State<SignupScreen> {
       _error = null;
     });
     try {
-      final sent = await EmailOTP.sendOTP(email: email);
+      final sent = await _emailOtpCodeService.sendCode(email);
       if (!sent) {
         setState(
-          () => _error = EmailOTP.lastError ?? 'Could not send the OTP.',
+          () => _error =
+              _emailOtpCodeService.lastError ?? 'Could not send the OTP.',
         );
         return;
       }
@@ -2263,10 +2284,11 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
       _error = null;
     });
     try {
-      final sent = await EmailOTP.sendOTP(email: email);
+      final sent = await _emailOtpCodeService.sendCode(email);
       if (!sent) {
         setState(
-          () => _error = EmailOTP.lastError ?? 'Could not send the OTP.',
+          () => _error =
+              _emailOtpCodeService.lastError ?? 'Could not send the OTP.',
         );
         return;
       }
@@ -2350,9 +2372,53 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
   }
 }
 
+abstract interface class OtpCodeService {
+  Future<bool> sendCode(String email);
+  bool verifyCode({required String email, required String code});
+  bool isCodeExpired(String email);
+  String? get lastError;
+}
+
+class EmailOtpCodeService implements OtpCodeService {
+  static const Duration codeLifetime = Duration(minutes: 10);
+  static String? _activeEmail;
+  static DateTime? _expiresAt;
+
+  @override
+  String? get lastError => EmailOTP.lastError;
+
+  @override
+  Future<bool> sendCode(String email) async {
+    _activeEmail = null;
+    _expiresAt = null;
+
+    final sent = await EmailOTP.sendOTP(email: email);
+    if (sent) {
+      _activeEmail = email;
+      _expiresAt = DateTime.now().add(codeLifetime);
+    }
+    return sent;
+  }
+
+  @override
+  bool verifyCode({required String email, required String code}) =>
+      _activeEmail == email && !isCodeExpired(email) &&
+      EmailOTP.verifyOTP(otp: code);
+
+  @override
+  bool isCodeExpired(String email) =>
+      _activeEmail == email &&
+      _expiresAt != null &&
+      !DateTime.now().isBefore(_expiresAt!);
+}
+
+final OtpCodeService _emailOtpCodeService = EmailOtpCodeService();
+
 class OtpVerificationScreen extends StatefulWidget {
   final String email;
   final String flow;
+  final OtpCodeService? otpService;
+  final DateTime Function()? now;
   final String? phone;
   final String? password;
   final String? pin;
@@ -2364,6 +2430,8 @@ class OtpVerificationScreen extends StatefulWidget {
     super.key,
     required this.email,
     required this.flow,
+    this.otpService,
+    this.now,
     this.phone,
     this.password,
     this.pin,
@@ -2381,31 +2449,51 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
   bool _busy = false;
   String? _error;
   DateTime? _resendAvailableAt;
+  Timer? _resendCountdownTimer;
+
+  OtpCodeService get _otpService =>
+      widget.otpService ?? _emailOtpCodeService;
+  DateTime get _now => widget.now?.call() ?? DateTime.now();
 
   @override
   void initState() {
     super.initState();
-    _resendAvailableAt = DateTime.now().add(const Duration(minutes: 3));
+    _resendAvailableAt = _now.add(const Duration(seconds: 3));
+    _startResendCountdown();
   }
 
   @override
   void dispose() {
+    _resendCountdownTimer?.cancel();
     _otpController.dispose();
     super.dispose();
   }
 
   bool get _canResend =>
-      _resendAvailableAt == null || DateTime.now().isAfter(_resendAvailableAt!);
+      _resendAvailableAt == null ||
+      !_now.isBefore(_resendAvailableAt!);
 
   String get _resendLabel {
     if (_canResend) return 'Send another code';
-    final remaining = _resendAvailableAt!.difference(DateTime.now());
-    final seconds = remaining.inSeconds
-        .remainder(60)
-        .toString()
-        .padLeft(2, '0');
-    final minutes = remaining.inMinutes.toString().padLeft(2, '0');
+    final remaining = _resendAvailableAt!.difference(_now);
+    final totalSeconds = (remaining.inMilliseconds / 1000).ceil();
+    final seconds = (totalSeconds % 60).toString().padLeft(2, '0');
+    final minutes = (totalSeconds ~/ 60).toString().padLeft(2, '0');
     return 'Send another code in $minutes:$seconds';
+  }
+
+  void _startResendCountdown() {
+    _resendCountdownTimer?.cancel();
+    _resendCountdownTimer = Timer.periodic(const Duration(seconds: 1), (
+      timer,
+    ) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      setState(() {});
+      if (_canResend) timer.cancel();
+    });
   }
 
   Future<void> _resendCode() async {
@@ -2415,20 +2503,30 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
       _error = null;
     });
     try {
-      final sent = widget.flow == 'forgot'
-          ? await EmailOTP.resendOTP(email: widget.email)
-          : await EmailOTP.resendOTP(email: widget.email);
+      final sent = await _otpService.sendCode(widget.email);
       if (!sent) {
-        setState(
-          () => _error = EmailOTP.lastError ?? 'Could not send another code.',
-        );
+        if (mounted) {
+          setState(
+            () => _error =
+                _otpService.lastError ??
+                'Could not send another code. Check your connection and try again.',
+          );
+        }
         return;
       }
-      _resendAvailableAt = DateTime.now().add(const Duration(minutes: 3));
+      if (!mounted) return;
+      setState(() {
+        _resendAvailableAt = _now.add(const Duration(minutes: 3));
+      });
+      _startResendCountdown();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('A new OTP has been sent.')),
+      );
+    } on Exception catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('A new OTP has been sent.')),
-        );
+        setState(() {
+          _error = 'Could not send another code: $error';
+        });
       }
     } finally {
       if (mounted) setState(() => _busy = false);
@@ -2448,10 +2546,13 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
     });
 
     try {
-      final isValid = EmailOTP.verifyOTP(otp: otp);
+      final isValid = _otpService.verifyCode(
+        email: widget.email,
+        code: otp,
+      );
       if (!isValid) {
         setState(
-          () => _error = EmailOTP.isOtpExpired()
+          () => _error = _otpService.isCodeExpired(widget.email)
               ? 'The OTP has expired. Please request a new one.'
               : 'Invalid OTP. Please try again.',
         );
@@ -3078,10 +3179,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
       _message = null;
     });
     try {
-      final sent = await EmailOTP.sendOTP(email: user.email!);
+      final sent = await _emailOtpCodeService.sendCode(user.email!);
       if (!sent) {
         throw Exception(
-          EmailOTP.lastError ?? 'Could not send the confirmation email.',
+          _emailOtpCodeService.lastError ??
+              'Could not send the confirmation email.',
         );
       }
       if (mounted) {
@@ -5044,7 +5146,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   int _currentIndex = 0;
 
   late String _esp32Ip;
-  late TextEditingController _ipController;
 
   String _connectionStatus = "ESP32 offline";
 
@@ -5068,11 +5169,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   StreamSubscription? _telemetrySub;
   StreamSubscription? _snapshotSub;
   StreamSubscription? _firebaseSub;
+  StreamSubscription? _firebaseConnectionSub;
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _cloudLogsSub;
   StreamSubscription?
   _firebaseCommandsSub; // Subscription for command status updates
   Timer? _connectionTimer;
   bool _wifiPromptShown = false;
+  bool _offlinePromptShown = false;
+  bool _offlineBannerDismissed = false;
+  bool? _firebaseConnected;
   bool _wifiProvisioningCompleted = false;
   bool _isRefreshingConnectivity = false;
   bool _connectivityProbeInProgress = false;
@@ -5112,12 +5217,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _esp32Ip = widget.initialIp;
-    _ipController = TextEditingController(text: _esp32Ip);
     _wifiSsidController = TextEditingController();
     _wifiPasswordController = TextEditingController();
     _loadStoredLogsAndSettings();
     unawaited(_reconcileHistory());
     unawaited(_subscribeToCloudLogs());
+    _subscribeToFirebaseConnection();
     _subscribeToFirebase();
     _subscribeToBackgroundUpdates();
     _subscribeToFirebaseCommands();
@@ -5130,23 +5235,33 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       if (mounted) {
         unawaited(_refreshConnectivity(showLoading: false));
         setState(_updateConnectionStatus);
-        // Only prompt to provision the ESP32 when the user is on the Home screen
-        // and the device has been offline for a while. This prevents intrusive
-        // popups while navigating other screens.
-        if (_connectionStatus != 'ESP32 offline') {
-          _offlineSince = null;
-          _wifiPromptShown = false;
-        } else {
-          _offlineSince ??= DateTime.now();
-          if (!_wifiPromptShown &&
+        if (_firebaseConnected == true) {
+          _offlinePromptShown = false;
+          _offlineBannerDismissed = false;
+          if (_hasFreshLocalTelemetry || _hasFreshFirebaseTelemetry) {
+            _offlineSince = null;
+            _wifiPromptShown = false;
+          } else if (!_wifiPromptShown &&
               !_wifiProvisioningCompleted &&
               shouldShowWifiSetupPrompt(
                 localDeviceReachable: _hasFreshLocalTelemetry,
                 cloudReachable: _hasFreshFirebaseTelemetry,
               ) &&
-              _currentIndex == 0 &&
+              _currentIndex == 0) {
+            _offlineSince ??= DateTime.now();
+            if (DateTime.now().difference(_offlineSince!).inSeconds >= 3) {
+              _showWifiSetupDialog();
+            }
+          }
+        } else if (_firebaseConnected == false) {
+          _offlineSince ??= DateTime.now();
+          if (!_offlinePromptShown &&
+              shouldShowOfflineHotspotPrompt(
+                firebaseConnected: _firebaseConnected,
+                localDeviceReachable: _hasFreshLocalTelemetry,
+              ) &&
               DateTime.now().difference(_offlineSince!).inSeconds >= 3) {
-            _showWifiSetupDialog();
+            _showOfflineHotspotDialog();
           }
         }
       }
@@ -5167,6 +5282,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     _telemetrySub?.cancel();
     _snapshotSub?.cancel();
     _firebaseSub?.cancel();
+    _firebaseConnectionSub?.cancel();
     _cloudLogsSub?.cancel();
     _firebaseCommandsSub?.cancel();
     _connectionTimer?.cancel();
@@ -5177,10 +5293,39 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     for (final timer in _actuatorTelemetryTimeouts.values) {
       timer.cancel();
     }
-    _ipController.dispose();
     _wifiSsidController.dispose();
     _wifiPasswordController.dispose();
     super.dispose();
+  }
+
+  void _subscribeToFirebaseConnection() {
+    try {
+      _firebaseConnectionSub = hydrodeckDatabase()
+          .ref('.info/connected')
+          .onValue
+          .listen(
+            (event) {
+              if (!mounted) return;
+              final connected = event.snapshot.value == true;
+              setState(() {
+                _firebaseConnected = connected;
+                if (connected) {
+                  _offlineSince = null;
+                  _offlinePromptShown = false;
+                  _offlineBannerDismissed = false;
+                  _wifiPromptShown = false;
+                }
+              });
+            },
+            onError: (_) {
+              if (mounted) {
+                setState(() => _firebaseConnected = false);
+              }
+            },
+          );
+    } catch (_) {
+      // Firebase may not be initialized yet; wait for its connection event.
+    }
   }
 
   void _subscribeToFirebase() {
@@ -5278,7 +5423,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             _updateConnectionStatus();
             if (payload['ip'] != null) {
               _esp32Ip = payload['ip'].toString();
-              _ipController.text = _esp32Ip;
             }
           });
           if (sharedMinPh != null && sharedMaxPh != null) {
@@ -5702,7 +5846,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           _applyGrowLightTelemetry(result.value.growLightOn);
           _updateActuatorStates(result.value.actuatorStates, isLocal: true);
           _esp32Ip = result.key;
-          _ipController.text = result.key;
           _lastLocalTelemetryAt = DateTime.now();
         });
         localConnected = true;
@@ -6330,7 +6473,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             if (mounted) {
               setState(() {
                 _esp32Ip = target;
-                _ipController.text = target;
                 _lastLocalTelemetryAt = DateTime.now();
               });
             }
@@ -6576,7 +6718,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       if (!mounted) return;
       setState(() {
         _esp32Ip = '192.168.4.1';
-        _ipController.text = _esp32Ip;
         _lastLocalTelemetryAt = DateTime.now();
         _bed1 = telemetry.bed1;
         _bed2 = telemetry.bed2;
@@ -6600,6 +6741,101 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       _hotspotAttemptGate.finish();
       if (mounted) setState(() {});
     }
+  }
+
+  void _showOfflineHotspotDialog() {
+    if (!mounted ||
+        _offlinePromptShown ||
+        !shouldShowOfflineHotspotPrompt(
+          firebaseConnected: _firebaseConnected,
+          localDeviceReachable: _hasFreshLocalTelemetry,
+        )) {
+      return;
+    }
+    _offlinePromptShown = true;
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('You are offline'),
+        content: const Text(
+          'You are offline. Connect to the ESP32 hotspot instead?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Not now'),
+          ),
+          ElevatedButton.icon(
+            onPressed: () {
+              Navigator.pop(context);
+              unawaited(_connectToEsp32Hotspot());
+            },
+            icon: const Icon(Icons.wifi),
+            label: const Text('Connect to hotspot'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOfflineBanner() {
+    final message = dashboardOfflineBannerMessage(
+      firebaseConnected: _firebaseConnected,
+      localDeviceReachable: _hasFreshLocalTelemetry,
+    );
+    if (message == null || _offlineBannerDismissed) {
+      return const SizedBox.shrink();
+    }
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF3E0),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFFFFCC80)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.cloud_off_outlined, color: Colors.deepOrange),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _hasFreshLocalTelemetry
+                      ? 'Cloud unavailable'
+                      : 'You are offline',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 4),
+                Text(message, style: const TextStyle(fontSize: 12, height: 1.3)),
+                if (!_hasFreshLocalTelemetry)
+                  TextButton.icon(
+                    onPressed: _isHotspotConnecting
+                        ? null
+                        : () => unawaited(_connectToEsp32Hotspot()),
+                    icon: const Icon(Icons.wifi, size: 18),
+                    label: const Text('Connect to ESP32 hotspot'),
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.only(top: 6),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: 'Dismiss offline message',
+            visualDensity: VisualDensity.compact,
+            onPressed: () => setState(() => _offlineBannerDismissed = true),
+            icon: const Icon(Icons.close, size: 20),
+          ),
+        ],
+      ),
+    );
   }
 
   void _showWifiSetupDialog() {
@@ -7008,28 +7244,112 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Connect Hydrodeck'),
+        title: const Text('Home & connection help'),
         content: const SingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text('1. Power on the ESP32 and wait for its setup hotspot.'),
-              SizedBox(height: 10),
               Text(
-                '2. If it is not on your home Wi-Fi, tap the Wi-Fi setup prompt and search for ESP32-HYDRODECK.',
+                'Connect the ESP32',
+                style: TextStyle(fontWeight: FontWeight.bold),
               ),
               SizedBox(height: 10),
               Text(
-                '3. Connect to the hotspot using its configured password, then enter your home Wi-Fi name and password.',
+                '1. Power on the ESP32. In Settings, open ESP32 Hotspot Setup and tap Connect to ESP32 Hotspot.',
               ),
               SizedBox(height: 10),
               Text(
-                '4. The ESP32 stays available on its hotspot while it joins home Wi-Fi. Reconnect this phone to the same home Wi-Fi for direct local access.',
+                '2. To put the ESP32 on your home Wi-Fi, enter that network’s name and password, then tap Send Wi-Fi to ESP32.',
               ),
               SizedBox(height: 10),
               Text(
-                '5. Tap refresh. “Connected locally” means this phone can reach the ESP32; “Online” means the MAIN Firebase heartbeat is current.',
+                '3. For direct local access, connect your phone to the same Wi-Fi as the ESP32, or use its hotspot.',
+              ),
+              SizedBox(height: 14),
+              Text(
+                'Connection status',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              SizedBox(height: 6),
+              Text(
+                'Connected locally means this phone received a direct /status reply from the ESP32. Online means HydroDeck sees a recent ESP32 heartbeat through Firebase. Wi-Fi alone does not mean internet or cloud access is working.',
+              ),
+              SizedBox(height: 14),
+              Text('Readings', style: TextStyle(fontWeight: FontWeight.bold)),
+              SizedBox(height: 6),
+              Text(
+                'pH shows how acidic or alkaline the grow-bed water is; compare it with the target limits in Settings.',
+              ),
+              SizedBox(height: 6),
+              Text(
+                'TDS (PPM) estimates dissolved nutrients and minerals in the water.',
+              ),
+              SizedBox(height: 6),
+              Text('Water temperature is shown in °C.'),
+              SizedBox(height: 6),
+              Text(
+                'Grow-bed water level reports whether each bed sensor says Water full or Needs water.',
+              ),
+              SizedBox(height: 6),
+              Text(
+                'Reservoir shows the rainwater tank level and whether the separate RAIN unit is online.',
+              ),
+              SizedBox(height: 14),
+              Text(
+                'If a reading or command times out, the phone may have lost local Wi-Fi/device communication. A cloud-based request can also time out when internet or Firebase is unavailable.',
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showControlsHelp() {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Controls help'),
+        content: const SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Using the controls',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              SizedBox(height: 8),
+              Text(
+                'Water pumps turn on or off for their grow bed. Only one water pump may run at a time, and a pump cannot start when the RAIN reservoir unit is offline.',
+              ),
+              SizedBox(height: 8),
+              Text(
+                'Nutrient and pH buttons run dosing pumps. Only one chemical dose runs at a time. The pH + or − button is enabled only when the reading and target limits call for that adjustment.',
+              ),
+              SizedBox(height: 8),
+              Text(
+                'Use the Grow Light button to switch the light on or off.',
+              ),
+              SizedBox(height: 14),
+              Text(
+                'Why a control may be locked',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              SizedBox(height: 8),
+              Text(
+                'A control can be temporarily unavailable while a command is waiting for confirmation, a dosing pulse is running, the other water pump is on, or the reservoir unit is offline. Wait for the status to update before trying again.',
+              ),
+              SizedBox(height: 14),
+              Text(
+                'If a reading or command times out, the phone may have lost local Wi-Fi/device communication. A cloud-based request can also time out when internet or Firebase is unavailable.',
               ),
             ],
           ),
@@ -7076,7 +7396,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               ]
             : const [],
       ),
-      body: SafeArea(child: screens[_currentIndex]),
+      body: SafeArea(
+        child: Column(
+          children: [
+            if (_firebaseConnected == false && !_offlineBannerDismissed)
+              _buildOfflineBanner(),
+            Expanded(child: screens[_currentIndex]),
+          ],
+        ),
+      ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _currentIndex,
         type: BottomNavigationBarType.fixed,
@@ -7638,9 +7966,21 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'Hardware Controls',
-            style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Expanded(
+                child: Text(
+                  'Hardware Controls',
+                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Controls help',
+                onPressed: _showControlsHelp,
+                icon: const Icon(Icons.help_outline),
+              ),
+            ],
           ),
           sectionTitle('PH LEVEL'),
           separatedRows([phRow(1, _bed1), phRow(2, _bed2)]),
@@ -7895,48 +8235,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 20),
-
-          const Text(
-            'Network Configuration',
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              fontSize: 15,
-              color: Colors.black87,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Column(
-              children: [
-                TextField(
-                  controller: _ipController,
-                  decoration: const InputDecoration(
-                    labelText: "ESP32 IP or Hostname",
-                    hintText: "hydrodeck.local or 192.168.x.x",
-                    border: OutlineInputBorder(),
-                    suffixIcon: Icon(Icons.wifi),
-                  ),
-                  onChanged: (val) {
-                    final trimmed = val.trim();
-                    setState(() {
-                      _esp32Ip = trimmed;
-                    });
-                    if (_supportsBackgroundService) {
-                      FlutterBackgroundService().invoke('updateIp', {
-                        'ip': trimmed,
-                      });
-                    }
-                  },
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 24),
 
           const Text(
             'ESP32 Hotspot Setup',
