@@ -472,12 +472,19 @@ void main() {
       expect(isWifiProvisioningPending('received'), isTrue);
       expect(isWifiProvisioningPending('scanning'), isTrue);
       expect(isWifiProvisioningPending('testing'), isTrue);
+      expect(isWifiProvisioningPending('rain_pending'), isTrue);
       expect(isWifiProvisioningPending('connected'), isFalse);
       expect(isWifiProvisioningAccepted('received'), isTrue);
       expect(isWifiProvisioningFinal('testing'), isFalse);
       expect(isWifiProvisioningFinal('connected'), isTrue);
       expect(isWifiProvisioningFinal('network_unavailable'), isTrue);
       expect(isWifiProvisioningFinal('authentication_failed'), isTrue);
+      expect(isWifiProvisioningFinal('rain_unconfirmed'), isTrue);
+      expect(isWifiProvisioningFinal('rain_rejected'), isTrue);
+      expect(
+        wifiProvisioningMessage('rain_unconfirmed'),
+        contains('RAIN did not confirm'),
+      );
       expect(wifiProvisioningMessage('connected'), contains('successfully'));
       expect(
         wifiProvisioningMessage('network_unavailable'),

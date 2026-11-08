@@ -1,17 +1,27 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <ArduinoJson.h>
+#define ENABLE_USER_AUTH
+#define ENABLE_DATABASE
+#include <FirebaseClient.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/md.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <Preferences.h>
 #include <atomic>
 #include <cstring>
 
 // Replace this placeholder with the same private token in the MAIN sketch.
 const char* RAIN_TOKEN = "15c7068b34aa4c8103371012c769b18feb98878a948fba5c89786b32f7caaea9";
+// MAIN owns /hydrodeck/commands; RAIN publishes only its isolated status record.
+#define API_KEY "AIzaSyBBz_dOxKgGkz84VTnmAWXP556dMqJWGLo"
+#define USER_EMAIL "esp32@esp32.com"
+#define USER_PASSWORD "asdqwe123"
+#define DATABASE_URL "https://hydrodeck-e6fea-default-rtdb.asia-southeast1.firebasedatabase.app/"
 const uint8_t ESPNOW_BROADCAST_MAC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 #define PUMP_ON LOW
@@ -34,6 +44,13 @@ const unsigned long ESPNOW_INIT_RETRY_MS = 2000UL;
 const uint8_t FIRST_DISCOVERY_CHANNEL = 1;
 const uint8_t LAST_DISCOVERY_CHANNEL = 13;
 const unsigned long MAIN_BEACON_TIMEOUT_MS = 3000UL;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 8000UL;
+const unsigned long WIFI_RETRY_BASE_MS = 30000UL;
+const unsigned long WIFI_RETRY_MAX_MS = 120000UL;
+const unsigned long FIREBASE_STATUS_INTERVAL_MS = 5000UL;
+const unsigned long FIREBASE_RESULT_TIMEOUT_MS = 15000UL;
+const unsigned long RAIN_PROVISION_ACK_RETRY_MS = 500UL;
+const uint8_t RAIN_PROVISION_ACK_MAX_ATTEMPTS = 10;
 const uint16_t ESPNOW_MAGIC = 0x4859;
 const uint8_t ESPNOW_VERSION = 2;
 const uint8_t DEVICE_MAIN = 1;
@@ -43,6 +60,8 @@ const uint8_t MSG_MAIN_BEACON = 2;
 const uint8_t MSG_RAIN_STATUS = 3;
 const uint8_t MSG_PUMP_COMMAND = 4;
 const uint8_t MSG_COMMAND_ACK = 5;
+const uint8_t MSG_WIFI_PROVISION = 6;
+const uint8_t MSG_WIFI_PROVISION_ACK = 7;
 const uint8_t PUMP1_ID = 1;
 const uint8_t PUMP2_ID = 2;
 const uint8_t ACK_ACCEPTED = 1;
@@ -55,7 +74,9 @@ const uint8_t FAULT_RESERVOIR_LOW = 3;
 const uint8_t FAULT_MAX_RUN = 4;
 const uint8_t FAULT_STALE_COMMAND = 5;
 const uint8_t FAULT_INVALID_COMMAND = 6;
-const size_t ESPNOW_PACKET_MAX = 64;
+const uint8_t WIFI_PROVISION_ACCEPTED = 1;
+const uint8_t WIFI_PROVISION_REJECTED = 2;
+const size_t ESPNOW_PACKET_MAX = 128;
 
 #pragma pack(push, 1)
 struct PacketHeader {
@@ -110,11 +131,34 @@ struct CommandAckPacket {
   uint16_t crc;
   uint8_t authTag[8];
 };
+
+struct WifiProvisionPacket {
+  PacketHeader header;
+  uint32_t requestId;
+  uint8_t ssidLength;
+  uint8_t passwordLength;
+  char ssid[32];
+  char password[63];
+  uint16_t crc;
+  uint8_t authTag[8];
+};
+
+struct WifiProvisionAckPacket {
+  PacketHeader header;
+  uint32_t requestId;
+  uint32_t rainBootId;
+  uint8_t status;
+  uint16_t crc;
+  uint8_t authTag[8];
+};
 #pragma pack(pop)
 
 static_assert(sizeof(RainStatusPacket) <= ESP_NOW_MAX_DATA_LEN, "RAIN status packet exceeds ESP-NOW v1 limit");
 static_assert(sizeof(PumpCommandPacket) <= ESP_NOW_MAX_DATA_LEN, "Pump command packet exceeds ESP-NOW v1 limit");
 static_assert(sizeof(CommandAckPacket) <= ESP_NOW_MAX_DATA_LEN, "Command ACK exceeds ESP-NOW v1 limit");
+static_assert(sizeof(WifiProvisionPacket) <= ESP_NOW_MAX_DATA_LEN, "Wi-Fi provisioning packet exceeds ESP-NOW v1 limit");
+static_assert(sizeof(WifiProvisionAckPacket) <= ESP_NOW_MAX_DATA_LEN, "Wi-Fi provisioning ACK exceeds ESP-NOW v1 limit");
+static_assert(sizeof(WifiProvisionPacket) <= ESPNOW_PACKET_MAX, "Wi-Fi provisioning packet exceeds receive queue capacity");
 
 struct ReceivedPacket {
   uint8_t mac[6];
@@ -169,10 +213,38 @@ bool hasValidMainReply = false;
 unsigned long lastMainReplyAt = 0;
 unsigned long lastPollAt = 0;
 unsigned long lastWifiAttemptAt = 0;
+unsigned long wifiAttemptStartedAt = 0;
+unsigned long wifiRetryDelayMs = WIFI_RETRY_BASE_MS;
+uint8_t wifiRetryExponent = 0;
+bool wifiAttemptInProgress = false;
+bool wifiCredentialsPending = false;
+unsigned long wifiCredentialsConnectAfter = 0;
+bool firebaseInitialized = false;
+bool firebaseStatusWritePending = false;
+unsigned long firebaseStatusWriteStartedAt = 0;
+unsigned long lastFirebaseStatusWriteAt = 0;
+bool ntpConfigured = false;
+uint32_t lastProvisionRequestId = 0;
+bool lastProvisionRequestKnown = false;
+uint8_t lastProvisionRequestStatus = WIFI_PROVISION_REJECTED;
+uint8_t provisionAckAttempts = 0;
+unsigned long provisionAckLastSentAt = 0;
+bool provisionAckPending = false;
+uint32_t provisionAckRequestId = 0;
+uint8_t provisionAckStatus = WIFI_PROVISION_REJECTED;
 
 bool reservoirFullWet = false;
 bool reservoirFullCandidate = false;
 unsigned long reservoirFullCandidateAt = 0;
+Preferences wifiPreferences;
+String savedSsid;
+String savedPassword;
+WiFiClientSecure sslClient;
+using AsyncClient = AsyncClientClass;
+AsyncClient firebaseClient(sslClient);
+UserAuth userAuth(API_KEY, USER_EMAIL, USER_PASSWORD);
+FirebaseApp firebaseApp;
+RealtimeDatabase firebaseDatabase;
 
 uint16_t packetCrc(const uint8_t* bytes, size_t length) {
   uint16_t crc = 0xffff;
@@ -452,6 +524,139 @@ void sendCommandAck(const uint8_t mac[6], uint32_t commandId, uint8_t pump,
   }
 }
 
+void queueWifiProvisionAck(uint32_t requestId, uint8_t status) {
+  provisionAckRequestId = requestId;
+  provisionAckStatus = status;
+  provisionAckAttempts = 0;
+  provisionAckLastSentAt = 0;
+  provisionAckPending = true;
+}
+
+void serviceWifiProvisionAck(unsigned long now) {
+  if (!provisionAckPending || !mainPeerKnown || !mainSessionKnown ||
+      provisionAckAttempts >= RAIN_PROVISION_ACK_MAX_ATTEMPTS ||
+      (provisionAckLastSentAt != 0 &&
+       now - provisionAckLastSentAt < RAIN_PROVISION_ACK_RETRY_MS)) return;
+  WifiProvisionAckPacket packet = {};
+  preparePacket(packet, MSG_WIFI_PROVISION_ACK, DEVICE_RAIN);
+  packet.requestId = provisionAckRequestId;
+  packet.rainBootId = rainBootId;
+  packet.status = provisionAckStatus;
+  if (!finalizePacket(packet)) {
+    Serial.println("ESP-NOW Wi-Fi provisioning ACK authentication failed");
+    return;
+  }
+  provisionAckLastSentAt = now;
+  provisionAckAttempts++;
+  if (!sendPacket(mainMac, &packet, sizeof(packet)) &&
+      provisionAckAttempts >= RAIN_PROVISION_ACK_MAX_ATTEMPTS) {
+    Serial.println("RAIN Wi-Fi provisioning ACK could not be delivered");
+  }
+  if (provisionAckAttempts >= RAIN_PROVISION_ACK_MAX_ATTEMPTS) {
+    provisionAckPending = false;
+  }
+}
+
+bool validWifiProvisionFields(const WifiProvisionPacket& packet) {
+  if (packet.requestId == 0 || packet.ssidLength == 0 ||
+      packet.ssidLength > sizeof(packet.ssid) ||
+      packet.passwordLength > sizeof(packet.password) ||
+      (packet.passwordLength > 0 && packet.passwordLength < 8) ||
+      memchr(packet.ssid, '\0', packet.ssidLength) != nullptr ||
+      memchr(packet.password, '\0', packet.passwordLength) != nullptr) {
+    return false;
+  }
+  for (size_t index = packet.ssidLength; index < sizeof(packet.ssid); index++) {
+    if (packet.ssid[index] != 0) return false;
+  }
+  for (size_t index = packet.passwordLength;
+       index < sizeof(packet.password); index++) {
+    if (packet.password[index] != 0) return false;
+  }
+  return true;
+}
+
+void processWifiProvisioning(const ReceivedPacket& received,
+    const WifiProvisionPacket& packet) {
+  if (!mainSessionKnown || !mainPeerKnown ||
+      memcmp(received.mac, mainMac, sizeof(mainMac)) != 0 ||
+      (mainCommandSequenceKnown &&
+       !sequenceIsNewer(packet.header.sequence, lastMainCommandSequence))) {
+    Serial.println("ESP-NOW Wi-Fi provisioning rejected: unpaired MAIN or stale sequence");
+    return;
+  }
+  mainCommandSequenceKnown = true;
+  lastMainCommandSequence = packet.header.sequence;
+
+  uint8_t status = WIFI_PROVISION_REJECTED;
+  if (validWifiProvisionFields(packet)) {
+    char requestedSsid[33] = {};
+    char requestedPassword[64] = {};
+    memcpy(requestedSsid, packet.ssid, packet.ssidLength);
+    memcpy(requestedPassword, packet.password, packet.passwordLength);
+    const bool sameSavedCredentials =
+        savedSsid == requestedSsid && savedPassword == requestedPassword;
+    const bool duplicateRequest = lastProvisionRequestKnown &&
+        packet.requestId == lastProvisionRequestId;
+    const uint32_t persistedRequestId = wifiPreferences.getUInt("provId", 0);
+    if (duplicateRequest) {
+      status = sameSavedCredentials
+          ? lastProvisionRequestStatus : WIFI_PROVISION_REJECTED;
+    } else if (persistedRequestId == packet.requestId &&
+        !sameSavedCredentials) {
+      status = WIFI_PROVISION_REJECTED;
+    } else if (sameSavedCredentials) {
+      status = WIFI_PROVISION_ACCEPTED;
+      if (wifiPreferences.putUInt("provId", packet.requestId) ==
+          sizeof(uint32_t) &&
+          wifiPreferences.getUInt("provId", 0) == packet.requestId) {
+        lastProvisionRequestId = packet.requestId;
+        lastProvisionRequestKnown = true;
+        lastProvisionRequestStatus = status;
+      } else {
+        status = WIFI_PROVISION_REJECTED;
+      }
+    } else {
+        const String previousSsid = savedSsid;
+        const String previousPassword = savedPassword;
+        const size_t ssidStored =
+            wifiPreferences.putString("ssid", requestedSsid);
+        const size_t passwordStored =
+            wifiPreferences.putString("password", requestedPassword);
+        const size_t requestStored =
+            wifiPreferences.putUInt("provId", packet.requestId);
+        if (ssidStored == strlen(requestedSsid) &&
+            passwordStored == strlen(requestedPassword) &&
+            requestStored == sizeof(uint32_t) &&
+            wifiPreferences.getString("ssid", "") == requestedSsid &&
+            wifiPreferences.getString("password", "") == requestedPassword &&
+            wifiPreferences.getUInt("provId", 0) == packet.requestId) {
+          savedSsid = requestedSsid;
+          savedPassword = requestedPassword;
+          wifiCredentialsPending = true;
+          wifiCredentialsConnectAfter = millis() + 5000UL;
+          lastMainSeenAt = millis();
+          status = WIFI_PROVISION_ACCEPTED;
+          lastProvisionRequestId = packet.requestId;
+          lastProvisionRequestKnown = true;
+          lastProvisionRequestStatus = status;
+        } else {
+          wifiPreferences.putString("ssid", previousSsid);
+          wifiPreferences.putString("password", previousPassword);
+          wifiPreferences.putUInt("provId", persistedRequestId);
+          Serial.println("RAIN Wi-Fi credentials could not be stored; previous values restored.");
+        }
+    }
+  } else {
+    Serial.println("ESP-NOW Wi-Fi provisioning rejected: malformed credentials");
+  }
+
+  queueWifiProvisionAck(packet.requestId, status);
+  Serial.printf("RAIN Wi-Fi provisioning result=%s request=%08lX\n",
+      status == WIFI_PROVISION_ACCEPTED ? "stored" : "rejected",
+      static_cast<unsigned long>(packet.requestId));
+}
+
 void sendRainStatus(bool broadcast) {
   RainStatusPacket packet = {};
   preparePacket(packet, broadcast ? MSG_RAIN_HELLO : MSG_RAIN_STATUS,
@@ -725,11 +930,23 @@ void processEspNowPackets(unsigned long now) {
       mainCommandSequenceKnown = true;
       lastMainCommandSequence = command.header.sequence;
       processPumpCommand(received, command, now);
+      continue;
+    }
+    if (header.type == MSG_WIFI_PROVISION) {
+      WifiProvisionPacket provision;
+      memcpy(&provision, received.bytes, sizeof(provision));
+      if (!packetValid(provision, received.length, MSG_WIFI_PROVISION,
+              DEVICE_MAIN)) {
+        Serial.println("ESP-NOW Wi-Fi provisioning rejected: size/CRC/authentication");
+        continue;
+      }
+      processWifiProvisioning(received, provision);
     }
   }
 }
 
 void serviceChannelDiscovery(unsigned long now) {
+  if (WiFi.status() == WL_CONNECTED || wifiAttemptInProgress) return;
   if (lastDiscoveryChannelChangeAt != 0 &&
       now - lastDiscoveryChannelChangeAt < DISCOVERY_CHANNEL_DWELL_MS) {
     return;
@@ -755,6 +972,7 @@ void serviceDiscovery(unsigned long now) {
     stopAllPumpsForRecovery(now);
   }
   if (!mainSessionKnown) serviceChannelDiscovery(now);
+  serviceWifiProvisionAck(now);
 
   if (statusUpdatePending) {
     statusUpdatePending = false;
@@ -802,6 +1020,131 @@ bool initializeEspNow() {
   return true;
 }
 
+void processRainFirebaseAuth(AsyncResult& result) {
+  if (result.isError()) {
+    Serial.printf("RAIN Firebase authentication failed code=%d\n",
+        result.error().code());
+  }
+  result.clear();
+}
+
+void processRainFirebaseStatus(AsyncResult& result) {
+  if (result.uid() != "rainStatus") {
+    result.clear();
+    return;
+  }
+  firebaseStatusWritePending = false;
+  if (result.isError()) {
+    Serial.printf("RAIN Firebase status write failed code=%d\n",
+        result.error().code());
+  }
+  result.clear();
+}
+
+void initializeRainFirebase(unsigned long now) {
+  if (firebaseInitialized || WiFi.status() != WL_CONNECTED) return;
+  sslClient.useBuiltinCACertBundle();
+  sslClient.setConnectionTimeout(1000);
+  sslClient.setHandshakeTimeout(5);
+  if (!ntpConfigured) {
+    configTzTime("PHT-8", "pool.ntp.org", "time.nist.gov");
+    ntpConfigured = true;
+  }
+  initializeApp(firebaseClient, firebaseApp, getAuth(userAuth),
+      processRainFirebaseAuth, "rainAuth");
+  firebaseApp.getApp<RealtimeDatabase>(firebaseDatabase);
+  firebaseDatabase.url(DATABASE_URL);
+  firebaseInitialized = true;
+  lastFirebaseStatusWriteAt = now - FIREBASE_STATUS_INTERVAL_MS;
+  Serial.printf("RAIN Firebase initialization started channel=%d RSSI=%d\n",
+      WiFi.channel(), WiFi.RSSI());
+}
+
+void serviceRainFirebase(unsigned long now) {
+  if (WiFi.status() != WL_CONNECTED || WiFi.SSID() != savedSsid) {
+    firebaseInitialized = false;
+    firebaseStatusWritePending = false;
+    return;
+  }
+  initializeRainFirebase(now);
+  if (!firebaseInitialized) return;
+  if (!firebaseApp.ready()) return;
+
+  if (firebaseStatusWritePending) {
+    if (now - firebaseStatusWriteStartedAt < FIREBASE_RESULT_TIMEOUT_MS) return;
+    firebaseStatusWritePending = false;
+    Serial.println("RAIN Firebase status write timed out; retrying.");
+  }
+  if (now - lastFirebaseStatusWriteAt < FIREBASE_STATUS_INTERVAL_MS) return;
+  lastFirebaseStatusWriteAt = now;
+  firebaseStatusWriteStartedAt = now;
+  firebaseStatusWritePending = true;
+  String statusJson = "{";
+  statusJson += "\"online\":true,";
+  statusJson += "\"reservoir\":{\"level\":\"" + reservoirLevel() +
+      "\",\"full\":" + String(reservoirFullWet ? "true" : "false") + "},";
+  statusJson += "\"waterPump1\":" + String(pump1On ? "true" : "false") + ",";
+  statusJson += "\"waterPump2\":" + String(pump2On ? "true" : "false") + ",";
+  statusJson += "\"updatedAt\":{\".sv\":\"timestamp\"}";
+  statusJson += "}";
+  firebaseDatabase.set<object_t>(
+      firebaseClient,
+      "/hydrodeck/rainNodeStatus",
+      object_t(statusJson.c_str()),
+      processRainFirebaseStatus,
+      "rainStatus"
+  );
+  if (firebaseClient.lastError().code() != 0) {
+    firebaseStatusWritePending = false;
+    Serial.printf("RAIN Firebase status enqueue failed code=%d\n",
+        firebaseClient.lastError().code());
+  }
+}
+
+void serviceRainWifi(unsigned long now) {
+  if (wifiCredentialsPending) {
+    if ((long)(now - wifiCredentialsConnectAfter) < 0) return;
+    wifiCredentialsPending = false;
+    WiFi.disconnect(false, false);
+    firebaseInitialized = false;
+    wifiAttemptInProgress = false;
+    lastWifiAttemptAt = now;
+    wifiAttemptStartedAt = now;
+    WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
+    wifiAttemptInProgress = true;
+    Serial.println("RAIN attempting newly stored Wi-Fi credentials.");
+  }
+
+  if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == savedSsid) {
+    wifiAttemptInProgress = false;
+    wifiRetryExponent = 0;
+    wifiRetryDelayMs = WIFI_RETRY_BASE_MS;
+    initializeRainFirebase(now);
+    return;
+  }
+
+  if (wifiAttemptInProgress &&
+      now - wifiAttemptStartedAt >= WIFI_CONNECT_TIMEOUT_MS) {
+    wifiAttemptInProgress = false;
+    lastWifiAttemptAt = now;
+    if (wifiRetryExponent < 3) wifiRetryExponent++;
+    const unsigned long backoff =
+        WIFI_RETRY_BASE_MS * (1UL << wifiRetryExponent);
+    wifiRetryDelayMs = backoff > WIFI_RETRY_MAX_MS
+        ? WIFI_RETRY_MAX_MS : backoff;
+    Serial.printf("RAIN Wi-Fi attempt timed out; retry backoff=%lu ms\n",
+        wifiRetryDelayMs);
+  }
+
+  if (savedSsid.isEmpty() || wifiAttemptInProgress ||
+      now - lastWifiAttemptAt < wifiRetryDelayMs) return;
+  lastWifiAttemptAt = now;
+  wifiAttemptStartedAt = now;
+  WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
+  wifiAttemptInProgress = true;
+  Serial.println("RAIN retrying saved Wi-Fi credentials.");
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -822,10 +1165,26 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  Serial.printf("HYDRO_RAIN_ACTIVE stationMac=%s; no Wi-Fi association required\n",
-      WiFi.macAddress().c_str());
+  WiFi.setAutoReconnect(false);
+  wifiPreferences.begin("wifi", false);
+  savedSsid = wifiPreferences.getString("ssid", "");
+  savedPassword = wifiPreferences.getString("password", "");
+  lastProvisionRequestId = wifiPreferences.getUInt("provId", 0);
+  lastProvisionRequestKnown = lastProvisionRequestId != 0;
+  lastProvisionRequestStatus = WIFI_PROVISION_ACCEPTED;
+  Serial.printf("HYDRO_RAIN_ACTIVE stationMac=%s wifiCredentials=%s\n",
+      WiFi.macAddress().c_str(), savedSsid.isEmpty() ? "not_configured" : "stored");
   lastEspNowRetryAt = millis();
   initializeEspNow();
+  if (!savedSsid.isEmpty() && savedSsid.length() <= 32 &&
+      savedPassword.length() <= 63 &&
+      (savedPassword.isEmpty() || savedPassword.length() >= 8)) {
+    lastWifiAttemptAt = millis();
+    wifiAttemptStartedAt = lastWifiAttemptAt;
+    WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
+    wifiAttemptInProgress = true;
+    Serial.println("RAIN connecting to saved Wi-Fi credentials in the background.");
+  }
 }
 
 void loop() {
@@ -841,6 +1200,9 @@ void loop() {
   if (reservoirFullWet != previousReservoirFull) statusUpdatePending = true;
   servicePumpSafety(now);
   processEspNowPackets(now);
+  firebaseApp.loop();
+  serviceRainWifi(now);
+  serviceRainFirebase(now);
   if (!espNowReady && now - lastEspNowRetryAt >= ESPNOW_INIT_RETRY_MS) {
     lastEspNowRetryAt = now;
     Serial.println("RAIN retrying ESP-NOW initialization");

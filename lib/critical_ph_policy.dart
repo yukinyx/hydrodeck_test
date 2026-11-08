@@ -4,6 +4,8 @@ class CriticalPhEpisode {
   DateTime? _startedAt;
   bool _notified = false;
 
+  String? get notificationId => _startedAt?.microsecondsSinceEpoch.toString();
+
   bool shouldNotify({
     required double? ph,
     required double minimum,

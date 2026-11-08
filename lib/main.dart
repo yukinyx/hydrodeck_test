@@ -32,6 +32,7 @@ import 'critical_ph_policy.dart';
 import 'planting_navigation.dart';
 import 'policy_documents.dart';
 import 'support_request.dart';
+import 'weather_service.dart';
 
 bool get _supportsBackgroundService =>
     !kIsWeb &&
@@ -114,6 +115,11 @@ class DatabaseHelper {
 
   DatabaseHelper._init();
 
+  @visibleForTesting
+  static void setDatabaseForTesting(Database? database) {
+    _database = database;
+  }
+
   Future<Database?> get database async {
     if (kIsWeb) return null; // Web bypass to avoid sqflite runtime exceptions
     if (_database != null) return _database!;
@@ -131,7 +137,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 10,
+      version: 11,
       onCreate: _createDB,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -190,6 +196,30 @@ class DatabaseHelper {
             'ALTER TABLE historical_logs ADD COLUMN rainNodeOnline INTEGER',
           );
         }
+        if (oldVersion < 11) {
+          await db.execute('''
+            CREATE TABLE notification_inbox (
+              alertId TEXT PRIMARY KEY,
+              pH REAL NOT NULL,
+              createdAt TEXT NOT NULL,
+              isRead INTEGER NOT NULL DEFAULT 0
+            )
+          ''');
+          await db.execute('''
+            CREATE TABLE weather_location (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              name TEXT NOT NULL,
+              latitude REAL NOT NULL,
+              longitude REAL NOT NULL
+            )
+          ''');
+          await db.execute('''
+            CREATE TABLE local_history_deletions (
+              recordId TEXT PRIMARY KEY,
+              deletedAt TEXT NOT NULL
+            )
+          ''');
+        }
       },
     );
   }
@@ -240,7 +270,9 @@ class DatabaseHelper {
           'intervalKey': intervalKey,
           'recordType': scheduledSnapshotRecordType,
           'recordId': recordId,
-          'timestamp': legacyManilaHalfHourStartUtc(timestamp).toIso8601String(),
+          'timestamp': legacyManilaHalfHourStartUtc(
+            timestamp,
+          ).toIso8601String(),
         },
         where: 'id = ?',
         whereArgs: [id],
@@ -322,6 +354,28 @@ class DatabaseHelper {
         isBiometricsEnabled INTEGER NOT NULL
       )
     ''');
+    await db.execute('''
+      CREATE TABLE notification_inbox (
+        alertId TEXT PRIMARY KEY,
+        pH REAL NOT NULL,
+        createdAt TEXT NOT NULL,
+        isRead INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE weather_location (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        name TEXT NOT NULL,
+        latitude REAL NOT NULL,
+        longitude REAL NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE local_history_deletions (
+        recordId TEXT PRIMARY KEY,
+        deletedAt TEXT NOT NULL
+      )
+    ''');
   }
 
   // Security Configuration Queries
@@ -397,6 +451,7 @@ class DatabaseHelper {
   }) async {
     final db = await instance.database;
     if (db == null) return false;
+    if (await isLocalLogDeleted(log.identity)) return false;
     final existingRows = await db.query(
       'historical_logs',
       where: 'recordId = ?',
@@ -524,6 +579,114 @@ class DatabaseHelper {
       orderBy: 'timestamp DESC',
     );
     return result.map(_logFromRow).toList();
+  }
+
+  Future<bool> deleteLocalLog(String recordId) async {
+    final db = await instance.database;
+    if (db == null) throw StateError('Local history database is unavailable.');
+    final deleted = await db.transaction((transaction) async {
+      await transaction.insert('local_history_deletions', {
+        'recordId': recordId,
+        'deletedAt': DateTime.now().toUtc().toIso8601String(),
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+      return transaction.delete(
+        'historical_logs',
+        where: 'recordId = ?',
+        whereArgs: [recordId],
+      );
+    });
+    return deleted > 0;
+  }
+
+  Future<bool> isLocalLogDeleted(String recordId) async {
+    final db = await instance.database;
+    if (db == null) throw StateError('Local history database is unavailable.');
+    final rows = await db.query(
+      'local_history_deletions',
+      where: 'recordId = ?',
+      whereArgs: [recordId],
+      limit: 1,
+    );
+    return rows.isNotEmpty;
+  }
+
+  Future<void> insertPhAlert({
+    required String alertId,
+    required double ph,
+    required DateTime createdAt,
+  }) async {
+    final db = await instance.database;
+    if (db == null) throw StateError('Notification inbox is unavailable.');
+    await db.insert('notification_inbox', {
+      'alertId': alertId,
+      'pH': ph,
+      'createdAt': createdAt.toUtc().toIso8601String(),
+      'isRead': 0,
+    }, conflictAlgorithm: ConflictAlgorithm.ignore);
+  }
+
+  Future<List<PhAlert>> getPhAlerts() async {
+    final db = await instance.database;
+    if (db == null) throw StateError('Notification inbox is unavailable.');
+    final rows = await db.query(
+      'notification_inbox',
+      orderBy: 'createdAt DESC',
+    );
+    return rows.map(PhAlert.fromRow).toList();
+  }
+
+  Future<int> getUnreadPhAlertCount() async {
+    final db = await instance.database;
+    if (db == null) throw StateError('Notification inbox is unavailable.');
+    final rows = await db.query(
+      'notification_inbox',
+      columns: ['COUNT(*) AS count'],
+      where: 'isRead = 0',
+    );
+    return (rows.first['count'] as int?) ?? 0;
+  }
+
+  Future<void> markPhAlertRead(String alertId) async {
+    final db = await instance.database;
+    if (db == null) throw StateError('Notification inbox is unavailable.');
+    await db.update(
+      'notification_inbox',
+      {'isRead': 1},
+      where: 'alertId = ?',
+      whereArgs: [alertId],
+    );
+  }
+
+  Future<void> clearPhAlerts() async {
+    final db = await instance.database;
+    if (db == null) throw StateError('Notification inbox is unavailable.');
+    await db.delete('notification_inbox');
+  }
+
+  Future<WeatherLocation?> getWeatherLocation() async {
+    final db = await instance.database;
+    if (db == null) return null;
+    final rows = await db.query('weather_location', where: 'id = 1', limit: 1);
+    if (rows.isEmpty) return null;
+    final row = rows.first;
+    return WeatherLocation(
+      name: row['name'] as String,
+      latitude: (row['latitude'] as num).toDouble(),
+      longitude: (row['longitude'] as num).toDouble(),
+    );
+  }
+
+  Future<void> saveWeatherLocation(WeatherLocation location) async {
+    final db = await instance.database;
+    if (db == null) {
+      throw StateError('Weather location storage is unavailable.');
+    }
+    await db.insert('weather_location', {
+      'id': 1,
+      'name': location.name,
+      'latitude': location.latitude,
+      'longitude': location.longitude,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   // Planting Runs History Queries
@@ -707,8 +870,22 @@ class NotificationHelper {
         ?.requestNotificationsPermission();
   }
 
-  static Future<void> showPhAlertNotification(double ph) async {
+  static Future<void> showPhAlertNotification(
+    double ph, {
+    required String alertId,
+  }) async {
     if (kIsWeb) return;
+
+    try {
+      await DatabaseHelper.instance.insertPhAlert(
+        alertId: alertId,
+        ph: ph,
+        createdAt: DateTime.now(),
+      );
+    } catch (error, stackTrace) {
+      debugPrint('Could not save pH alert to the local inbox: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
 
     const AndroidNotificationDetails androidDetails =
         AndroidNotificationDetails(
@@ -724,7 +901,7 @@ class NotificationHelper {
     );
 
     await _notificationsPlugin.show(
-      id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      id: int.tryParse(alertId) ?? DateTime.now().millisecondsSinceEpoch,
       title: '⚠️ Critical pH Alert',
       body:
           'pH level has remained outside the configured range (${ph.toStringAsFixed(2)}) for more than 5 minutes.',
@@ -732,6 +909,634 @@ class NotificationHelper {
     );
   }
 }
+
+class NotificationsScreen extends StatefulWidget {
+  final ValueChanged<int> onUnreadCountChanged;
+
+  const NotificationsScreen({super.key, required this.onUnreadCountChanged});
+
+  @override
+  State<NotificationsScreen> createState() => _NotificationsScreenState();
+}
+
+class _NotificationsScreenState extends State<NotificationsScreen> {
+  List<PhAlert>? _alerts;
+  Object? _loadError;
+  Timer? _refreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadAlerts());
+    _refreshTimer = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => unawaited(_loadAlerts()),
+    );
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadAlerts() async {
+    try {
+      final alerts = await DatabaseHelper.instance.getPhAlerts();
+      if (!mounted) return;
+      setState(() {
+        _alerts = alerts;
+        _loadError = null;
+      });
+      widget.onUnreadCountChanged(
+        alerts.where((alert) => !alert.isRead).length,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _loadError = error);
+    }
+  }
+
+  Future<void> _markRead(PhAlert alert) async {
+    if (alert.isRead) return;
+    try {
+      await DatabaseHelper.instance.markPhAlertRead(alert.alertId);
+      await _loadAlerts();
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not mark alert as read: $error')),
+      );
+    }
+  }
+
+  Future<void> _clearAlerts() async {
+    try {
+      await DatabaseHelper.instance.clearPhAlerts();
+      await _loadAlerts();
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not clear notifications: $error')),
+      );
+    }
+  }
+
+  String _formatDate(DateTime value) =>
+      '${value.year}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')} '
+      '${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}';
+
+  @override
+  Widget build(BuildContext context) {
+    final alerts = _alerts;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(24, 20, 16, 8),
+          child: Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'Notifications',
+                  style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+                ),
+              ),
+              TextButton.icon(
+                onPressed: alerts == null || alerts.isEmpty
+                    ? null
+                    : _clearAlerts,
+                icon: const Icon(Icons.delete_sweep_outlined),
+                label: const Text('Clear'),
+              ),
+            ],
+          ),
+        ),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 24),
+          child: Text(
+            'Tap an alert to mark it as read. Clearing removes only this inbox.',
+            style: TextStyle(color: Colors.black54),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Expanded(
+          child: _loadError != null
+              ? Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('Notifications could not be loaded.'),
+                      TextButton(
+                        onPressed: () => unawaited(_loadAlerts()),
+                        child: const Text('Retry'),
+                      ),
+                    ],
+                  ),
+                )
+              : alerts == null
+              ? const Center(child: CircularProgressIndicator())
+              : alerts.isEmpty
+              ? const Center(child: Text('No critical pH alerts yet.'))
+              : ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: alerts.length,
+                  itemBuilder: (context, index) {
+                    final alert = alerts[index];
+                    return Card(
+                      color: alert.isRead
+                          ? Colors.white
+                          : const Color(0xFFFFF1F0),
+                      child: ListTile(
+                        leading: Icon(
+                          Icons.warning_amber_rounded,
+                          color: alert.isRead ? Colors.grey : Colors.red,
+                        ),
+                        title: Text(
+                          'Critical pH alert · ${alert.ph.toStringAsFixed(2)}',
+                          style: TextStyle(
+                            fontWeight: alert.isRead
+                                ? FontWeight.normal
+                                : FontWeight.bold,
+                          ),
+                        ),
+                        subtitle: Text(_formatDate(alert.createdAt)),
+                        trailing: alert.isRead
+                            ? null
+                            : const Icon(
+                                Icons.circle,
+                                size: 10,
+                                color: Colors.red,
+                              ),
+                        onTap: () => _markRead(alert),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+}
+
+class WeatherHomeCard extends StatefulWidget {
+  const WeatherHomeCard({super.key});
+
+  @override
+  State<WeatherHomeCard> createState() => _WeatherHomeCardState();
+}
+
+class _WeatherHomeCardState extends State<WeatherHomeCard> {
+  WeatherConditions? _conditions;
+  String? _locationName;
+  Object? _error;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_refresh());
+  }
+
+  Future<void> _refresh() async {
+    if (!mounted) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final location = await DatabaseHelper.instance.getWeatherLocation();
+      if (!mounted) return;
+      if (location == null) {
+        setState(() {
+          _locationName = null;
+          _conditions = null;
+          _loading = false;
+        });
+        return;
+      }
+      setState(() => _locationName = location.name);
+      final conditions = await WeatherService.fetch(location);
+      if (!mounted) return;
+      setState(() {
+        _conditions = conditions;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = error;
+        _loading = false;
+      });
+    }
+  }
+
+  void _openDetails() {
+    Navigator.push<void>(
+      context,
+      MaterialPageRoute(builder: (_) => const WeatherDetailScreen()),
+    ).then((_) => _refresh());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final conditions = _conditions;
+    final temperature = conditions?.temperature;
+    return Card(
+      margin: EdgeInsets.zero,
+      clipBehavior: Clip.antiAlias,
+      color: const Color(0xFF123F3B),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: InkWell(
+        onTap: _openDetails,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+          child: Row(
+            children: [
+              Icon(
+                weatherIcon(conditions?.weatherCode),
+                size: 36,
+                color: const Color(0xFF7DE6D2),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _locationName ?? 'Local weather',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      _loading
+                          ? 'Loading weather…'
+                          : _error != null
+                          ? 'Weather unavailable · tap to retry'
+                          : temperature == null
+                          ? 'Choose a location to get weather'
+                          : weatherDescription(conditions?.weatherCode),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Color(0xFFB7D7D1),
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (_loading)
+                const SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Color(0xFF7DE6D2),
+                  ),
+                )
+              else if (temperature != null)
+                Text(
+                  '${temperature.toStringAsFixed(0)}°',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 26,
+                    fontWeight: FontWeight.bold,
+                  ),
+                )
+              else
+                const Icon(Icons.chevron_right, color: Colors.white70),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class WeatherDetailScreen extends StatefulWidget {
+  const WeatherDetailScreen({super.key});
+
+  @override
+  State<WeatherDetailScreen> createState() => _WeatherDetailScreenState();
+}
+
+class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
+  final TextEditingController _searchController = TextEditingController();
+  WeatherLocation? _location;
+  WeatherConditions? _conditions;
+  List<WeatherLocation> _matches = [];
+  Object? _error;
+  bool _loading = false;
+  bool _searching = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadSavedLocation());
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadSavedLocation() async {
+    try {
+      final saved = await DatabaseHelper.instance.getWeatherLocation();
+      if (!mounted || saved == null) return;
+      _searchController.text = saved.name;
+      setState(() => _location = saved);
+      await _loadWeather(saved);
+    } catch (error) {
+      if (mounted) setState(() => _error = error);
+    }
+  }
+
+  Future<void> _searchLocations() async {
+    setState(() {
+      _searching = true;
+      _error = null;
+      _matches = [];
+    });
+    try {
+      final matches = await WeatherService.searchLocations(
+        _searchController.text,
+      );
+      if (!mounted) return;
+      setState(() => _matches = matches);
+      if (matches.isEmpty) setState(() => _error = 'No matching places found.');
+    } catch (error) {
+      if (mounted) setState(() => _error = error);
+    } finally {
+      if (mounted) setState(() => _searching = false);
+    }
+  }
+
+  Future<void> _selectLocation(WeatherLocation location) async {
+    setState(() {
+      _location = location;
+      _matches = [];
+      _searchController.text = location.name;
+    });
+    try {
+      await DatabaseHelper.instance.saveWeatherLocation(location);
+      await _loadWeather(location);
+    } catch (error) {
+      if (mounted) setState(() => _error = error);
+    }
+  }
+
+  Future<void> _loadWeather(WeatherLocation location) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final conditions = await WeatherService.fetch(location);
+      if (!mounted) return;
+      setState(() {
+        _conditions = conditions;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = error;
+        _loading = false;
+      });
+    }
+  }
+
+  String _dayName(DateTime date) {
+    const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    return days[date.weekday - 1];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final conditions = _conditions;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Weather'),
+        actions: [
+          IconButton(
+            tooltip: 'Refresh weather',
+            onPressed: _location == null || _loading
+                ? null
+                : () => _loadWeather(_location!),
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(20),
+        children: [
+          const Text(
+            'Choose a location',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'Search for and select a city. Weather is provided by Open-Meteo; Hydrodeck does not access your device location.',
+            style: TextStyle(color: Colors.black54),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _searchController,
+                  textInputAction: TextInputAction.search,
+                  onSubmitted: (_) => _searchLocations(),
+                  decoration: const InputDecoration(
+                    labelText: 'City or place',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filled(
+                tooltip: 'Search locations',
+                onPressed: _searching ? null : _searchLocations,
+                icon: _searching
+                    ? const SizedBox(
+                        height: 20,
+                        width: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.search),
+              ),
+            ],
+          ),
+          if (_matches.isNotEmpty)
+            ..._matches.map(
+              (match) => ListTile(
+                leading: const Icon(Icons.location_on_outlined),
+                title: Text(match.name),
+                onTap: () => _selectLocation(match),
+              ),
+            ),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Text(
+                'Weather unavailable: $_error',
+                style: const TextStyle(color: Colors.red),
+              ),
+            ),
+          if (_loading)
+            const Padding(
+              padding: EdgeInsets.all(36),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (conditions != null) ...[
+            const SizedBox(height: 24),
+            Container(
+              padding: const EdgeInsets.all(22),
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [Color(0xFF0D3532), Color(0xFF176D5E)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    conditions.location.name,
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Icon(
+                        weatherIcon(conditions.weatherCode),
+                        color: const Color(0xFF7DE6D2),
+                        size: 54,
+                      ),
+                      const SizedBox(width: 18),
+                      Text(
+                        conditions.temperature == null
+                            ? '—'
+                            : '${conditions.temperature!.toStringAsFixed(0)}°',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 48,
+                          fontWeight: FontWeight.w300,
+                        ),
+                      ),
+                    ],
+                  ),
+                  Text(
+                    weatherDescription(conditions.weatherCode),
+                    style: const TextStyle(color: Colors.white, fontSize: 18),
+                  ),
+                  const SizedBox(height: 18),
+                  Wrap(
+                    spacing: 20,
+                    runSpacing: 12,
+                    children: [
+                      _WeatherMetric(
+                        label: 'Feels like',
+                        value: conditions.feelsLike == null
+                            ? '—'
+                            : '${conditions.feelsLike!.toStringAsFixed(0)}°',
+                      ),
+                      _WeatherMetric(
+                        label: 'Humidity',
+                        value: conditions.humidity == null
+                            ? '—'
+                            : '${conditions.humidity}%',
+                      ),
+                      _WeatherMetric(
+                        label: 'Wind',
+                        value: conditions.windSpeed == null
+                            ? '—'
+                            : '${conditions.windSpeed!.toStringAsFixed(0)} km/h',
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            if (conditions.forecast.isNotEmpty) ...[
+              const SizedBox(height: 24),
+              const Text(
+                '5-day forecast',
+                style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              ...conditions.forecast.map(
+                (day) => ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(
+                    weatherIcon(day.weatherCode),
+                    color: const Color(0xFF168AAD),
+                  ),
+                  title: Text(_dayName(day.date)),
+                  subtitle: Text(
+                    '${weatherDescription(day.weatherCode)}'
+                    '${day.precipitationProbability == null ? '' : ' · ${day.precipitationProbability}% rain'}',
+                  ),
+                  trailing: Text(
+                    '${day.minimumTemperature?.toStringAsFixed(0) ?? '—'}° / '
+                    '${day.maximumTemperature?.toStringAsFixed(0) ?? '—'}°',
+                  ),
+                ),
+              ),
+            ],
+          ] else if (_location == null && _error == null)
+            const Padding(
+              padding: EdgeInsets.only(top: 24),
+              child: Text('Select a location to see current weather.'),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WeatherMetric extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _WeatherMetric({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+      Text(
+        value,
+        style: const TextStyle(
+          color: Colors.white,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    ],
+  );
+}
+
+IconData weatherIcon(int? code) => switch (code) {
+  0 || 1 => Icons.wb_sunny_outlined,
+  2 || 3 => Icons.cloud_outlined,
+  45 || 48 => Icons.foggy,
+  51 || 53 || 55 || 56 || 57 => Icons.grain,
+  61 || 63 || 65 || 66 || 67 || 80 || 81 || 82 => Icons.umbrella_outlined,
+  71 || 73 || 75 || 77 || 85 || 86 => Icons.ac_unit,
+  95 || 96 || 99 => Icons.thunderstorm_outlined,
+  _ => Icons.cloud_outlined,
+};
 
 class ReservoirReading {
   final String level;
@@ -1354,9 +2159,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         primaryResult['data'] as Map,
       );
       currentPhReading = readValidBed2Ph(statusData);
-      final normalized = normalizeStatusPayload(
-        statusData,
-      );
+      final normalized = normalizeStatusPayload(statusData);
       final bed1 = GrowBedReading.fromMap(
         normalized['bed1'] as Map<String, dynamic>,
       );
@@ -1420,9 +2223,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
           final host = res['host'] as String;
           final statusData = Map<String, dynamic>.from(res['data'] as Map);
           currentPhReading = readValidBed2Ph(statusData);
-          final normalized = normalizeStatusPayload(
-            statusData,
-          );
+          final normalized = normalizeStatusPayload(statusData);
           final bed1 = GrowBedReading.fromMap(
             normalized['bed1'] as Map<String, dynamic>,
           );
@@ -1516,13 +2317,21 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
     final notificationTime = DateTime.now();
     if (criticalPhEpisode.shouldNotify(
-      ph: currentPhReading,
-      minimum: minPhThreshold,
-      maximum: maxPhThreshold,
-      now: notificationTime,
-    ) &&
+          ph: currentPhReading,
+          minimum: minPhThreshold,
+          maximum: maxPhThreshold,
+          now: notificationTime,
+        ) &&
         isAppClosed) {
-      unawaited(NotificationHelper.showPhAlertNotification(currentPhReading!));
+      final alertId = criticalPhEpisode.notificationId;
+      if (alertId != null) {
+        unawaited(
+          NotificationHelper.showPhAlertNotification(
+            currentPhReading!,
+            alertId: alertId,
+          ),
+        );
+      }
       criticalPhEpisode.markNotified();
     }
 
@@ -1674,7 +2483,7 @@ void main() async {
     secureType: SecureType.tls,
     host: 'smtp.gmail.com',
     username: 'hydrodecknt@gmail.com',
-    password: 'bctm hpcn krjt ffgy',
+    password: 'psiq auzg tweh klhj',
   );
   if (_supportsBackgroundService) await NotificationHelper.init();
   runApp(const HydrodeckApp());
@@ -1739,15 +2548,21 @@ class AuthGatekeeper extends StatefulWidget {
   State<AuthGatekeeper> createState() => _AuthGatekeeperState();
 }
 
-class _AuthGatekeeperState extends State<AuthGatekeeper> {
+class _AuthGatekeeperState extends State<AuthGatekeeper>
+    with SingleTickerProviderStateMixin {
   bool _loading = true;
   bool _showSignup = true;
   User? _user;
   StreamSubscription<User?>? _authSubscription;
+  late final AnimationController _transition;
 
   @override
   void initState() {
     super.initState();
+    _transition = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    );
     _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
       final lastSignIn = user?.metadata.lastSignInTime;
       final sessionValid =
@@ -1762,6 +2577,11 @@ class _AuthGatekeeperState extends State<AuthGatekeeper> {
           _user = sessionValid ? user : null;
           _loading = false;
         });
+        if (MediaQuery.maybeOf(context)?.disableAnimations == true) {
+          _transition.value = 1;
+        } else {
+          unawaited(_transition.forward());
+        }
       }
     });
   }
@@ -1769,6 +2589,7 @@ class _AuthGatekeeperState extends State<AuthGatekeeper> {
   @override
   void dispose() {
     _authSubscription?.cancel();
+    _transition.dispose();
     super.dispose();
   }
 
@@ -1778,24 +2599,163 @@ class _AuthGatekeeperState extends State<AuthGatekeeper> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) {
-      return const Scaffold(
-        body: Center(
-          child: CircularProgressIndicator(color: Color(0xFF2DC867)),
-        ),
-      );
-    }
+    if (_loading) return const _HydrodeckSplash();
     if (_user != null) return const MainGatekeeper();
-    return _showSignup
-        ? SignupScreen(
-            onLogin: () => setState(() => _showSignup = false),
-            onAuthenticated: _authenticated,
-          )
-        : LoginScreen(
-            onSignup: () => setState(() => _showSignup = true),
-            onAuthenticated: _authenticated,
-          );
+    return _AuthEntryTransition(
+      animation: _transition,
+      child: _showSignup
+          ? SignupScreen(
+              onLogin: () => setState(() => _showSignup = false),
+              onAuthenticated: _authenticated,
+            )
+          : LoginScreen(
+              onSignup: () => setState(() => _showSignup = true),
+              onAuthenticated: _authenticated,
+            ),
+    );
   }
+}
+
+class _HydrodeckSplash extends StatelessWidget {
+  const _HydrodeckSplash();
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: const Color(0xFF073B34),
+    body: Stack(
+      fit: StackFit.expand,
+      children: [
+        const DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [Color(0xFF073B34), Color(0xFF0B554B)],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+          ),
+        ),
+        Positioned(top: -80, right: -40, child: _splashCloud(240, 150)),
+        Positioned(bottom: -70, left: -60, child: _splashCloud(260, 160)),
+        const Positioned(
+          top: 88,
+          left: 44,
+          child: Icon(Icons.water_drop, color: Color(0x557DE6D2), size: 23),
+        ),
+        const Positioned(
+          bottom: 150,
+          right: 42,
+          child: Icon(Icons.water_drop, color: Color(0x557DE6D2), size: 18),
+        ),
+        Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Image.asset('hydrodeck_logo.png', width: 140, height: 140),
+              const SizedBox(height: 12),
+              const Text(
+                'HYDRODECK',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 4,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'GROW WITH CONFIDENCE',
+                style: TextStyle(
+                  color: Color(0xFFB7D7D1),
+                  fontSize: 11,
+                  letterSpacing: 2,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+
+  static Widget _splashCloud(double width, double height) => Container(
+    width: width,
+    height: height,
+    decoration: BoxDecoration(
+      color: const Color(0x223DB5A1),
+      borderRadius: BorderRadius.circular(height),
+    ),
+  );
+}
+
+class _AuthEntryTransition extends StatelessWidget {
+  final Animation<double> animation;
+  final Widget child;
+
+  const _AuthEntryTransition({required this.animation, required this.child});
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: animation,
+    child: child,
+    builder: (context, child) {
+      final progress = Curves.easeInOutCubic.transform(animation.value);
+      final size = MediaQuery.sizeOf(context);
+      return Stack(
+        children: [
+          Positioned.fill(
+            child: Transform.translate(
+              offset: Offset(0, size.height * 0.12 * (1 - progress)),
+              child: child,
+            ),
+          ),
+          if (progress < 1)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: ColoredBox(
+                  color: Color.fromRGBO(7, 59, 52, 1 - progress),
+                ),
+              ),
+            ),
+          if (progress < 1)
+            Positioned(
+              top: 14 + (size.height - 220) * 0.5 * (1 - progress),
+              left: 0,
+              right: 0,
+              child: IgnorePointer(
+                child: Opacity(
+                  opacity: 1 - progress,
+                  child: Center(
+                    child: Transform.scale(
+                      scale: 1 - 0.5 * progress,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Image.asset(
+                            'hydrodeck_logo.png',
+                            width: 140,
+                            height: 140,
+                          ),
+                          const SizedBox(height: 10),
+                          const Text(
+                            'HYDRODECK',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 22,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 4,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      );
+    },
+  );
 }
 
 class SignupScreen extends StatefulWidget {
@@ -2402,7 +3362,8 @@ class EmailOtpCodeService implements OtpCodeService {
 
   @override
   bool verifyCode({required String email, required String code}) =>
-      _activeEmail == email && !isCodeExpired(email) &&
+      _activeEmail == email &&
+      !isCodeExpired(email) &&
       EmailOTP.verifyOTP(otp: code);
 
   @override
@@ -2451,8 +3412,7 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
   DateTime? _resendAvailableAt;
   Timer? _resendCountdownTimer;
 
-  OtpCodeService get _otpService =>
-      widget.otpService ?? _emailOtpCodeService;
+  OtpCodeService get _otpService => widget.otpService ?? _emailOtpCodeService;
   DateTime get _now => widget.now?.call() ?? DateTime.now();
 
   @override
@@ -2470,8 +3430,7 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
   }
 
   bool get _canResend =>
-      _resendAvailableAt == null ||
-      !_now.isBefore(_resendAvailableAt!);
+      _resendAvailableAt == null || !_now.isBefore(_resendAvailableAt!);
 
   String get _resendLabel {
     if (_canResend) return 'Send another code';
@@ -2484,9 +3443,7 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
 
   void _startResendCountdown() {
     _resendCountdownTimer?.cancel();
-    _resendCountdownTimer = Timer.periodic(const Duration(seconds: 1), (
-      timer,
-    ) {
+    _resendCountdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (!mounted) {
         timer.cancel();
         return;
@@ -2519,9 +3476,9 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
         _resendAvailableAt = _now.add(const Duration(minutes: 3));
       });
       _startResendCountdown();
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('A new OTP has been sent.')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('A new OTP has been sent.')));
     } on Exception catch (error) {
       if (mounted) {
         setState(() {
@@ -2546,10 +3503,7 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
     });
 
     try {
-      final isValid = _otpService.verifyCode(
-        email: widget.email,
-        code: otp,
-      );
+      final isValid = _otpService.verifyCode(email: widget.email, code: otp);
       if (!isValid) {
         setState(
           () => _error = _otpService.isCodeExpired(widget.email)
@@ -2829,6 +3783,8 @@ Widget _field(
       counterText: maxLength == null ? null : '',
       errorText: errorText,
       prefixIcon: Icon(icon),
+      filled: true,
+      fillColor: Colors.white,
       border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
     ),
   );
@@ -2872,6 +3828,8 @@ class _PasswordVisibilityFieldState extends State<_PasswordVisibilityField> {
       hintText: widget.hintText,
       errorText: widget.errorText,
       prefixIcon: Icon(widget.icon),
+      filled: true,
+      fillColor: Colors.white,
       border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
       suffixIcon: IconButton(
         tooltip: _obscure ? 'Show password' : 'Hide password',
@@ -2905,73 +3863,139 @@ class _AuthFormScaffold extends StatelessWidget {
   });
   @override
   Widget build(BuildContext context) => Scaffold(
-    body: SafeArea(
-      child: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 460),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text(
-                  'HYDRODECK',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: 28,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 2,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  subtitle,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.grey),
-                ),
-                const SizedBox(height: 28),
-                Text(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 18),
-                ...fields.expand(
-                  (field) => [field, const SizedBox(height: 12)],
-                ),
-                if (error != null)
-                  Text(error!, style: const TextStyle(color: Colors.red)),
-                if (beforeAction != null) ...[
-                  const SizedBox(height: 8),
-                  beforeAction!,
-                ],
-                const SizedBox(height: 12),
-                ElevatedButton(
-                  onPressed: busy ? null : onAction,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2DC867),
-                    foregroundColor: Colors.white,
-                    minimumSize: const Size.fromHeight(52),
-                  ),
-                  child: busy
-                      ? const SizedBox(
-                          height: 22,
-                          width: 22,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
+    backgroundColor: const Color(0xFF073B34),
+    body: Stack(
+      children: [
+        Positioned(
+          top: -90,
+          right: -85,
+          child: _HydrodeckSplash._splashCloud(240, 150),
+        ),
+        SafeArea(
+          child: LayoutBuilder(
+            builder: (context, _) => SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 460),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Column(
+                        children: [
+                          Image.asset(
+                            'hydrodeck_logo.png',
+                            width: 68,
+                            height: 68,
                           ),
-                        )
-                      : Text(actionLabel),
+                          const SizedBox(height: 2),
+                          const Text(
+                            'HYDRODECK',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 17,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 2.5,
+                            ),
+                          ),
+                          const SizedBox(height: 5),
+                          Text(
+                            subtitle,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Color(0xFFB7D7D1),
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 20),
+                      Container(
+                        padding: const EdgeInsets.all(22),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF0B302D),
+                          borderRadius: BorderRadius.circular(28),
+                          border: Border.all(color: const Color(0x337DE6D2)),
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Color(0x44000000),
+                              blurRadius: 24,
+                              offset: Offset(0, 10),
+                            ),
+                          ],
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Text(
+                              title,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 22,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 18),
+                            ...fields.expand(
+                              (field) => [field, const SizedBox(height: 12)],
+                            ),
+                            if (error != null)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 8),
+                                child: Text(
+                                  error!,
+                                  style: const TextStyle(
+                                    color: Colors.redAccent,
+                                  ),
+                                ),
+                              ),
+                            if (beforeAction != null) ...[
+                              const SizedBox(height: 8),
+                              DefaultTextStyle(
+                                style: const TextStyle(color: Colors.white70),
+                                child: beforeAction!,
+                              ),
+                            ],
+                            const SizedBox(height: 12),
+                            ElevatedButton(
+                              onPressed: busy ? null : onAction,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF2DC867),
+                                foregroundColor: Colors.white,
+                                minimumSize: const Size.fromHeight(52),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                              ),
+                              child: busy
+                                  ? const SizedBox(
+                                      height: 22,
+                                      width: 22,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white,
+                                      ),
+                                    )
+                                  : Text(actionLabel),
+                            ),
+                            Center(
+                              child: DefaultTextStyle(
+                                style: const TextStyle(color: Colors.white70),
+                                child: footer,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-                Center(child: footer),
-              ],
+              ),
             ),
           ),
         ),
-      ),
+      ],
     ),
   );
 }
@@ -3403,6 +4427,27 @@ class HistoricalData {
     'bed2': bed2?.toMap(),
     'reservoir': reservoir.toMap(),
   };
+}
+
+class PhAlert {
+  final String alertId;
+  final double ph;
+  final DateTime createdAt;
+  final bool isRead;
+
+  const PhAlert({
+    required this.alertId,
+    required this.ph,
+    required this.createdAt,
+    required this.isRead,
+  });
+
+  factory PhAlert.fromRow(Map<String, Object?> row) => PhAlert(
+    alertId: row['alertId'] as String,
+    ph: (row['pH'] as num).toDouble(),
+    createdAt: DateTime.parse(row['createdAt'] as String).toLocal(),
+    isRead: row['isRead'] == 1,
+  );
 }
 
 class PlantingRecord {
@@ -4625,8 +5670,7 @@ class MainGatekeeper extends StatefulWidget {
 class _MainGatekeeperState extends State<MainGatekeeper> {
   bool _isLoading = true;
 
-  final PlantingNavigationState _plantingNavigation =
-      PlantingNavigationState();
+  final PlantingNavigationState _plantingNavigation = PlantingNavigationState();
   ActivePlantingSession? _activePlantingSession;
   List<PlantingRecord> _pastPlantingRuns = [];
 
@@ -5144,6 +6188,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   static const String _esp32HotspotPassword = 'hydrodeck';
 
   int _currentIndex = 0;
+  int _unreadPhAlertCount = 0;
+  Timer? _unreadAlertTimer;
 
   late String _esp32Ip;
 
@@ -5220,6 +6266,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     _wifiSsidController = TextEditingController();
     _wifiPasswordController = TextEditingController();
     _loadStoredLogsAndSettings();
+    unawaited(_refreshUnreadPhAlertCount());
+    _unreadAlertTimer = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => unawaited(_refreshUnreadPhAlertCount()),
+    );
     unawaited(_reconcileHistory());
     unawaited(_subscribeToCloudLogs());
     _subscribeToFirebaseConnection();
@@ -5276,9 +6327,21 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     }
   }
 
+  Future<void> _refreshUnreadPhAlertCount() async {
+    try {
+      final unreadCount = await DatabaseHelper.instance.getUnreadPhAlertCount();
+      if (mounted && unreadCount != _unreadPhAlertCount) {
+        setState(() => _unreadPhAlertCount = unreadCount);
+      }
+    } catch (error) {
+      debugPrint('Could not refresh notification badge: $error');
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _unreadAlertTimer?.cancel();
     _telemetrySub?.cancel();
     _snapshotSub?.cancel();
     _firebaseSub?.cancel();
@@ -5290,6 +6353,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     for (final timer in _commandTimeouts.values) {
       timer.cancel();
     }
+
     for (final timer in _actuatorTelemetryTimeouts.values) {
       timer.cancel();
     }
@@ -6077,10 +7141,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               );
             }
             if (!mounted || incoming.isEmpty) return;
+            final storedLogs = await DatabaseHelper.instance.getLogsForBatch(
+              batchNumber,
+            );
+            if (!mounted) return;
             setState(() {
               _historyLogs =
                   mergeHistoryByIdentity([
-                      ...incoming,
+                      ...storedLogs,
                       ..._historyLogs,
                     ], historyLogIdentity).values.toList()
                     ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
@@ -6812,7 +7880,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
                 const SizedBox(height: 4),
-                Text(message, style: const TextStyle(fontSize: 12, height: 1.3)),
+                Text(
+                  message,
+                  style: const TextStyle(fontSize: 12, height: 1.3),
+                ),
                 if (!_hasFreshLocalTelemetry)
                   TextButton.icon(
                     onPressed: _isHotspotConnecting
@@ -7117,8 +8188,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         var disconnected = false;
         try {
           await WiFiForIoTPlugin.forceWifiUsage(false);
-          disconnected = await WiFiForIoTPlugin.disconnect()
-              .timeout(const Duration(seconds: 5));
+          disconnected = await WiFiForIoTPlugin.disconnect().timeout(
+            const Duration(seconds: 5),
+          );
         } catch (_) {
           disconnected = false;
         }
@@ -7164,6 +8236,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       'received',
       'scanning',
       'testing',
+      'rain_pending',
+      'rain_unconfirmed',
+      'rain_rejected',
       'connected',
       'network_unavailable',
       'authentication_failed',
@@ -7335,9 +8410,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 'Nutrient and pH buttons run dosing pumps. Only one chemical dose runs at a time. The pH + or − button is enabled only when the reading and target limits call for that adjustment.',
               ),
               SizedBox(height: 8),
-              Text(
-                'Use the Grow Light button to switch the light on or off.',
-              ),
+              Text('Use the Grow Light button to switch the light on or off.'),
               SizedBox(height: 14),
               Text(
                 'Why a control may be locked',
@@ -7373,10 +8446,18 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       _buildControlScreen(),
       _buildDataScreen(),
       _buildSettingsScreen(),
+      NotificationsScreen(
+        onUnreadCountChanged: (unreadCount) {
+          if (mounted && unreadCount != _unreadPhAlertCount) {
+            setState(() => _unreadPhAlertCount = unreadCount);
+          }
+        },
+      ),
     ];
 
     return Scaffold(
       appBar: AppBar(
+        title: _currentIndex == 4 ? const Text('Notifications') : null,
         backgroundColor: Colors.white,
         foregroundColor: Colors.black,
         elevation: 0,
@@ -7415,25 +8496,48 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           fontSize: 11,
         ),
         unselectedLabelStyle: const TextStyle(fontSize: 11),
-        items: const [
-          BottomNavigationBarItem(icon: Icon(Icons.home), label: 'HOME'),
+        items: [
+          const BottomNavigationBarItem(icon: Icon(Icons.home), label: 'HOME'),
           BottomNavigationBarItem(
-            icon: Icon(Icons.grid_view),
+            icon: const Icon(Icons.grid_view),
             label: 'CONTROLS',
           ),
           BottomNavigationBarItem(
-            icon: Icon(Icons.bar_chart_outlined),
+            icon: const Icon(Icons.bar_chart_outlined),
             label: 'DATA',
           ),
           BottomNavigationBarItem(
-            icon: Icon(Icons.settings_outlined),
+            icon: const Icon(Icons.settings_outlined),
             label: 'SETTINGS',
+          ),
+          BottomNavigationBarItem(
+            icon: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                const Icon(Icons.notifications_outlined),
+                if (_unreadPhAlertCount > 0)
+                  Positioned(
+                    top: -2,
+                    right: -3,
+                    child: Container(
+                      width: 9,
+                      height: 9,
+                      decoration: const BoxDecoration(
+                        color: Colors.red,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            label: 'ALERTS',
           ),
         ],
         onTap: (index) {
           setState(() {
             _currentIndex = index;
           });
+          if (index == 4) unawaited(_refreshUnreadPhAlertCount());
         },
       ),
     );
@@ -7512,6 +8616,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               ),
             ],
           ),
+          const SizedBox(height: 20),
+
+          const WeatherHomeCard(),
           const SizedBox(height: 20),
 
           hasPhWarning
@@ -8175,44 +9282,121 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                       }
 
                       final log = item as HistoricalData;
-                      return Container(
-                        margin: const EdgeInsets.only(bottom: 12),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(16),
+                      return Dismissible(
+                        key: ValueKey(log.identity),
+                        direction: DismissDirection.endToStart,
+                        secondaryBackground: Container(
+                          margin: const EdgeInsets.only(bottom: 12),
+                          padding: const EdgeInsets.only(right: 20),
+                          decoration: BoxDecoration(
+                            color: Colors.red.shade700,
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          alignment: Alignment.centerRight,
+                          child: const Icon(
+                            Icons.delete_outline,
+                            color: Colors.white,
+                          ),
                         ),
-                        child: ListTile(
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 6,
-                          ),
-                          title: Text(
-                            _formatDateTimeToReadable(log.timestamp),
-                            style: const TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13,
-                              color: Colors.black87,
-                            ),
-                          ),
-                          trailing: const Icon(
-                            Icons.chevron_right,
-                            color: Colors.grey,
-                          ),
-                          onTap: () {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (context) => SnapshotDetailScreen(
-                                  data: log,
-                                  formattedTime: _formatDateTimeToReadable(
-                                    log.timestamp,
-                                  ),
-                                  minPh: _minPhThreshold,
-                                  maxPh: _maxPhThreshold,
-                                ),
+                        confirmDismiss: (_) async {
+                          final messenger = ScaffoldMessenger.of(context);
+                          final confirmed = await showDialog<bool>(
+                            context: context,
+                            builder: (dialogContext) => AlertDialog(
+                              title: const Text('Delete local log?'),
+                              content: const Text(
+                                'This removes the log from this device only. Any cloud-synced copy is not deleted.',
                               ),
+                              actions: [
+                                TextButton(
+                                  onPressed: () =>
+                                      Navigator.pop(dialogContext, false),
+                                  child: const Text('Cancel'),
+                                ),
+                                TextButton(
+                                  onPressed: () =>
+                                      Navigator.pop(dialogContext, true),
+                                  child: const Text(
+                                    'Delete from device',
+                                    style: TextStyle(color: Colors.red),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                          if (confirmed != true) return false;
+                          try {
+                            final deleted = await DatabaseHelper.instance
+                                .deleteLocalLog(log.identity);
+                            if (!deleted && mounted) {
+                              messenger.showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    'This local log no longer exists.',
+                                  ),
+                                ),
+                              );
+                            }
+                            return deleted;
+                          } catch (error) {
+                            if (mounted) {
+                              messenger.showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'Could not delete the local log: $error',
+                                  ),
+                                ),
+                              );
+                            }
+                            return false;
+                          }
+                        },
+                        onDismissed: (_) {
+                          setState(() {
+                            _historyLogs.removeWhere(
+                              (item) => item.identity == log.identity,
                             );
-                          },
+                          });
+                        },
+                        child: Container(
+                          margin: const EdgeInsets.only(bottom: 12),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: ListTile(
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 6,
+                            ),
+                            title: Text(
+                              _formatDateTimeToReadable(log.timestamp),
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                                color: Colors.black87,
+                              ),
+                            ),
+                            trailing: const Icon(
+                              Icons.chevron_right,
+                              color: Colors.grey,
+                            ),
+                            onTap: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (context) => SnapshotDetailScreen(
+                                    data: log,
+                                    formattedTime: _formatDateTimeToReadable(
+                                      log.timestamp,
+                                    ),
+                                    minPh: _minPhThreshold,
+                                    maxPh: _maxPhThreshold,
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
                         ),
                       );
                     },

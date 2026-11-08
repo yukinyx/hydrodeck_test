@@ -54,6 +54,8 @@ const uint8_t MSG_MAIN_BEACON = 2;
 const uint8_t MSG_RAIN_STATUS = 3;
 const uint8_t MSG_PUMP_COMMAND = 4;
 const uint8_t MSG_COMMAND_ACK = 5;
+const uint8_t MSG_WIFI_PROVISION = 6;
+const uint8_t MSG_WIFI_PROVISION_ACK = 7;
 const uint8_t PUMP1_ID = 1;
 const uint8_t PUMP2_ID = 2;
 const uint8_t ACK_ACCEPTED = 1;
@@ -66,7 +68,14 @@ const uint8_t FAULT_RESERVOIR_LOW = 3;
 const uint8_t FAULT_MAX_RUN = 4;
 const uint8_t FAULT_STALE_COMMAND = 5;
 const uint8_t FAULT_INVALID_COMMAND = 6;
-const size_t ESPNOW_PACKET_MAX = 64;
+const uint8_t WIFI_PROVISION_ACCEPTED = 1;
+const uint8_t WIFI_PROVISION_REJECTED = 2;
+const size_t ESPNOW_PACKET_MAX = 128;
+const unsigned long RAIN_PROVISION_RETRY_MS = 500UL;
+const unsigned long RAIN_PROVISION_TIMEOUT_MS = 15000UL;
+const unsigned long RAIN_PROVISION_RESYNC_MS = 30000UL;
+const unsigned long RAIN_PROVISION_RETRY_WINDOW_MS = 5000UL;
+const uint8_t RAIN_PROVISION_MAX_ATTEMPTS = 30;
 const uint8_t ESPNOW_BROADCAST_MAC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 #pragma pack(push, 1)
@@ -122,11 +131,34 @@ struct CommandAckPacket {
   uint16_t crc;
   uint8_t authTag[8];
 };
+
+struct WifiProvisionPacket {
+  PacketHeader header;
+  uint32_t requestId;
+  uint8_t ssidLength;
+  uint8_t passwordLength;
+  char ssid[32];
+  char password[63];
+  uint16_t crc;
+  uint8_t authTag[8];
+};
+
+struct WifiProvisionAckPacket {
+  PacketHeader header;
+  uint32_t requestId;
+  uint32_t rainBootId;
+  uint8_t status;
+  uint16_t crc;
+  uint8_t authTag[8];
+};
 #pragma pack(pop)
 
 static_assert(sizeof(RainStatusPacket) <= ESP_NOW_MAX_DATA_LEN, "RAIN status packet exceeds ESP-NOW v1 limit");
 static_assert(sizeof(PumpCommandPacket) <= ESP_NOW_MAX_DATA_LEN, "Pump command packet exceeds ESP-NOW v1 limit");
 static_assert(sizeof(CommandAckPacket) <= ESP_NOW_MAX_DATA_LEN, "Command ACK exceeds ESP-NOW v1 limit");
+static_assert(sizeof(WifiProvisionPacket) <= ESP_NOW_MAX_DATA_LEN, "Wi-Fi provisioning packet exceeds ESP-NOW v1 limit");
+static_assert(sizeof(WifiProvisionAckPacket) <= ESP_NOW_MAX_DATA_LEN, "Wi-Fi provisioning ACK exceeds ESP-NOW v1 limit");
+static_assert(sizeof(WifiProvisionPacket) <= ESPNOW_PACKET_MAX, "Wi-Fi provisioning packet exceeds receive queue capacity");
 
 struct ReceivedPacket {
   uint8_t mac[6];
@@ -216,6 +248,14 @@ String provisioningRequestId;
 bool provisioningScanPending = false;
 bool provisioningScanStarted = false;
 bool provisioningNetworkFound = false;
+bool provisioningMainResultComplete = false;
+bool provisioningRainAcked = false;
+bool provisioningRainRejected = false;
+bool provisioningRainUnconfirmed = false;
+uint32_t provisioningEspNowRequestId = 0;
+uint8_t provisioningRainAttempts = 0;
+unsigned long provisioningRainStartedAt = 0;
+unsigned long provisioningRainLastSentAt = 0;
 const char* remoteActuatorNames[] = {
   "waterPump1", "phUp1", "phDown1", "nutrient1",
   "waterPump2", "phUp2", "phDown2", "nutrient2", "growLight"
@@ -354,6 +394,8 @@ uint32_t lastRainBootId = 0;
 uint16_t espNowSequence = 0;
 uint16_t lastRainSequence = 0;
 bool lastRainSequenceKnown = false;
+uint16_t lastRainProvisionAckSequence = 0;
+bool lastRainProvisionAckSequenceKnown = false;
 unsigned long lastRainCommandSentAt[2] = {};
 unsigned long lastBeaconSentAt = 0;
 unsigned long lastEspNowRetryAt = 0;
@@ -374,8 +416,8 @@ const unsigned long phDelayThreshold = 60000UL; // 1 minute in milliseconds
 const unsigned long phAutoRetryLogInterval = 5000UL;
 const float phControlHysteresis = 0.15f;
 
-const unsigned long BED1_PUMP_DURATION_MS = 3000UL;
-const unsigned long BED2_PUMP_DURATION_MS = 5000UL;
+const unsigned long BED1_PUMP_DURATION_MS = 2000UL;
+const unsigned long BED2_PUMP_DURATION_MS = 2000UL;
 struct PumpRunState {
   bool active = false;
   bool hasDeadline = false;
@@ -1106,6 +1148,8 @@ void serviceRainNodeHealth(unsigned long now) {
   }
   if (now - lastRainSeenAt <= RAIN_NODE_TIMEOUT_MS) return;
   rainNodeOnline = false;
+  reservoirFullWet = false;
+  reservoirLevel = "not_full";
   Serial.println("RAIN node offline");
   for (const int pumpNum : {1, 5}) {
     PumpRunState& run = pumpRuns[pumpNum - 1];
@@ -1153,6 +1197,81 @@ void sendMainBeacon() {
     return;
   }
   sendEspNowPacket(ESPNOW_BROADCAST_MAC, &packet, sizeof(packet));
+}
+
+String provisioningClientStatus() {
+  if (!provisioningMainResultComplete) return provisioningStatus;
+  if (provisioningRainRejected) return "rain_rejected";
+  if (provisioningRainUnconfirmed) return "rain_unconfirmed";
+  if (!provisioningRainAcked) return "rain_pending";
+  return provisioningStatus;
+}
+
+String provisioningRainStatus() {
+  if (provisioningRainAcked) return "confirmed";
+  if (provisioningRainRejected) return "rejected";
+  if (provisioningRainUnconfirmed) return "unconfirmed";
+  return provisioningEspNowRequestId == 0 ? "not_started" : "pending";
+}
+
+void serviceRainProvisioning(unsigned long now) {
+  if (!espNowReady || !rainMacKnown) return;
+
+  // Synchronize MAIN's saved credentials whenever RAIN pairs, then resend
+  // periodically. RAIN handles the same request ID idempotently.
+  if (provisioningEspNowRequestId == 0) {
+    provisioningEspNowRequestId = esp_random();
+    if (provisioningEspNowRequestId == 0) provisioningEspNowRequestId = 1;
+    provisioningRainAttempts = 0;
+    provisioningRainStartedAt = now;
+    provisioningRainLastSentAt = 0;
+    provisioningRainAcked = false;
+    provisioningRainRejected = false;
+    provisioningRainUnconfirmed = false;
+  }
+
+  if (provisioningRainAcked) {
+    if (now - provisioningRainLastSentAt < RAIN_PROVISION_RESYNC_MS) return;
+    provisioningRainAttempts = 0;
+  } else {
+    if (provisioningRainStartedAt == 0) provisioningRainStartedAt = now;
+    if (now - provisioningRainStartedAt >= RAIN_PROVISION_TIMEOUT_MS ||
+        provisioningRainAttempts >= RAIN_PROVISION_MAX_ATTEMPTS) {
+      if (!provisioningRainUnconfirmed) {
+        provisioningRainUnconfirmed = true;
+        Serial.println("RAIN did not confirm Wi-Fi credential storage; continuing retries.");
+      }
+      if (provisioningRainLastSentAt != 0 &&
+          now - provisioningRainLastSentAt < RAIN_PROVISION_RETRY_WINDOW_MS) {
+        return;
+      }
+      provisioningRainAttempts = 0;
+      provisioningRainStartedAt = now;
+    }
+    if (provisioningRainRejected &&
+        now - provisioningRainLastSentAt < RAIN_PROVISION_RETRY_WINDOW_MS) return;
+    if (provisioningRainRejected) provisioningRainRejected = false;
+    if (provisioningRainLastSentAt != 0 &&
+        now - provisioningRainLastSentAt < RAIN_PROVISION_RETRY_MS) return;
+  }
+
+  WifiProvisionPacket packet = {};
+  preparePacket(packet, MSG_WIFI_PROVISION, DEVICE_MAIN);
+  packet.requestId = provisioningEspNowRequestId;
+  packet.ssidLength = static_cast<uint8_t>(strlen(ssid));
+  packet.passwordLength = static_cast<uint8_t>(strlen(password));
+  memcpy(packet.ssid, ssid, packet.ssidLength);
+  memcpy(packet.password, password, packet.passwordLength);
+  if (!finalizePacket(packet)) {
+    Serial.println("ESP-NOW Wi-Fi provisioning authentication failed.");
+    return;
+  }
+  provisioningRainLastSentAt = now;
+  provisioningRainAttempts++;
+  if (!sendEspNowPacket(rainMac, &packet, sizeof(packet))) {
+    Serial.printf("RAIN Wi-Fi provisioning send retry=%u\n",
+        provisioningRainAttempts);
+  }
 }
 
 unsigned long remotePumpRemainingMs(int pumpNum, unsigned long now) {
@@ -1248,6 +1367,15 @@ void processRainStatus(const ReceivedPacket& received,
       }
     }
     lastRainSequenceKnown = false;
+    lastRainProvisionAckSequenceKnown = false;
+    provisioningEspNowRequestId = esp_random();
+    if (provisioningEspNowRequestId == 0) provisioningEspNowRequestId = 1;
+    provisioningRainAttempts = 0;
+    provisioningRainStartedAt = now;
+    provisioningRainLastSentAt = 0;
+    provisioningRainAcked = false;
+    provisioningRainRejected = false;
+    provisioningRainUnconfirmed = false;
   }
   if (lastRainBootId == report.bootId && lastRainSequenceKnown &&
       !sequenceIsNewer(report.header.sequence, lastRainSequence)) {
@@ -1346,6 +1474,32 @@ void processRainAck(const ReceivedPacket& received,
   }
 }
 
+void processWifiProvisionAck(const ReceivedPacket& received,
+    const WifiProvisionAckPacket& ack) {
+  if (!rainMacKnown || memcmp(rainMac, received.mac, sizeof(rainMac)) != 0 ||
+      ack.requestId == 0 || ack.requestId != provisioningEspNowRequestId ||
+      ack.rainBootId == 0 || ack.rainBootId != lastRainBootId ||
+      (ack.status != WIFI_PROVISION_ACCEPTED &&
+       ack.status != WIFI_PROVISION_REJECTED) ||
+      (lastRainProvisionAckSequenceKnown &&
+       !sequenceIsNewer(ack.header.sequence,
+           lastRainProvisionAckSequence))) {
+    Serial.println("ESP-NOW Wi-Fi provisioning ACK rejected: invalid peer, session, or fields");
+    return;
+  }
+  lastRainProvisionAckSequence = ack.header.sequence;
+  lastRainProvisionAckSequenceKnown = true;
+  if (ack.status == WIFI_PROVISION_ACCEPTED) {
+    provisioningRainAcked = true;
+    provisioningRainRejected = false;
+    provisioningRainUnconfirmed = false;
+    Serial.println("RAIN confirmed Wi-Fi credential storage.");
+  } else {
+    provisioningRainRejected = true;
+    Serial.println("RAIN rejected Wi-Fi provisioning request.");
+  }
+}
+
 void processEspNowPackets() {
   if (espNowReceiveQueue == nullptr) return;
   const uint32_t queueDrops = espNowQueueDrops.load(std::memory_order_relaxed);
@@ -1380,6 +1534,14 @@ void processEspNowPackets() {
         continue;
       }
       processRainAck(received, ack);
+    } else if (header.type == MSG_WIFI_PROVISION_ACK) {
+      WifiProvisionAckPacket ack;
+      memcpy(&ack, received.bytes, sizeof(ack));
+      if (!packetValid(ack, received.length, MSG_WIFI_PROVISION_ACK, DEVICE_RAIN)) {
+        Serial.println("ESP-NOW Wi-Fi provisioning ACK rejected: size/CRC/authentication");
+        continue;
+      }
+      processWifiProvisionAck(received, ack);
     } else {
       Serial.printf("ESP-NOW unsupported RAIN packet type=%u\n", header.type);
     }
@@ -1420,6 +1582,7 @@ bool initializeEspNow() {
 
 void serviceEspNow(unsigned long now) {
   processEspNowPackets();
+  serviceRainProvisioning(now);
   if (!espNowReady && now - lastEspNowRetryAt >= 2000UL) {
     lastEspNowRetryAt = now;
     initializeEspNow();
@@ -1646,6 +1809,8 @@ void processRemoteActuatorResult(AsyncResult& result) {
 }
 
 void requestRemoteActuatorCommand() {
+  // MAIN alone consumes /hydrodeck/commands; RAIN pump requests are relayed
+  // through the existing authenticated ESP-NOW command path.
   if (!firebaseInitialized || !app.ready() || remoteCommandPending) return;
 
   remoteCommandPending = true;
@@ -2142,13 +2307,17 @@ void handleProvision() {
     return;
   }
   if (requestId == provisioningRequestId) {
-    String response = "{\"status\":\"" + provisioningStatus +
+    String response = "{\"status\":\"" + provisioningClientStatus() +
         "\",\"reason\":" + String(provisioningDisconnectReason) +
-        ",\"requestId\":\"" + provisioningRequestId + "\"}";
+        ",\"wifiStatus\":\"" + provisioningStatus +
+        "\",\"rainStatus\":\"" + provisioningRainStatus() +
+        "\",\"requestId\":\"" + provisioningRequestId + "\"}";
     server.send(202, "application/json", response);
     return;
   }
-  if (provisioningPending) {
+  if (provisioningPending ||
+      (provisioningMainResultComplete && !provisioningRainAcked &&
+       !provisioningRainRejected && !provisioningRainUnconfirmed)) {
     String response = "{\"status\":\"busy\",\"reason\":0,\"requestId\":\"" +
         requestId + "\"}";
     server.send(409, "application/json", response);
@@ -2164,7 +2333,9 @@ void handleProvision() {
   String newPassword = server.arg("password");
   newSsid.trim();
   newPassword.trim();
-  if (newSsid.isEmpty() || newSsid.length() >= sizeof(ssid) || newPassword.length() >= sizeof(password)) {
+  if (newSsid.isEmpty() || newSsid.length() > 32 ||
+      newPassword.length() > 63 ||
+      (newPassword.length() > 0 && newPassword.length() < 8)) {
     String response = "{\"status\":\"invalid_credentials\",\"reason\":0,\"requestId\":\"" +
         requestId + "\"}";
     server.send(400, "application/json", response);
@@ -2176,6 +2347,15 @@ void handleProvision() {
   wifiPreferences.putString("password", password);
   provisioningRequestId = requestId;
   provisioningPending = true;
+  provisioningMainResultComplete = false;
+  provisioningRainAcked = false;
+  provisioningRainRejected = false;
+  provisioningRainUnconfirmed = false;
+  provisioningEspNowRequestId = esp_random();
+  if (provisioningEspNowRequestId == 0) provisioningEspNowRequestId = 1;
+  provisioningRainAttempts = 0;
+  provisioningRainStartedAt = millis();
+  provisioningRainLastSentAt = 0;
   provisioningScanPending = true;
   provisioningScanStarted = false;
   provisioningNetworkFound = false;
@@ -2184,7 +2364,7 @@ void handleProvision() {
   provisioningStatus = "received";
   provisioningDisconnectReason = 0;
   String response = "{\"status\":\"received\",\"reason\":0,\"requestId\":\"" +
-      provisioningRequestId + "\"}";
+      provisioningRequestId + "\",\"wifiStatus\":\"received\",\"rainStatus\":\"pending\"}";
   server.send(202, "application/json", response);
 }
 
@@ -2195,9 +2375,11 @@ void handleProvisionStatus() {
         "{\"status\":\"unknown_request\",\"reason\":0}");
     return;
   }
-  String json = "{\"status\":\"" + provisioningStatus +
+  String json = "{\"status\":\"" + provisioningClientStatus() +
       "\",\"reason\":" + String(provisioningDisconnectReason) +
-      ",\"requestId\":\"" + provisioningRequestId + "\"}";
+      ",\"wifiStatus\":\"" + provisioningStatus +
+      "\",\"rainStatus\":\"" + provisioningRainStatus() +
+      "\",\"requestId\":\"" + provisioningRequestId + "\"}";
   server.send(200, "application/json", json);
 }
 
@@ -2474,6 +2656,7 @@ void processMainWifiDiagnostics() {
         if (provisioningStatus != "testing") {
           provisioningPending = false;
           wifiConnectInProgress = false;
+          provisioningMainResultComplete = true;
           lastWifiRetry = millis();
         }
       }
@@ -2714,6 +2897,7 @@ void loop() {
               provisioningPending = false;
               provisioningScanPending = false;
               provisioningScanStarted = false;
+              provisioningMainResultComplete = true;
               provisioningDisconnectReason = 201;
               Serial.println("Provisioned Wi-Fi SSID was not found in scan results.");
             }
@@ -2740,12 +2924,14 @@ void loop() {
       wifiConnectInProgress = false;
       provisioningStatus = "connected";
       provisioningDisconnectReason = 0;
+      provisioningMainResultComplete = true;
       initializeFirebase();
       Serial.println("Replacement Wi-Fi connected; setup hotspot remains available.");
     } else if (now - wifiConnectStarted >= wifiConnectTimeout) {
       wifiConnectInProgress = false;
       provisioningPending = false;
       provisioningStatus = "timeout";
+      provisioningMainResultComplete = true;
       lastWifiRetry = now;
       Serial.println("New Wi-Fi attempt timed out; setup hotspot remains available.");
     }

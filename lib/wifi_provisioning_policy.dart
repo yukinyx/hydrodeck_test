@@ -3,6 +3,12 @@ String wifiProvisioningMessage(String? code) => switch (code) {
   'received' => 'Credentials received. Checking the Wi-Fi network...',
   'scanning' => 'The ESP32 is checking whether the Wi-Fi network is available...',
   'testing' => 'The ESP32 is testing the Wi-Fi connection...',
+  'rain_pending' =>
+    'MAIN is testing Wi-Fi and waiting for RAIN to confirm credential storage...',
+  'rain_unconfirmed' =>
+    'MAIN processed the Wi-Fi details, but RAIN did not confirm that it stored them. Check that RAIN is online and retry.',
+  'rain_rejected' =>
+    'MAIN processed the Wi-Fi details, but RAIN rejected them. Check the network details and retry.',
   'connected' => 'Connected to Wi-Fi successfully.',
   'network_unavailable' =>
     'The ESP32 could not find that Wi-Fi network. Check the name and try again.',
@@ -20,10 +26,15 @@ String wifiProvisioningMessage(String? code) => switch (code) {
 };
 
 bool isWifiProvisioningPending(String? code) =>
-    code == 'received' || code == 'scanning' || code == 'testing';
+    code == 'received' ||
+    code == 'scanning' ||
+    code == 'testing' ||
+    code == 'rain_pending';
 
 bool isWifiProvisioningAccepted(String? code) =>
     isWifiProvisioningPending(code) ||
+    code == 'rain_unconfirmed' ||
+    code == 'rain_rejected' ||
     code == 'connected' ||
     code == 'network_unavailable' ||
     code == 'authentication_failed' ||
