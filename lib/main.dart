@@ -13,6 +13,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:local_auth/local_auth.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:wifi_iot/wifi_iot.dart';
 import 'package:wifi_scan/wifi_scan.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -48,6 +49,91 @@ const double _minimumPhSetting = 4.0;
 const double _maximumPhSetting = 7.0;
 const double _minimumMaxPhSetting = 6.0;
 const double _maximumMaxPhSetting = 9.0;
+
+ThemeData _hydrodeckTheme() {
+  final colorScheme =
+      ColorScheme.fromSeed(
+        seedColor: const Color(0xFF2DC867),
+        brightness: Brightness.dark,
+      ).copyWith(
+        primary: const Color(0xFF2DC867),
+        onPrimary: const Color(0xFF073B34),
+        secondary: const Color(0xFF62CDA1),
+        tertiary: const Color(0xFFFFD166),
+        onTertiary: const Color(0xFF302300),
+        tertiaryContainer: const Color(0xFF514116),
+        onTertiaryContainer: const Color(0xFFFFE08A),
+        surface: const Color(0xFF103C36),
+        onSurface: const Color(0xFFEAF3EF),
+        surfaceContainerHighest: const Color(0xFF194942),
+        onSurfaceVariant: const Color(0xFFB7D7D1),
+        outline: const Color(0xFF527A70),
+        error: const Color(0xFFFF8A80),
+        onError: const Color(0xFF3B0808),
+      );
+  final borderRadius = BorderRadius.circular(14);
+
+  return ThemeData(
+    useMaterial3: true,
+    brightness: Brightness.dark,
+    colorScheme: colorScheme,
+    scaffoldBackgroundColor: const Color(0xFF073B34),
+    fontFamily: 'Sans-Serif',
+    primaryColor: const Color(0xFF2DC867),
+    appBarTheme: AppBarTheme(
+      backgroundColor: colorScheme.surface,
+      foregroundColor: colorScheme.onSurface,
+      elevation: 0,
+    ),
+    cardColor: colorScheme.surface,
+    dialogTheme: DialogThemeData(backgroundColor: colorScheme.surface),
+    elevatedButtonTheme: ElevatedButtonThemeData(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: colorScheme.primary,
+        foregroundColor: colorScheme.onPrimary,
+        disabledBackgroundColor: colorScheme.surfaceContainerHighest,
+        disabledForegroundColor: colorScheme.onSurfaceVariant,
+      ),
+    ),
+    filledButtonTheme: FilledButtonThemeData(
+      style: FilledButton.styleFrom(
+        backgroundColor: colorScheme.primary,
+        foregroundColor: colorScheme.onPrimary,
+        disabledBackgroundColor: colorScheme.surfaceContainerHighest,
+        disabledForegroundColor: colorScheme.onSurfaceVariant,
+      ),
+    ),
+    outlinedButtonTheme: OutlinedButtonThemeData(
+      style: OutlinedButton.styleFrom(
+        foregroundColor: colorScheme.primary,
+        disabledForegroundColor: colorScheme.onSurfaceVariant,
+        side: BorderSide(color: colorScheme.outline),
+      ),
+    ),
+    textButtonTheme: TextButtonThemeData(
+      style: TextButton.styleFrom(
+        foregroundColor: colorScheme.primary,
+        disabledForegroundColor: colorScheme.onSurfaceVariant,
+      ),
+    ),
+    inputDecorationTheme: InputDecorationTheme(
+      filled: true,
+      fillColor: colorScheme.surfaceContainerHighest,
+      labelStyle: TextStyle(color: colorScheme.onSurfaceVariant),
+      hintStyle: TextStyle(color: colorScheme.onSurfaceVariant),
+      prefixIconColor: colorScheme.onSurfaceVariant,
+      border: OutlineInputBorder(borderRadius: borderRadius),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: borderRadius,
+        borderSide: BorderSide(color: colorScheme.outline),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: borderRadius,
+        borderSide: BorderSide(color: colorScheme.primary, width: 2),
+      ),
+    ),
+  );
+}
 
 bool isValidPhThresholds(double minimum, double maximum) =>
     minimum.isFinite &&
@@ -206,14 +292,6 @@ class DatabaseHelper {
             )
           ''');
           await db.execute('''
-            CREATE TABLE weather_location (
-              id INTEGER PRIMARY KEY CHECK (id = 1),
-              name TEXT NOT NULL,
-              latitude REAL NOT NULL,
-              longitude REAL NOT NULL
-            )
-          ''');
-          await db.execute('''
             CREATE TABLE local_history_deletions (
               recordId TEXT PRIMARY KEY,
               deletedAt TEXT NOT NULL
@@ -360,14 +438,6 @@ class DatabaseHelper {
         pH REAL NOT NULL,
         createdAt TEXT NOT NULL,
         isRead INTEGER NOT NULL DEFAULT 0
-      )
-    ''');
-    await db.execute('''
-      CREATE TABLE weather_location (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        name TEXT NOT NULL,
-        latitude REAL NOT NULL,
-        longitude REAL NOT NULL
       )
     ''');
     await db.execute('''
@@ -661,32 +731,6 @@ class DatabaseHelper {
     final db = await instance.database;
     if (db == null) throw StateError('Notification inbox is unavailable.');
     await db.delete('notification_inbox');
-  }
-
-  Future<WeatherLocation?> getWeatherLocation() async {
-    final db = await instance.database;
-    if (db == null) return null;
-    final rows = await db.query('weather_location', where: 'id = 1', limit: 1);
-    if (rows.isEmpty) return null;
-    final row = rows.first;
-    return WeatherLocation(
-      name: row['name'] as String,
-      latitude: (row['latitude'] as num).toDouble(),
-      longitude: (row['longitude'] as num).toDouble(),
-    );
-  }
-
-  Future<void> saveWeatherLocation(WeatherLocation location) async {
-    final db = await instance.database;
-    if (db == null) {
-      throw StateError('Weather location storage is unavailable.');
-    }
-    await db.insert('weather_location', {
-      'id': 1,
-      'name': location.name,
-      'latitude': location.latitude,
-      'longitude': location.longitude,
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   // Planting Runs History Queries
@@ -989,6 +1033,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
   @override
   Widget build(BuildContext context) {
     final alerts = _alerts;
+    final colors = Theme.of(context).colorScheme;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -1012,11 +1057,13 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
             ],
           ),
         ),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 24),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
           child: Text(
             'Tap an alert to mark it as read. Clearing removes only this inbox.',
-            style: TextStyle(color: Colors.black54),
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
           ),
         ),
         const SizedBox(height: 8),
@@ -1045,12 +1092,14 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                     final alert = alerts[index];
                     return Card(
                       color: alert.isRead
-                          ? Colors.white
-                          : const Color(0xFFFFF1F0),
+                          ? colors.surface
+                          : colors.errorContainer,
                       child: ListTile(
                         leading: Icon(
                           Icons.warning_amber_rounded,
-                          color: alert.isRead ? Colors.grey : Colors.red,
+                          color: alert.isRead
+                              ? colors.onSurfaceVariant
+                              : colors.error,
                         ),
                         title: Text(
                           'Critical pH alert · ${alert.ph.toStringAsFixed(2)}',
@@ -1063,11 +1112,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                         subtitle: Text(_formatDate(alert.createdAt)),
                         trailing: alert.isRead
                             ? null
-                            : const Icon(
-                                Icons.circle,
-                                size: 10,
-                                color: Colors.red,
-                              ),
+                            : Icon(Icons.circle, size: 10, color: colors.error),
                         onTap: () => _markRead(alert),
                       ),
                     );
@@ -1105,25 +1150,16 @@ class _WeatherHomeCardState extends State<WeatherHomeCard> {
       _error = null;
     });
     try {
-      final location = await DatabaseHelper.instance.getWeatherLocation();
-      if (!mounted) return;
-      if (location == null) {
-        setState(() {
-          _locationName = null;
-          _conditions = null;
-          _loading = false;
-        });
-        return;
-      }
-      setState(() => _locationName = location.name);
-      final conditions = await WeatherService.fetch(location);
+      final conditions = await _fetchCurrentWeather();
       if (!mounted) return;
       setState(() {
+        _locationName = conditions.location.name;
         _conditions = conditions;
         _loading = false;
       });
     } catch (error) {
       if (!mounted) return;
+      debugPrint('Current weather load failed: $error');
       setState(() {
         _error = error;
         _loading = false;
@@ -1142,76 +1178,73 @@ class _WeatherHomeCardState extends State<WeatherHomeCard> {
   Widget build(BuildContext context) {
     final conditions = _conditions;
     final temperature = conditions?.temperature;
-    return Card(
-      margin: EdgeInsets.zero,
+    final colors = Theme.of(context).colorScheme;
+    return Material(
+      color: colors.surfaceContainerHighest,
+      borderRadius: BorderRadius.circular(28),
       clipBehavior: Clip.antiAlias,
-      color: const Color(0xFF123F3B),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
       child: InkWell(
         onTap: _openDetails,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-          child: Row(
-            children: [
-              Icon(
-                weatherIcon(conditions?.weatherCode),
-                size: 36,
-                color: const Color(0xFF7DE6D2),
-              ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      _locationName ?? 'Local weather',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      _loading
-                          ? 'Loading weather…'
-                          : _error != null
-                          ? 'Weather unavailable · tap to retry'
-                          : temperature == null
-                          ? 'Choose a location to get weather'
-                          : weatherDescription(conditions?.weatherCode),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Color(0xFFB7D7D1),
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 164),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  weatherIcon(conditions?.weatherCode),
+                  size: 18,
+                  color: colors.primary,
                 ),
-              ),
-              if (_loading)
-                const SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: Color(0xFF7DE6D2),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(
+                    _locationName ?? 'Weather',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: colors.onSurface,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 12,
+                    ),
                   ),
-                )
-              else if (temperature != null)
-                Text(
-                  '${temperature.toStringAsFixed(0)}°',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 26,
-                    fontWeight: FontWeight.bold,
+                ),
+                const SizedBox(width: 6),
+                if (_loading && temperature == null)
+                  Icon(
+                    Icons.location_searching,
+                    size: 15,
+                    color: colors.primary,
+                  )
+                else if (temperature != null)
+                  Text(
+                    '${temperature.toStringAsFixed(0)}°',
+                    style: TextStyle(
+                      color: colors.onSurface,
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  )
+                else if (conditions?.weatherCode != null)
+                  Text(
+                    weatherDescription(conditions!.weatherCode),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: colors.onSurface,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  )
+                else
+                  Icon(
+                    _error == null ? Icons.chevron_right : Icons.info_outline,
+                    size: 18,
+                    color: colors.onSurfaceVariant,
                   ),
-                )
-              else
-                const Icon(Icons.chevron_right, color: Colors.white70),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -1220,97 +1253,75 @@ class _WeatherHomeCardState extends State<WeatherHomeCard> {
 }
 
 class WeatherDetailScreen extends StatefulWidget {
-  const WeatherDetailScreen({super.key});
+  final Future<WeatherConditions> Function()? weatherLoader;
+
+  const WeatherDetailScreen({super.key, this.weatherLoader});
 
   @override
   State<WeatherDetailScreen> createState() => _WeatherDetailScreenState();
 }
 
 class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
-  final TextEditingController _searchController = TextEditingController();
-  WeatherLocation? _location;
   WeatherConditions? _conditions;
-  List<WeatherLocation> _matches = [];
-  Object? _error;
+  String? _error;
   bool _loading = false;
-  bool _searching = false;
+  bool _canOpenSettings = false;
 
   @override
   void initState() {
     super.initState();
-    unawaited(_loadSavedLocation());
+    unawaited(_refresh());
   }
 
-  @override
-  void dispose() {
-    _searchController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _loadSavedLocation() async {
-    try {
-      final saved = await DatabaseHelper.instance.getWeatherLocation();
-      if (!mounted || saved == null) return;
-      _searchController.text = saved.name;
-      setState(() => _location = saved);
-      await _loadWeather(saved);
-    } catch (error) {
-      if (mounted) setState(() => _error = error);
-    }
-  }
-
-  Future<void> _searchLocations() async {
-    setState(() {
-      _searching = true;
-      _error = null;
-      _matches = [];
-    });
-    try {
-      final matches = await WeatherService.searchLocations(
-        _searchController.text,
-      );
-      if (!mounted) return;
-      setState(() => _matches = matches);
-      if (matches.isEmpty) setState(() => _error = 'No matching places found.');
-    } catch (error) {
-      if (mounted) setState(() => _error = error);
-    } finally {
-      if (mounted) setState(() => _searching = false);
-    }
-  }
-
-  Future<void> _selectLocation(WeatherLocation location) async {
-    setState(() {
-      _location = location;
-      _matches = [];
-      _searchController.text = location.name;
-    });
-    try {
-      await DatabaseHelper.instance.saveWeatherLocation(location);
-      await _loadWeather(location);
-    } catch (error) {
-      if (mounted) setState(() => _error = error);
-    }
-  }
-
-  Future<void> _loadWeather(WeatherLocation location) async {
+  Future<void> _refresh() async {
+    if (!mounted || _loading) return;
     setState(() {
       _loading = true;
       _error = null;
+      _canOpenSettings = false;
     });
     try {
-      final conditions = await WeatherService.fetch(location);
+      final conditions = widget.weatherLoader == null
+          ? await _fetchCurrentWeather()
+          : await widget.weatherLoader!();
       if (!mounted) return;
       setState(() {
         _conditions = conditions;
         _loading = false;
       });
-    } catch (error) {
+    } on WeatherException catch (error) {
       if (!mounted) return;
       setState(() {
-        _error = error;
+        _error = error.message;
+        _canOpenSettings = error.canOpenSettings;
         _loading = false;
       });
+    } catch (error) {
+      if (!mounted) return;
+      debugPrint('Weather detail load failed: $error');
+      setState(() {
+        _error = 'Could not load current weather. Please retry.';
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _openLocationSettings() async {
+    try {
+      final opened = await Geolocator.openAppSettings();
+      if (!opened && mounted) {
+        setState(() {
+          _error = 'Could not open app settings. Enable location access there.';
+          _canOpenSettings = false;
+        });
+      }
+    } on Exception {
+      if (mounted) {
+        setState(() {
+          _error = 'Could not open app settings. Enable location access there.';
+          _canOpenSettings = false;
+        });
+      }
     }
   }
 
@@ -1322,15 +1333,14 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
   @override
   Widget build(BuildContext context) {
     final conditions = _conditions;
+    final colors = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Weather'),
         actions: [
           IconButton(
             tooltip: 'Refresh weather',
-            onPressed: _location == null || _loading
-                ? null
-                : () => _loadWeather(_location!),
+            onPressed: _loading ? null : _refresh,
             icon: const Icon(Icons.refresh),
           ),
         ],
@@ -1338,71 +1348,74 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
-          const Text(
-            'Choose a location',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          Text(
+            'Current weather',
+            style: TextStyle(
+              color: colors.onSurface,
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
           ),
           const SizedBox(height: 6),
-          const Text(
-            'Search for and select a city. Weather is provided by Open-Meteo; Hydrodeck does not access your device location.',
-            style: TextStyle(color: Colors.black54),
+          Text(
+            'Weather for your current device location. Refresh to update it. Forecasts are provided by Open-Meteo.',
+            style: TextStyle(color: colors.onSurfaceVariant),
           ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _searchController,
-                  textInputAction: TextInputAction.search,
-                  onSubmitted: (_) => _searchLocations(),
-                  decoration: const InputDecoration(
-                    labelText: 'City or place',
-                    border: OutlineInputBorder(),
+          const SizedBox(height: 16),
+          if (_error != null)
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  conditions == null
+                      ? 'Weather unavailable: $_error'
+                      : 'Showing the last available weather. Refresh failed: $_error',
+                  style: TextStyle(
+                    color: conditions == null
+                        ? colors.error
+                        : colors.onSurfaceVariant,
                   ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              IconButton.filled(
-                tooltip: 'Search locations',
-                onPressed: _searching ? null : _searchLocations,
-                icon: _searching
-                    ? const SizedBox(
-                        height: 20,
-                        width: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.search),
-              ),
-            ],
-          ),
-          if (_matches.isNotEmpty)
-            ..._matches.map(
-              (match) => ListTile(
-                leading: const Icon(Icons.location_on_outlined),
-                title: Text(match.name),
-                onTap: () => _selectLocation(match),
-              ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 8,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: _loading ? null : _refresh,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Retry'),
+                    ),
+                    if (_canOpenSettings)
+                      OutlinedButton.icon(
+                        onPressed: _openLocationSettings,
+                        icon: const Icon(Icons.settings_outlined),
+                        label: const Text('Open app settings'),
+                      ),
+                  ],
+                ),
+              ],
             ),
-          if (_error != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 12),
-              child: Text(
-                'Weather unavailable: $_error',
-                style: const TextStyle(color: Colors.red),
-              ),
-            ),
-          if (_loading)
+          if (_loading && conditions == null)
             const Padding(
               padding: EdgeInsets.all(36),
               child: Center(child: CircularProgressIndicator()),
             )
           else if (conditions != null) ...[
+            if (_loading)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: LinearProgressIndicator(
+                  color: colors.primary,
+                  minHeight: 2,
+                ),
+              ),
             const SizedBox(height: 24),
             Container(
               padding: const EdgeInsets.all(22),
               decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [Color(0xFF0D3532), Color(0xFF176D5E)],
+                gradient: LinearGradient(
+                  colors: [colors.primary, colors.secondary],
                   begin: Alignment.topLeft,
                   end: Alignment.bottomRight,
                 ),
@@ -1413,14 +1426,14 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
                 children: [
                   Text(
                     conditions.location.name,
-                    style: const TextStyle(color: Colors.white70),
+                    style: TextStyle(color: colors.onPrimary.withAlpha(210)),
                   ),
                   const SizedBox(height: 12),
                   Row(
                     children: [
                       Icon(
                         weatherIcon(conditions.weatherCode),
-                        color: const Color(0xFF7DE6D2),
+                        color: colors.onPrimary,
                         size: 54,
                       ),
                       const SizedBox(width: 18),
@@ -1429,16 +1442,15 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
                             ? '—'
                             : '${conditions.temperature!.toStringAsFixed(0)}°',
                         style: const TextStyle(
-                          color: Colors.white,
                           fontSize: 48,
                           fontWeight: FontWeight.w300,
-                        ),
+                        ).copyWith(color: colors.onPrimary),
                       ),
                     ],
                   ),
                   Text(
                     weatherDescription(conditions.weatherCode),
-                    style: const TextStyle(color: Colors.white, fontSize: 18),
+                    style: TextStyle(color: colors.onPrimary, fontSize: 18),
                   ),
                   const SizedBox(height: 18),
                   Wrap(
@@ -1458,6 +1470,12 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
                             : '${conditions.humidity}%',
                       ),
                       _WeatherMetric(
+                        label: 'Precipitation',
+                        value: conditions.precipitation == null
+                            ? '—'
+                            : '${conditions.precipitation!.toStringAsFixed(1)} mm',
+                      ),
+                      _WeatherMetric(
                         label: 'Wind',
                         value: conditions.windSpeed == null
                             ? '—'
@@ -1468,6 +1486,58 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
                 ],
               ),
             ),
+            if (conditions.hourly.isNotEmpty) ...[
+              const SizedBox(height: 24),
+              const Text(
+                'Hourly forecast',
+                style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 112,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: conditions.hourly.length,
+                  separatorBuilder: (_, _) => const SizedBox(width: 10),
+                  itemBuilder: (context, index) {
+                    final hour = conditions.hourly[index];
+                    final label =
+                        '${hour.time.hour.toString().padLeft(2, '0')}:00';
+                    return Container(
+                      width: 82,
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: colors.surfaceContainerHighest,
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        children: [
+                          Text(label),
+                          Icon(
+                            weatherIcon(hour.weatherCode),
+                            color: colors.primary,
+                            size: 22,
+                          ),
+                          Text(
+                            hour.temperature == null
+                                ? '—'
+                                : '${hour.temperature!.toStringAsFixed(0)}°',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                          Text(
+                            hour.precipitationProbability == null
+                                ? '—'
+                                : '${hour.precipitationProbability}% rain',
+                            style: const TextStyle(fontSize: 10),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
             if (conditions.forecast.isNotEmpty) ...[
               const SizedBox(height: 24),
               const Text(
@@ -1480,7 +1550,7 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
                   contentPadding: EdgeInsets.zero,
                   leading: Icon(
                     weatherIcon(day.weatherCode),
-                    color: const Color(0xFF168AAD),
+                    color: colors.primary,
                   ),
                   title: Text(_dayName(day.date)),
                   subtitle: Text(
@@ -1494,15 +1564,16 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
                 ),
               ),
             ],
-          ] else if (_location == null && _error == null)
-            const Padding(
-              padding: EdgeInsets.only(top: 24),
-              child: Text('Select a location to see current weather.'),
-            ),
+          ],
         ],
       ),
     );
   }
+}
+
+Future<WeatherConditions> _fetchCurrentWeather() async {
+  final location = await WeatherService.currentLocation();
+  return WeatherService.fetch(location);
 }
 
 class _WeatherMetric extends StatelessWidget {
@@ -1512,19 +1583,28 @@ class _WeatherMetric extends StatelessWidget {
   const _WeatherMetric({required this.label, required this.value});
 
   @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
-      Text(
-        value,
-        style: const TextStyle(
-          color: Colors.white,
-          fontWeight: FontWeight.bold,
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            color: colors.onPrimary.withAlpha(210),
+            fontSize: 12,
+          ),
         ),
-      ),
-    ],
-  );
+        Text(
+          value,
+          style: TextStyle(
+            color: colors.onPrimary,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+  }
 }
 
 IconData weatherIcon(int? code) => switch (code) {
@@ -2531,11 +2611,7 @@ class _HydrodeckAppState extends State<HydrodeckApp>
     return MaterialApp(
       title: 'Hydrodeck',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        scaffoldBackgroundColor: const Color(0xFFF9F9F9),
-        fontFamily: 'Sans-Serif',
-        primaryColor: const Color(0xFF2DC867),
-      ),
+      theme: _hydrodeckTheme(),
       home: const AuthGatekeeper(),
     );
   }
@@ -2616,8 +2692,40 @@ class _AuthGatekeeperState extends State<AuthGatekeeper>
   }
 }
 
-class _HydrodeckSplash extends StatelessWidget {
+class _HydrodeckSplash extends StatefulWidget {
   const _HydrodeckSplash();
+
+  @override
+  State<_HydrodeckSplash> createState() => _HydrodeckSplashState();
+}
+
+class _HydrodeckSplashState extends State<_HydrodeckSplash>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _animation;
+
+  @override
+  void initState() {
+    super.initState();
+    _animation = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2200),
+    );
+    if (WidgetsBinding
+        .instance
+        .platformDispatcher
+        .accessibilityFeatures
+        .disableAnimations) {
+      _animation.value = 0.5;
+    } else {
+      _animation.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void dispose() {
+    _animation.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -2636,41 +2744,63 @@ class _HydrodeckSplash extends StatelessWidget {
         ),
         Positioned(top: -80, right: -40, child: _splashCloud(240, 150)),
         Positioned(bottom: -70, left: -60, child: _splashCloud(260, 160)),
-        const Positioned(
-          top: 88,
-          left: 44,
-          child: Icon(Icons.water_drop, color: Color(0x557DE6D2), size: 23),
-        ),
-        const Positioned(
-          bottom: 150,
-          right: 42,
-          child: Icon(Icons.water_drop, color: Color(0x557DE6D2), size: 18),
-        ),
-        Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
+        AnimatedBuilder(
+          animation: _animation,
+          builder: (context, child) => Stack(
             children: [
-              Image.asset('hydrodeck_logo.png', width: 140, height: 140),
-              const SizedBox(height: 12),
-              const Text(
-                'HYDRODECK',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 4,
-                ),
+              Positioned(
+                top: 88 + 8 * _animation.value,
+                left: 44,
+                child: child!,
               ),
-              const SizedBox(height: 8),
-              const Text(
-                'GROW WITH CONFIDENCE',
-                style: TextStyle(
-                  color: Color(0xFFB7D7D1),
-                  fontSize: 11,
-                  letterSpacing: 2,
+              Positioned(
+                bottom: 150 + 10 * (1 - _animation.value),
+                right: 42,
+                child: Transform.scale(
+                  scale: 0.8 + 0.2 * _animation.value,
+                  child: child,
                 ),
               ),
             ],
+          ),
+          child: const Icon(
+            Icons.water_drop,
+            color: Color(0x557DE6D2),
+            size: 23,
+          ),
+        ),
+        Center(
+          child: AnimatedBuilder(
+            animation: _animation,
+            builder: (context, child) => Transform.translate(
+              offset: Offset(0, -4 * _animation.value),
+              child: child,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Image.asset('hydrodeck_logo.png', width: 140, height: 140),
+                const SizedBox(height: 12),
+                Text(
+                  'HYDRODECK',
+                  style: TextStyle(
+                    color: Color(0xFFEAF3EF),
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 4,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'GROW WITH CONFIDENCE',
+                  style: TextStyle(
+                    color: Color(0xFFB7D7D1),
+                    fontSize: 11,
+                    letterSpacing: 2,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ],
@@ -2700,11 +2830,27 @@ class _AuthEntryTransition extends StatelessWidget {
     builder: (context, child) {
       final progress = Curves.easeInOutCubic.transform(animation.value);
       final size = MediaQuery.sizeOf(context);
+      final padding = MediaQuery.paddingOf(context);
+      final colors = Theme.of(context).colorScheme;
+      const startHeroHeight = 178.0;
+      final availableHeight = (size.height - padding.vertical).clamp(
+        0.0,
+        size.height,
+      );
+      final startScale = (availableHeight / startHeroHeight)
+          .clamp(0.0, 1.0)
+          .toDouble();
+      final heroHeight = startHeroHeight * startScale;
+      final startTop =
+          padding.top +
+          ((availableHeight - heroHeight) / 2).clamp(0.0, availableHeight);
+      final logoSize = lerpDouble(140 * startScale, 68, progress)!;
+      final brandSize = lerpDouble(22 * startScale, 17, progress)!;
       return Stack(
         children: [
           Positioned.fill(
             child: Transform.translate(
-              offset: Offset(0, size.height * 0.12 * (1 - progress)),
+              offset: Offset(0, 20 * (1 - progress)),
               child: child,
             ),
           ),
@@ -2712,41 +2858,42 @@ class _AuthEntryTransition extends StatelessWidget {
             Positioned.fill(
               child: IgnorePointer(
                 child: ColoredBox(
-                  color: Color.fromRGBO(7, 59, 52, 1 - progress),
+                  color: const Color(
+                    0xFF073B34,
+                  ).withValues(alpha: 1 - progress),
                 ),
               ),
             ),
           if (progress < 1)
             Positioned(
-              top: 14 + (size.height - 220) * 0.5 * (1 - progress),
+              top: lerpDouble(startTop, padding.top + 16, progress)!,
               left: 0,
               right: 0,
               child: IgnorePointer(
                 child: Opacity(
                   opacity: 1 - progress,
                   child: Center(
-                    child: Transform.scale(
-                      scale: 1 - 0.5 * progress,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Image.asset(
-                            'hydrodeck_logo.png',
-                            width: 140,
-                            height: 140,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Image.asset(
+                          'hydrodeck_logo.png',
+                          width: logoSize,
+                          height: logoSize,
+                        ),
+                        SizedBox(
+                          height: lerpDouble(10 * startScale, 2, progress)!,
+                        ),
+                        Text(
+                          'HYDRODECK',
+                          style: TextStyle(
+                            color: colors.onSurface,
+                            fontSize: brandSize,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: lerpDouble(4, 2.5, progress),
                           ),
-                          const SizedBox(height: 10),
-                          const Text(
-                            'HYDRODECK',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 22,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 4,
-                            ),
-                          ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -3268,13 +3415,9 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Forgot Password'),
-        backgroundColor: Colors.white,
-        foregroundColor: Colors.black,
-        elevation: 0,
-      ),
+      appBar: AppBar(title: const Text('Forgot Password'), elevation: 0),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -3286,9 +3429,9 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                 style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 12),
-              const Text(
+              Text(
                 'We will send a 6-digit OTP to confirm the account before starting the password reset process.',
-                style: TextStyle(color: Colors.grey),
+                style: TextStyle(color: colors.onSurfaceVariant),
               ),
               const SizedBox(height: 24),
               TextField(
@@ -3296,7 +3439,6 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                 keyboardType: TextInputType.emailAddress,
                 decoration: const InputDecoration(
                   labelText: 'Email',
-                  border: OutlineInputBorder(),
                   prefixIcon: Icon(Icons.email_outlined),
                 ),
               ),
@@ -3306,8 +3448,8 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                   padding: const EdgeInsets.only(bottom: 12),
                   child: Text(
                     _error!,
-                    style: const TextStyle(
-                      color: Colors.red,
+                    style: TextStyle(
+                      color: colors.error,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
@@ -3315,12 +3457,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
               ElevatedButton(
                 onPressed: _busy ? null : _sendOtp,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2DC867),
-                  foregroundColor: Colors.white,
                   minimumSize: const Size.fromHeight(52),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(14),
-                  ),
                 ),
                 child: Text(_busy ? 'Sending OTP...' : 'Send OTP'),
               ),
@@ -3406,11 +3543,30 @@ class OtpVerificationScreen extends StatefulWidget {
 }
 
 class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
-  final _otpController = TextEditingController();
+  final List<TextEditingController> _otpDigits = List.generate(
+    6,
+    (_) => TextEditingController(),
+  );
+  final List<FocusNode> _otpFocusNodes = List.generate(6, (_) => FocusNode());
   bool _busy = false;
   String? _error;
   DateTime? _resendAvailableAt;
   Timer? _resendCountdownTimer;
+  String get _otpCode => _otpDigits.map((digit) => digit.text).join();
+  String get _maskedEmail {
+    final parts = widget.email.split('@');
+    if (parts.length != 2 || parts[0].isEmpty || parts[1].isEmpty) {
+      return 'your email address';
+    }
+    final domainParts = parts[1].split('.');
+    final maskedDomain = domainParts.first.isEmpty
+        ? '***'
+        : '${domainParts.first.substring(0, 1)}***';
+    final suffix = domainParts.length > 1
+        ? '.${domainParts.skip(1).join('.')}'
+        : '';
+    return '${parts[0].substring(0, 1)}***@$maskedDomain$suffix';
+  }
 
   OtpCodeService get _otpService => widget.otpService ?? _emailOtpCodeService;
   DateTime get _now => widget.now?.call() ?? DateTime.now();
@@ -3425,7 +3581,12 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
   @override
   void dispose() {
     _resendCountdownTimer?.cancel();
-    _otpController.dispose();
+    for (final controller in _otpDigits) {
+      controller.dispose();
+    }
+    for (final focusNode in _otpFocusNodes) {
+      focusNode.dispose();
+    }
     super.dispose();
   }
 
@@ -3454,7 +3615,7 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
   }
 
   Future<void> _resendCode() async {
-    if (!_canResend) return;
+    if (!_canResend || _busy) return;
     setState(() {
       _busy = true;
       _error = null;
@@ -3473,16 +3634,21 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
       }
       if (!mounted) return;
       setState(() {
+        for (final digit in _otpDigits) {
+          digit.clear();
+        }
+        _error = null;
         _resendAvailableAt = _now.add(const Duration(minutes: 3));
       });
       _startResendCountdown();
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('A new OTP has been sent.')));
-    } on Exception catch (error) {
+    } on Exception {
       if (mounted) {
         setState(() {
-          _error = 'Could not send another code: $error';
+          _error =
+              'Could not send another code. Check your connection and try again.';
         });
       }
     } finally {
@@ -3491,9 +3657,9 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
   }
 
   Future<void> _verifyAndContinue() async {
-    final otp = _otpController.text.trim();
+    final otp = _otpCode.trim();
     if (otp.length != 6 || !RegExp(r'^\d{6}$').hasMatch(otp)) {
-      setState(() => _error = 'Enter the 6-digit OTP sent to your email.');
+      setState(() => _error = 'Enter all six digits from the email code.');
       return;
     }
 
@@ -3605,7 +3771,23 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
         );
       }
     } on FirebaseAuthException catch (e) {
-      setState(() => _error = e.message ?? 'Could not complete the request.');
+      setState(() {
+        _error = switch (e.code) {
+          'network-request-failed' =>
+            'Network error. Check your connection and try again.',
+          'email-already-in-use' =>
+            'An account already uses this email. Try logging in instead.',
+          'weak-password' => 'Choose a stronger password and try again.',
+          _ => 'Could not complete the request. Please try again.',
+        };
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(
+          () => _error =
+              'Could not complete verification. Check your connection and try again.',
+        );
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -3613,79 +3795,217 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
     return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          widget.flow == 'signup' ? 'Verify Email' : 'Verify Reset OTP',
-        ),
-        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-        foregroundColor: Colors.black,
-        elevation: 0,
-      ),
+      appBar: AppBar(title: const Text('Verify your email'), elevation: 0),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                widget.flow == 'signup'
-                    ? 'Enter the 6-digit code sent to your email'
-                    : 'Enter the OTP sent to your email to continue the reset flow',
-                style: const TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.bold,
-                ),
+        child: LayoutBuilder(
+          builder: (context, constraints) => SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                minHeight: constraints.maxHeight - 48,
               ),
-              const SizedBox(height: 8),
-              Text(widget.email, style: const TextStyle(color: Colors.grey)),
-              const SizedBox(height: 24),
-              TextField(
-                controller: _otpController,
-                keyboardType: TextInputType.number,
-                maxLength: 6,
-                decoration: const InputDecoration(
-                  labelText: 'OTP code',
-                  border: OutlineInputBorder(),
-                  prefixIcon: Icon(Icons.pin_outlined),
-                ),
-              ),
-              const SizedBox(height: 18),
-              if (_error != null)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: Text(
-                    _error!,
-                    style: const TextStyle(
-                      color: Colors.red,
-                      fontWeight: FontWeight.w600,
-                    ),
+              child: Align(
+                alignment: Alignment.topCenter,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 520),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Icon(
+                        Icons.mark_email_unread_outlined,
+                        color: Color(0xFF2DC867),
+                        size: 56,
+                      ),
+                      const SizedBox(height: 18),
+                      Text(
+                        'Verify your email',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: colors.onSurface,
+                          fontSize: 27,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Text(
+                        'Enter the 6-digit code we sent to',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: theme.colorScheme.onSurfaceVariant,
+                          fontSize: 15,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        _maskedEmail,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: colors.onSurface,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 30),
+                      Row(
+                        children: List.generate(6, (index) {
+                          return Expanded(
+                            child: Padding(
+                              padding: EdgeInsets.only(
+                                right: index == 5 ? 0 : 8,
+                              ),
+                              child: SizedBox(
+                                height: 58,
+                                child: TextField(
+                                  controller: _otpDigits[index],
+                                  focusNode: _otpFocusNodes[index],
+                                  keyboardType: TextInputType.number,
+                                  textInputAction: index == 5
+                                      ? TextInputAction.done
+                                      : TextInputAction.next,
+                                  textAlign: TextAlign.center,
+                                  cursorColor: colors.primary,
+                                  style: TextStyle(
+                                    color: colors.onSurface,
+                                    fontSize: 23,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                  inputFormatters: [
+                                    FilteringTextInputFormatter.digitsOnly,
+                                    LengthLimitingTextInputFormatter(
+                                      index == 0 ? 6 : 1,
+                                    ),
+                                  ],
+                                  onChanged: (value) {
+                                    if (value.length > 1) {
+                                      final digits = value.split('');
+                                      for (
+                                        var digitIndex = 0;
+                                        digitIndex < digits.length &&
+                                            index + digitIndex < 6;
+                                        digitIndex++
+                                      ) {
+                                        _otpDigits[index + digitIndex].text =
+                                            digits[digitIndex];
+                                      }
+                                      final nextIndex = (index + digits.length)
+                                          .clamp(0, 5);
+                                      _otpFocusNodes[nextIndex].requestFocus();
+                                    } else if (value.isNotEmpty && index < 5) {
+                                      _otpFocusNodes[index + 1].requestFocus();
+                                    } else if (value.isEmpty && index > 0) {
+                                      _otpFocusNodes[index - 1].requestFocus();
+                                    } else if (index == 5 && value.isNotEmpty) {
+                                      _otpFocusNodes[index].unfocus();
+                                    }
+                                    if (_error != null) {
+                                      setState(() => _error = null);
+                                    }
+                                  },
+                                  decoration: InputDecoration(
+                                    counterText: '',
+                                    contentPadding: EdgeInsets.zero,
+                                    filled: true,
+                                    fillColor: colors.surfaceContainerHighest,
+                                    enabledBorder: OutlineInputBorder(
+                                      borderRadius: BorderRadius.circular(10),
+                                      borderSide: BorderSide(
+                                        color: _error == null
+                                            ? colors.outline
+                                            : colors.error,
+                                        width: 1.5,
+                                      ),
+                                    ),
+                                    focusedBorder: OutlineInputBorder(
+                                      borderRadius: BorderRadius.circular(10),
+                                      borderSide: BorderSide(
+                                        color: colors.primary,
+                                        width: 2.5,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          );
+                        }),
+                      ),
+                      if (_error != null) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          _error!,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: colors.error,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 24),
+                      ElevatedButton(
+                        onPressed: _busy ? null : _verifyAndContinue,
+                        style: ElevatedButton.styleFrom(
+                          minimumSize: const Size.fromHeight(54),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                        child: _busy
+                            ? SizedBox(
+                                height: 22,
+                                width: 22,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2.2,
+                                  color: colors.onPrimary,
+                                ),
+                              )
+                            : const Text(
+                                'Verify my email',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                      ),
+                      const SizedBox(height: 14),
+                      Wrap(
+                        alignment: WrapAlignment.center,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          Text(
+                            'Didn’t receive your code?',
+                            style: TextStyle(color: colors.onSurfaceVariant),
+                          ),
+                          TextButton(
+                            onPressed: (_busy || !_canResend)
+                                ? null
+                                : _resendCode,
+                            style: TextButton.styleFrom(
+                              foregroundColor: colors.primary,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                              ),
+                            ),
+                            child: Text(
+                              _canResend
+                                  ? 'Resend code'
+                                  : 'Resend code in ${_resendLabel.substring(_resendLabel.lastIndexOf(' ') + 1)}',
+                              style: const TextStyle(
+                                decoration: TextDecoration.underline,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
                 ),
-              ElevatedButton(
-                onPressed: _busy ? null : _verifyAndContinue,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Theme.of(context).primaryColor,
-                  foregroundColor: Colors.white,
-                  minimumSize: const Size.fromHeight(52),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                ),
-                child: Text(
-                  _busy
-                      ? 'Verifying...'
-                      : widget.flow == 'signup'
-                      ? 'Verify & Create Account'
-                      : 'Verify OTP',
-                ),
               ),
-              const SizedBox(height: 12),
-              TextButton(
-                onPressed: (_busy || !_canResend) ? null : _resendCode,
-                child: Text(_resendLabel),
-              ),
-            ],
+            ),
           ),
         ),
       ),
@@ -3700,6 +4020,7 @@ class PasswordResetInstructionsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
     return Scaffold(
       body: SafeArea(
         child: Padding(
@@ -3723,7 +4044,7 @@ class PasswordResetInstructionsScreen extends StatelessWidget {
               Text(
                 'A secure password reset email has been sent to $email. Open it and follow the instructions to create a new password.',
                 textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.grey),
+                style: TextStyle(color: colors.onSurfaceVariant),
               ),
               const SizedBox(height: 24),
               ElevatedButton(
@@ -3731,12 +4052,7 @@ class PasswordResetInstructionsScreen extends StatelessWidget {
                   Navigator.of(context).popUntil((route) => route.isFirst);
                 },
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2DC867),
-                  foregroundColor: Colors.white,
                   minimumSize: const Size.fromHeight(52),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(14),
-                  ),
                 ),
                 child: const Text('Back to login'),
               ),
@@ -3759,36 +4075,52 @@ Widget _field(
   FocusNode? focusNode,
   String? errorText,
   ValueChanged<String>? onChanged,
-}) {
-  if (obscure) {
-    return _PasswordVisibilityField(
+}) => Builder(
+  builder: (context) {
+    final colors = Theme.of(context).colorScheme;
+    if (obscure) {
+      return _PasswordVisibilityField(
+        controller: controller,
+        label: label,
+        icon: icon,
+        hintText: hintText,
+        focusNode: focusNode,
+        errorText: errorText,
+        onChanged: onChanged,
+      );
+    }
+    return TextField(
       controller: controller,
-      label: label,
-      icon: icon,
-      hintText: hintText,
+      keyboardType: keyboard,
+      maxLength: maxLength,
       focusNode: focusNode,
-      errorText: errorText,
       onChanged: onChanged,
+      cursorColor: colors.primary,
+      style: TextStyle(color: colors.onSurface),
+      decoration: InputDecoration(
+        labelText: label,
+        hintText: hintText,
+        labelStyle: TextStyle(color: colors.onSurfaceVariant),
+        floatingLabelStyle: TextStyle(color: colors.primary),
+        hintStyle: TextStyle(color: colors.onSurfaceVariant),
+        counterText: maxLength == null ? null : '',
+        errorText: errorText,
+        prefixIcon: Icon(icon),
+        filled: true,
+        fillColor: colors.surfaceContainerHighest,
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: colors.outline),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: colors.primary, width: 2),
+        ),
+      ),
     );
-  }
-  return TextField(
-    controller: controller,
-    keyboardType: keyboard,
-    maxLength: maxLength,
-    focusNode: focusNode,
-    onChanged: onChanged,
-    decoration: InputDecoration(
-      labelText: label,
-      hintText: hintText,
-      counterText: maxLength == null ? null : '',
-      errorText: errorText,
-      prefixIcon: Icon(icon),
-      filled: true,
-      fillColor: Colors.white,
-      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
-    ),
-  );
-}
+  },
+);
 
 class _PasswordVisibilityField extends StatefulWidget {
   final TextEditingController controller;
@@ -3818,28 +4150,46 @@ class _PasswordVisibilityFieldState extends State<_PasswordVisibilityField> {
   bool _obscure = true;
 
   @override
-  Widget build(BuildContext context) => TextField(
-    controller: widget.controller,
-    focusNode: widget.focusNode,
-    obscureText: _obscure,
-    onChanged: widget.onChanged,
-    decoration: InputDecoration(
-      labelText: widget.label,
-      hintText: widget.hintText,
-      errorText: widget.errorText,
-      prefixIcon: Icon(widget.icon),
-      filled: true,
-      fillColor: Colors.white,
-      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
-      suffixIcon: IconButton(
-        tooltip: _obscure ? 'Show password' : 'Hide password',
-        icon: Icon(
-          _obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return TextField(
+      controller: widget.controller,
+      focusNode: widget.focusNode,
+      obscureText: _obscure,
+      onChanged: widget.onChanged,
+      cursorColor: colors.primary,
+      style: TextStyle(color: colors.onSurface),
+      decoration: InputDecoration(
+        labelText: widget.label,
+        hintText: widget.hintText,
+        labelStyle: TextStyle(color: colors.onSurfaceVariant),
+        floatingLabelStyle: TextStyle(color: colors.primary),
+        hintStyle: TextStyle(color: colors.onSurfaceVariant),
+        errorText: widget.errorText,
+        prefixIcon: Icon(widget.icon),
+        filled: true,
+        fillColor: colors.surfaceContainerHighest,
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: colors.outline),
         ),
-        onPressed: () => setState(() => _obscure = !_obscure),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: colors.primary, width: 2),
+        ),
+        suffixIcon: IconButton(
+          tooltip: _obscure ? 'Show password' : 'Hide password',
+          icon: Icon(
+            _obscure
+                ? Icons.visibility_outlined
+                : Icons.visibility_off_outlined,
+          ),
+          onPressed: () => setState(() => _obscure = !_obscure),
+        ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 class _AuthFormScaffold extends StatelessWidget {
@@ -3862,142 +4212,160 @@ class _AuthFormScaffold extends StatelessWidget {
     this.beforeAction,
   });
   @override
-  Widget build(BuildContext context) => Scaffold(
-    backgroundColor: const Color(0xFF073B34),
-    body: Stack(
-      children: [
-        Positioned(
-          top: -90,
-          right: -85,
-          child: _HydrodeckSplash._splashCloud(240, 150),
-        ),
-        SafeArea(
-          child: LayoutBuilder(
-            builder: (context, _) => SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-              child: Center(
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Scaffold(
+      body: Stack(
+        children: [
+          Positioned(
+            top: -90,
+            right: -85,
+            child: _HydrodeckSplashState._splashCloud(240, 150),
+          ),
+          SafeArea(
+            child: LayoutBuilder(
+              builder: (context, constraints) => SingleChildScrollView(
+                keyboardDismissBehavior:
+                    ScrollViewKeyboardDismissBehavior.onDrag,
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 460),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Column(
+                  constraints: BoxConstraints(
+                    minHeight: (constraints.maxHeight - 40)
+                        .clamp(0.0, constraints.maxHeight)
+                        .toDouble(),
+                  ),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 460),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
-                          Image.asset(
-                            'hydrodeck_logo.png',
-                            width: 68,
-                            height: 68,
+                          Column(
+                            children: [
+                              Image.asset(
+                                'hydrodeck_logo.png',
+                                width: 68,
+                                height: 68,
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                'HYDRODECK',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: colors.onSurface,
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: 2.5,
+                                ),
+                              ),
+                              const SizedBox(height: 5),
+                              Text(
+                                subtitle,
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: colors.onSurfaceVariant,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ],
                           ),
-                          const SizedBox(height: 2),
-                          const Text(
-                            'HYDRODECK',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 17,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 2.5,
+                          const SizedBox(height: 20),
+                          Container(
+                            padding: const EdgeInsets.all(22),
+                            decoration: BoxDecoration(
+                              color: colors.surface,
+                              borderRadius: BorderRadius.circular(28),
+                              border: Border.all(color: colors.outline),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: colors.shadow.withAlpha(30),
+                                  blurRadius: 24,
+                                  offset: const Offset(0, 10),
+                                ),
+                              ],
                             ),
-                          ),
-                          const SizedBox(height: 5),
-                          Text(
-                            subtitle,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              color: Color(0xFFB7D7D1),
-                              fontSize: 13,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                Text(
+                                  title,
+                                  style: TextStyle(
+                                    color: colors.onSurface,
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(height: 20),
+                                ...fields.expand(
+                                  (field) => [
+                                    field,
+                                    const SizedBox(height: 16),
+                                  ],
+                                ),
+                                if (error != null)
+                                  Padding(
+                                    padding: const EdgeInsets.only(bottom: 12),
+                                    child: Text(
+                                      error!,
+                                      style: TextStyle(color: colors.error),
+                                    ),
+                                  ),
+                                if (beforeAction != null) ...[
+                                  const SizedBox(height: 12),
+                                  DefaultTextStyle(
+                                    style: TextStyle(
+                                      color: colors.onSurfaceVariant,
+                                    ),
+                                    child: beforeAction!,
+                                  ),
+                                ],
+                                const SizedBox(height: 16),
+                                ElevatedButton(
+                                  onPressed: busy ? null : onAction,
+                                  style: ElevatedButton.styleFrom(
+                                    minimumSize: const Size.fromHeight(52),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(14),
+                                    ),
+                                  ),
+                                  child: busy
+                                      ? SizedBox(
+                                          height: 22,
+                                          width: 22,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            color: colors.onPrimary,
+                                          ),
+                                        )
+                                      : Text(actionLabel),
+                                ),
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 10),
+                                  child: Center(
+                                    child: DefaultTextStyle(
+                                      style: TextStyle(
+                                        color: colors.onSurfaceVariant,
+                                      ),
+                                      child: footer,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                         ],
                       ),
-                      const SizedBox(height: 20),
-                      Container(
-                        padding: const EdgeInsets.all(22),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF0B302D),
-                          borderRadius: BorderRadius.circular(28),
-                          border: Border.all(color: const Color(0x337DE6D2)),
-                          boxShadow: const [
-                            BoxShadow(
-                              color: Color(0x44000000),
-                              blurRadius: 24,
-                              offset: Offset(0, 10),
-                            ),
-                          ],
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            Text(
-                              title,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 22,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            const SizedBox(height: 18),
-                            ...fields.expand(
-                              (field) => [field, const SizedBox(height: 12)],
-                            ),
-                            if (error != null)
-                              Padding(
-                                padding: const EdgeInsets.only(bottom: 8),
-                                child: Text(
-                                  error!,
-                                  style: const TextStyle(
-                                    color: Colors.redAccent,
-                                  ),
-                                ),
-                              ),
-                            if (beforeAction != null) ...[
-                              const SizedBox(height: 8),
-                              DefaultTextStyle(
-                                style: const TextStyle(color: Colors.white70),
-                                child: beforeAction!,
-                              ),
-                            ],
-                            const SizedBox(height: 12),
-                            ElevatedButton(
-                              onPressed: busy ? null : onAction,
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: const Color(0xFF2DC867),
-                                foregroundColor: Colors.white,
-                                minimumSize: const Size.fromHeight(52),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(14),
-                                ),
-                              ),
-                              child: busy
-                                  ? const SizedBox(
-                                      height: 22,
-                                      width: 22,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        color: Colors.white,
-                                      ),
-                                    )
-                                  : Text(actionLabel),
-                            ),
-                            Center(
-                              child: DefaultTextStyle(
-                                style: const TextStyle(color: Colors.white70),
-                                child: footer,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
+                    ),
                   ),
                 ),
               ),
             ),
           ),
-        ),
-      ],
-    ),
-  );
+        ],
+      ),
+    );
+  }
 }
 
 class ProfileScreen extends StatefulWidget {
@@ -4244,13 +4612,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Profile'),
-        backgroundColor: Colors.white,
-        foregroundColor: Colors.black,
-        elevation: 0,
-      ),
+      appBar: AppBar(title: const Text('Profile'), elevation: 0),
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
@@ -4262,9 +4626,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 8),
-              const Text(
+              Text(
                 'Changing the email address sends a verification email to the new address before it becomes active.',
-                style: TextStyle(fontSize: 12, color: Colors.grey),
+                style: TextStyle(fontSize: 12, color: colors.onSurfaceVariant),
               ),
               const SizedBox(height: 24),
               TextField(
@@ -4283,6 +4647,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 maxLength: 11,
                 decoration: const InputDecoration(
                   labelText: 'Phone number',
+                  counterText: '',
                   border: OutlineInputBorder(),
                   prefixIcon: Icon(Icons.phone_outlined),
                 ),
@@ -4313,8 +4678,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     _message!,
                     style: TextStyle(
                       color: _message!.contains('success')
-                          ? Colors.green
-                          : Colors.red,
+                          ? colors.primary
+                          : colors.error,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
@@ -4322,8 +4687,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
               ElevatedButton(
                 onPressed: _busy ? null : _saveProfile,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2DC867),
-                  foregroundColor: Colors.white,
+                  backgroundColor: colors.primary,
+                  foregroundColor: colors.onPrimary,
+                  disabledBackgroundColor: colors.surfaceContainerHighest,
+                  disabledForegroundColor: colors.onSurfaceVariant,
                   minimumSize: const Size.fromHeight(52),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(14),
@@ -4337,7 +4704,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 icon: const Icon(Icons.logout_outlined),
                 label: const Text('Sign out'),
                 style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.black87,
+                  foregroundColor: colors.onSurface,
                   minimumSize: const Size.fromHeight(52),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(14),
@@ -4350,8 +4717,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 icon: const Icon(Icons.delete_outline),
                 label: const Text('Delete account'),
                 style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.red,
-                  side: const BorderSide(color: Colors.red),
+                  foregroundColor: colors.error,
+                  side: BorderSide(color: colors.error),
                   minimumSize: const Size.fromHeight(52),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(14),
@@ -5194,6 +5561,7 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
     return Scaffold(
       body: SafeArea(
         child: SingleChildScrollView(
@@ -5202,13 +5570,13 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               const SizedBox(height: 20),
-              const Text(
+              Text(
                 'HYDRODECK',
                 style: TextStyle(
                   fontSize: 28,
                   fontWeight: FontWeight.bold,
                   letterSpacing: 2.0,
-                  color: Color(0xFF232323),
+                  color: colors.onSurface,
                 ),
               ),
               const SizedBox(height: 10),
@@ -5216,9 +5584,9 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                 !_isPinVerified
                     ? 'Initial Setup Authorization'
                     : 'Preferences Setup',
-                style: const TextStyle(
+                style: TextStyle(
                   fontSize: 14,
-                  color: Colors.grey,
+                  color: colors.onSurfaceVariant,
                   fontWeight: FontWeight.bold,
                 ),
               ),
@@ -5228,11 +5596,11 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                 Container(
                   padding: const EdgeInsets.all(24),
                   decoration: BoxDecoration(
-                    color: Colors.white,
+                    color: colors.surface,
                     borderRadius: BorderRadius.circular(24),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.black.withAlpha(10),
+                        color: colors.shadow.withAlpha(30),
                         blurRadius: 10,
                         offset: const Offset(0, 4),
                       ),
@@ -5240,24 +5608,24 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                   ),
                   child: Column(
                     children: [
-                      const Icon(
-                        Icons.lock_outline,
-                        size: 48,
-                        color: Color(0xFF2DC867),
-                      ),
+                      Icon(Icons.lock_outline, size: 48, color: colors.primary),
                       const SizedBox(height: 16),
-                      const Text(
+                      Text(
                         'Enter 4-Digit Manual PIN',
                         style: TextStyle(
+                          color: colors.onSurface,
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
                         ),
                       ),
                       const SizedBox(height: 8),
-                      const Text(
+                      Text(
                         'Please enter the default factory PIN included in your device user manual.',
                         textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 12, color: Colors.grey),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: colors.onSurfaceVariant,
+                        ),
                       ),
                       const SizedBox(height: 24),
                       TextField(
@@ -5322,7 +5690,10 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                             : _verifyPin,
                         style: ElevatedButton.styleFrom(
                           backgroundColor: const Color(0xFF2DC867),
-                          foregroundColor: Colors.white,
+                          foregroundColor: colors.onPrimary,
+                          disabledBackgroundColor:
+                              colors.surfaceContainerHighest,
+                          disabledForegroundColor: colors.onSurfaceVariant,
                           minimumSize: const Size(double.infinity, 50),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(25),
@@ -5343,11 +5714,11 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                 Container(
                   padding: const EdgeInsets.all(24),
                   decoration: BoxDecoration(
-                    color: Colors.white,
+                    color: colors.surface,
                     borderRadius: BorderRadius.circular(24),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.black.withAlpha(10),
+                        color: colors.shadow.withAlpha(30),
                         blurRadius: 10,
                         offset: const Offset(0, 4),
                       ),
@@ -5356,11 +5727,11 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Center(
+                      Center(
                         child: Icon(
                           Icons.phonelink_setup_rounded,
                           size: 48,
-                          color: Color(0xFF2DC867),
+                          color: colors.primary,
                         ),
                       ),
                       const SizedBox(height: 16),
@@ -5374,17 +5745,21 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                         ),
                       ),
                       const SizedBox(height: 20),
-                      const Text(
+                      Text(
                         'Device Custom PIN (Optional)',
                         style: TextStyle(
+                          color: colors.onSurface,
                           fontSize: 13,
                           fontWeight: FontWeight.bold,
                         ),
                       ),
                       const SizedBox(height: 4),
-                      const Text(
+                      Text(
                         'Change PIN specifically for opening the app on this device. The factory PIN remains usable for setup resets.',
-                        style: TextStyle(fontSize: 11, color: Colors.grey),
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: colors.onSurfaceVariant,
+                        ),
                       ),
                       const SizedBox(height: 12),
                       TextField(
@@ -5412,8 +5787,8 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                           ),
                           focusedBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12),
-                            borderSide: const BorderSide(
-                              color: Color(0xFF2DC867),
+                            borderSide: BorderSide(
+                              color: colors.primary,
                               width: 2,
                             ),
                           ),
@@ -5424,7 +5799,7 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                       const SizedBox(height: 8),
                       SwitchListTile(
                         contentPadding: EdgeInsets.zero,
-                        activeThumbColor: const Color(0xFF2DC867),
+                        activeThumbColor: colors.primary,
                         title: const Text(
                           'Enable Biometrics',
                           style: TextStyle(
@@ -5432,9 +5807,12 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                             fontWeight: FontWeight.bold,
                           ),
                         ),
-                        subtitle: const Text(
+                        subtitle: Text(
                           'Use Fingerprint or Face ID for fast unlocking',
-                          style: TextStyle(fontSize: 11, color: Colors.grey),
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: colors.onSurfaceVariant,
+                          ),
                         ),
                         value: _enableBiometrics,
                         onChanged: _handleBiometricToggle,
@@ -5443,8 +5821,8 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                         const SizedBox(height: 8),
                         Text(
                           _errorMessage!,
-                          style: const TextStyle(
-                            color: Colors.redAccent,
+                          style: TextStyle(
+                            color: colors.error,
                             fontSize: 12,
                             fontWeight: FontWeight.bold,
                           ),
@@ -5454,8 +5832,8 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                       ElevatedButton(
                         onPressed: _completeSetup,
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF2DC867),
-                          foregroundColor: Colors.white,
+                          backgroundColor: colors.primary,
+                          foregroundColor: colors.onPrimary,
                           minimumSize: const Size(double.infinity, 50),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(25),
@@ -5552,6 +5930,7 @@ class _AppUnlockScreenState extends State<AppUnlockScreen> {
   @override
   Widget build(BuildContext context) {
     bool bioEnabled = widget.securityConfig['isBiometricsEnabled'] == true;
+    final colors = Theme.of(context).colorScheme;
 
     return Scaffold(
       body: SafeArea(
@@ -5562,11 +5941,7 @@ class _AppUnlockScreenState extends State<AppUnlockScreen> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const Icon(
-                    Icons.security,
-                    size: 64,
-                    color: Color(0xFF2DC867),
-                  ),
+                  Icon(Icons.security, size: 64, color: colors.primary),
                   const SizedBox(height: 16),
                   const Text(
                     'HYDRODECK LOCKED',
@@ -5577,9 +5952,12 @@ class _AppUnlockScreenState extends State<AppUnlockScreen> {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  const Text(
+                  Text(
                     'Enter your PIN to open the application',
-                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: colors.onSurfaceVariant,
+                    ),
                   ),
                   const SizedBox(height: 32),
                   TextField(
@@ -5602,10 +5980,7 @@ class _AppUnlockScreenState extends State<AppUnlockScreen> {
                       ),
                       focusedBorder: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(16),
-                        borderSide: const BorderSide(
-                          color: Color(0xFF2DC867),
-                          width: 2,
-                        ),
+                        borderSide: BorderSide(color: colors.primary, width: 2),
                       ),
                     ),
                   ),
@@ -5613,8 +5988,8 @@ class _AppUnlockScreenState extends State<AppUnlockScreen> {
                     const SizedBox(height: 12),
                     Text(
                       _errorMessage!,
-                      style: const TextStyle(
-                        color: Colors.redAccent,
+                      style: TextStyle(
+                        color: colors.error,
                         fontSize: 12,
                         fontWeight: FontWeight.bold,
                       ),
@@ -5624,8 +5999,8 @@ class _AppUnlockScreenState extends State<AppUnlockScreen> {
                   ElevatedButton(
                     onPressed: _verifyPin,
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF2DC867),
-                      foregroundColor: Colors.white,
+                      backgroundColor: colors.primary,
+                      foregroundColor: colors.onPrimary,
                       minimumSize: const Size(double.infinity, 50),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(25),
@@ -5643,10 +6018,7 @@ class _AppUnlockScreenState extends State<AppUnlockScreen> {
                     const SizedBox(height: 16),
                     IconButton(
                       iconSize: 40,
-                      icon: const Icon(
-                        Icons.fingerprint,
-                        color: Color(0xFF2DC867),
-                      ),
+                      icon: Icon(Icons.fingerprint, color: colors.primary),
                       onPressed: _tryBiometricAuth,
                     ),
                   ],
@@ -5669,6 +6041,7 @@ class MainGatekeeper extends StatefulWidget {
 
 class _MainGatekeeperState extends State<MainGatekeeper> {
   bool _isLoading = true;
+  bool _isStartingPlanting = false;
 
   final PlantingNavigationState _plantingNavigation = PlantingNavigationState();
   ActivePlantingSession? _activePlantingSession;
@@ -5854,31 +6227,48 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
     } catch (_) {}
   }
 
-  void _startPlanting() async {
-    final now = await getServerNow();
-    final localCandidate =
-        _pastPlantingRuns.fold<int>(
-          0,
-          (maximum, run) =>
-              run.batchNumber > maximum ? run.batchNumber : maximum,
-        ) +
-        1;
-    final activeSession = await startOrResumePlanting(now, localCandidate);
-    await DatabaseHelper.instance.saveActiveSession(
-      activeSession.startDate,
-      activeSession.batchNumber,
-    );
-    await publishActiveBatchNumber(activeSession.batchNumber);
+  Future<void> _startPlanting() async {
+    if (_isStartingPlanting) return;
+    setState(() => _isStartingPlanting = true);
+    try {
+      final now = await getServerNow();
+      final localCandidate =
+          _pastPlantingRuns.fold<int>(
+            0,
+            (maximum, run) =>
+                run.batchNumber > maximum ? run.batchNumber : maximum,
+          ) +
+          1;
+      final activeSession = await startOrResumePlanting(now, localCandidate);
+      await DatabaseHelper.instance.saveActiveSession(
+        activeSession.startDate,
+        activeSession.batchNumber,
+      );
+      await publishActiveBatchNumber(activeSession.batchNumber);
 
-    if (_supportsBackgroundService) {
-      await initializeBackgroundService();
-      FlutterBackgroundService().invoke('setPlantingState', {'active': true});
+      if (_supportsBackgroundService) {
+        await initializeBackgroundService();
+        FlutterBackgroundService().invoke('setPlantingState', {'active': true});
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _activePlantingSession = activeSession;
+        _plantingNavigation.showDashboard();
+      });
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Could not open your planting session. Please retry.',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isStartingPlanting = false);
     }
-
-    setState(() {
-      _activePlantingSession = activeSession;
-      _plantingNavigation.showDashboard();
-    });
   }
 
   void _endPlanting() async {
@@ -5927,27 +6317,108 @@ class _MainGatekeeperState extends State<MainGatekeeper> {
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
-      return const Scaffold(
+      return Scaffold(
         body: Center(
-          child: CircularProgressIndicator(color: Color(0xFF2DC867)),
+          child: CircularProgressIndicator(
+            color: Theme.of(context).colorScheme.primary,
+          ),
         ),
       );
     }
 
     final activeSession = _activePlantingSession;
+    final Widget screen;
     if (_plantingNavigation.page == PlantingNavigationPage.startContinue) {
-      return StartPlantingScreen(
+      screen = StartPlantingScreen(
         onStart: _startPlanting,
         onContinue: _startPlanting,
         activeSession: activeSession,
         history: _pastPlantingRuns,
       );
+    } else {
+      screen = HydroponicsDashboard(
+        startDate: activeSession!.startDate,
+        batchNumber: activeSession.batchNumber,
+        onEndPlanting: _endPlanting,
+        initialIp: _activeEsp32Ip,
+      );
     }
-    return HydroponicsDashboard(
-      startDate: activeSession!.startDate,
-      batchNumber: activeSession.batchNumber,
-      onEndPlanting: _endPlanting,
-      initialIp: _activeEsp32Ip,
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        AnimatedSwitcher(
+          duration: MediaQuery.of(context).disableAnimations
+              ? Duration.zero
+              : const Duration(milliseconds: 280),
+          transitionBuilder: (child, animation) => FadeTransition(
+            opacity: animation,
+            child: SlideTransition(
+              position:
+                  Tween<Offset>(
+                    begin: const Offset(0, 0.025),
+                    end: Offset.zero,
+                  ).animate(
+                    CurvedAnimation(
+                      parent: animation,
+                      curve: Curves.easeOutCubic,
+                    ),
+                  ),
+              child: child,
+            ),
+          ),
+          child: KeyedSubtree(
+            key: ValueKey(_plantingNavigation.page),
+            child: screen,
+          ),
+        ),
+        if (_isStartingPlanting)
+          const Positioned.fill(child: _HydrodeckLoadingOverlay()),
+      ],
+    );
+  }
+}
+
+class _HydrodeckLoadingOverlay extends StatelessWidget {
+  const _HydrodeckLoadingOverlay();
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return ColoredBox(
+      color: colors.surface.withAlpha(225),
+      child: Center(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
+          decoration: BoxDecoration(
+            color: colors.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: colors.outline),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 76,
+                height: 76,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    CircularProgressIndicator(
+                      strokeWidth: 3,
+                      color: colors.primary,
+                    ),
+                    const Image(
+                      image: AssetImage('hydrodeck_logo.png'),
+                      width: 46,
+                      height: 46,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -5969,6 +6440,7 @@ class StartPlantingScreen extends StatelessWidget {
   void _showHistoryDialog(BuildContext context) {
     showModalBottomSheet(
       context: context,
+      backgroundColor: Theme.of(context).colorScheme.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
@@ -5986,10 +6458,14 @@ class StartPlantingScreen extends StatelessWidget {
               const SizedBox(height: 16),
               Expanded(
                 child: history.isEmpty
-                    ? const Center(
+                    ? Center(
                         child: Text(
                           'No completed planting cycles yet.',
-                          style: TextStyle(color: Colors.grey),
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
+                          ),
                         ),
                       )
                     : ListView.builder(
@@ -6002,11 +6478,13 @@ class StartPlantingScreen extends StatelessWidget {
                               borderRadius: BorderRadius.circular(12),
                             ),
                             child: ListTile(
-                              leading: const CircleAvatar(
-                                backgroundColor: Color(0xFFE8F7ED),
+                              leading: CircleAvatar(
+                                backgroundColor: Theme.of(
+                                  context,
+                                ).colorScheme.surfaceContainerHighest,
                                 child: Icon(
                                   Icons.eco,
-                                  color: Color(0xFF2DC867),
+                                  color: Theme.of(context).colorScheme.primary,
                                 ),
                               ),
                               title: Text(
@@ -6049,11 +6527,9 @@ class StartPlantingScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: Colors.white,
-        foregroundColor: Colors.black,
-        elevation: 0,
         actions: [
           IconButton(
             icon: const Icon(Icons.person_outline),
@@ -6067,95 +6543,100 @@ class StartPlantingScreen extends StatelessWidget {
         ],
       ),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 32.0),
-          child: Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                const Text(
-                  'HYDRODECK',
-                  style: TextStyle(
-                    fontSize: 32,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 2.0,
-                    color: Color(0xFF232323),
-                  ),
-                ),
-                const SizedBox(height: 40),
-                Container(
-                  width: 140,
-                  height: 140,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFE8F7ED),
-                    shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.green.withAlpha(20),
-                        blurRadius: 20,
-                        offset: const Offset(0, 10),
+        child: LayoutBuilder(
+          builder: (context, constraints) => SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                minHeight: (constraints.maxHeight - 40)
+                    .clamp(0.0, constraints.maxHeight)
+                    .toDouble(),
+              ),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 460),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text(
+                        'HYDRODECK',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 32,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 2.0,
+                          color: colors.onSurface,
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+                      Container(
+                        width: 140,
+                        height: 140,
+                        decoration: BoxDecoration(
+                          color: colors.surfaceContainerHighest,
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(
+                              color: colors.primary.withAlpha(20),
+                              blurRadius: 20,
+                              offset: const Offset(0, 10),
+                            ),
+                          ],
+                        ),
+                        child: Center(
+                          child: Image.asset(
+                            'hydrodeck_logo.png',
+                            width: 112,
+                            height: 112,
+                            fit: BoxFit.contain,
+                            semanticLabel: 'HydroDeck logo',
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 36),
+                      ElevatedButton(
+                        onPressed: activeSession == null ? onStart : onContinue,
+                        style: ElevatedButton.styleFrom(
+                          minimumSize: const Size(double.infinity, 56),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(28),
+                          ),
+                          elevation: 2,
+                        ),
+                        child: Text(
+                          activeSession == null
+                              ? 'Start Planting'
+                              : 'Continue Planting',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      OutlinedButton(
+                        onPressed: () => _showHistoryDialog(context),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: colors.primary,
+                          side: BorderSide(color: colors.primary, width: 1.5),
+                          minimumSize: const Size(double.infinity, 56),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(28),
+                          ),
+                        ),
+                        child: const Text(
+                          'History',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
                       ),
                     ],
                   ),
-                  child: Center(
-                    child: Image.asset(
-                      'hydrodeck_logo.png',
-                      width: 112,
-                      height: 112,
-                      fit: BoxFit.contain,
-                      semanticLabel: 'HydroDeck logo',
-                    ),
-                  ),
                 ),
-                const SizedBox(height: 24),
-                const Text(
-                  'Hydroponic Lettuce',
-                  style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.w500,
-                    color: Colors.grey,
-                  ),
-                ),
-                const SizedBox(height: 60),
-                ElevatedButton(
-                  onPressed: activeSession == null ? onStart : onContinue,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2DC867),
-                    foregroundColor: Colors.white,
-                    minimumSize: const Size(double.infinity, 56),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(28),
-                    ),
-                    elevation: 2,
-                  ),
-                  child: Text(
-                    activeSession == null
-                        ? 'Start Planting'
-                        : 'Continue Planting',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                OutlinedButton(
-                  onPressed: () => _showHistoryDialog(context),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: const Color(0xFF2DC867),
-                    side: const BorderSide(
-                      color: Color(0xFF2DC867),
-                      width: 1.5,
-                    ),
-                    minimumSize: const Size(double.infinity, 56),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(28),
-                    ),
-                  ),
-                  child: const Text(
-                    'History',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                  ),
-                ),
-              ],
+              ),
             ),
           ),
         ),
@@ -7847,6 +8328,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   Widget _buildOfflineBanner() {
+    final colors = Theme.of(context).colorScheme;
     final message = dashboardOfflineBannerMessage(
       firebaseConnected: _firebaseConnected,
       localDeviceReachable: _hasFreshLocalTelemetry,
@@ -7860,14 +8342,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: const Color(0xFFFFF3E0),
+        color: colors.tertiaryContainer,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: const Color(0xFFFFCC80)),
+        border: Border.all(color: colors.tertiary),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Icon(Icons.cloud_off_outlined, color: Colors.deepOrange),
+          Icon(Icons.cloud_off_outlined, color: colors.onTertiaryContainer),
           const SizedBox(width: 10),
           Expanded(
             child: Column(
@@ -7877,12 +8359,19 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   _hasFreshLocalTelemetry
                       ? 'Cloud unavailable'
                       : 'You are offline',
-                  style: const TextStyle(fontWeight: FontWeight.bold),
+                  style: TextStyle(
+                    color: colors.onTertiaryContainer,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
                 const SizedBox(height: 4),
                 Text(
                   message,
-                  style: const TextStyle(fontSize: 12, height: 1.3),
+                  style: TextStyle(
+                    color: colors.onTertiaryContainer,
+                    fontSize: 12,
+                    height: 1.3,
+                  ),
                 ),
                 if (!_hasFreshLocalTelemetry)
                   TextButton.icon(
@@ -7892,6 +8381,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                     icon: const Icon(Icons.wifi, size: 18),
                     label: const Text('Connect to ESP32 hotspot'),
                     style: TextButton.styleFrom(
+                      foregroundColor: colors.onTertiaryContainer,
                       padding: const EdgeInsets.only(top: 6),
                     ),
                   ),
@@ -7910,6 +8400,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   }
 
   void _showWifiSetupDialog() {
+    final colors = Theme.of(context).colorScheme;
     if (_wifiPromptShown ||
         _wifiProvisioningCompleted ||
         !mounted ||
@@ -8024,10 +8515,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                     const SizedBox(height: 8),
                     Text(
                       scanMessage!,
-                      style: const TextStyle(
-                        color: Colors.orange,
-                        fontSize: 12,
-                      ),
+                      style: TextStyle(color: colors.tertiary, fontSize: 12),
                     ),
                   ],
                   const SizedBox(height: 12),
@@ -8440,12 +8928,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   @override
   Widget build(BuildContext context) {
     final String computedWaterLabel = _getProcessedWaterStatus();
+    final colors = Theme.of(context).colorScheme;
 
     final List<Widget> screens = [
       _buildHomeScreen(computedWaterLabel),
       _buildControlScreen(),
       _buildDataScreen(),
-      _buildSettingsScreen(),
       NotificationsScreen(
         onUnreadCountChanged: (unreadCount) {
           if (mounted && unreadCount != _unreadPhAlertCount) {
@@ -8453,17 +8941,17 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           }
         },
       ),
+      _buildSettingsScreen(),
     ];
 
     return Scaffold(
-      appBar: AppBar(
-        title: _currentIndex == 4 ? const Text('Notifications') : null,
-        backgroundColor: Colors.white,
-        foregroundColor: Colors.black,
-        elevation: 0,
-        actions: _currentIndex == 3
-            ? [
+      appBar: _currentIndex == 4
+          ? AppBar(
+              title: const Text('Settings'),
+              elevation: 0,
+              actions: [
                 IconButton(
+                  tooltip: 'Profile',
                   icon: const Icon(Icons.person_outline),
                   onPressed: () {
                     Navigator.push(
@@ -8474,9 +8962,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                     );
                   },
                 ),
-              ]
-            : const [],
-      ),
+              ],
+            )
+          : null,
       body: SafeArea(
         child: Column(
           children: [
@@ -8489,8 +8977,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _currentIndex,
         type: BottomNavigationBarType.fixed,
-        selectedItemColor: const Color(0xFF2DC867),
-        unselectedItemColor: Colors.grey,
+        backgroundColor: colors.surface,
+        selectedItemColor: colors.primary,
+        unselectedItemColor: colors.onSurfaceVariant,
         selectedLabelStyle: const TextStyle(
           fontWeight: FontWeight.bold,
           fontSize: 11,
@@ -8505,10 +8994,6 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           BottomNavigationBarItem(
             icon: const Icon(Icons.bar_chart_outlined),
             label: 'DATA',
-          ),
-          BottomNavigationBarItem(
-            icon: const Icon(Icons.settings_outlined),
-            label: 'SETTINGS',
           ),
           BottomNavigationBarItem(
             icon: Stack(
@@ -8532,12 +9017,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             ),
             label: 'ALERTS',
           ),
+          BottomNavigationBarItem(
+            icon: const Icon(Icons.settings_outlined),
+            label: 'SETTINGS',
+          ),
         ],
         onTap: (index) {
           setState(() {
             _currentIndex = index;
           });
-          if (index == 4) unawaited(_refreshUnreadPhAlertCount());
+          if (index == 3) unawaited(_refreshUnreadPhAlertCount());
         },
       ),
     );
@@ -8545,9 +9034,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   // Home screen
   Widget _buildHomeScreen(String waterLabel) {
+    final colors = Theme.of(context).colorScheme;
     final statusColor = _connectionStatus == 'ESP32 offline'
-        ? Colors.orange
-        : Colors.green;
+        ? colors.tertiary
+        : colors.primary;
     final isBed1Warning =
         _bed1.ph < _minPhThreshold || _bed1.ph > _maxPhThreshold;
     final isBed2Warning =
@@ -8597,28 +9087,36 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           const SizedBox(height: 6),
           Row(
             children: [
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  color: statusColor,
-                  shape: BoxShape.circle,
+              Expanded(
+                child: Row(
+                  children: [
+                    Container(
+                      width: 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        color: statusColor,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        _connectionStatus,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: statusColor,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              const SizedBox(width: 8),
-              Text(
-                _connectionStatus,
-                style: TextStyle(
-                  color: statusColor,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 13,
-                ),
-              ),
+              const SizedBox(width: 10),
+              const WeatherHomeCard(),
             ],
           ),
-          const SizedBox(height: 20),
-
-          const WeatherHomeCard(),
           const SizedBox(height: 20),
 
           hasPhWarning
@@ -8626,11 +9124,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   width: double.infinity,
                   padding: const EdgeInsets.all(20),
                   decoration: BoxDecoration(
-                    color: Colors.red[400],
+                    color: colors.errorContainer,
                     borderRadius: BorderRadius.circular(24),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.red.withAlpha(50),
+                        color: colors.error.withAlpha(50),
                         blurRadius: 10,
                         offset: const Offset(0, 4),
                       ),
@@ -8648,8 +9146,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                                 : isBed1Warning
                                 ? 'GROW BED 1 pH WARNING'
                                 : 'GROW BED 2 pH WARNING',
-                            style: const TextStyle(
-                              color: Colors.white70,
+                            style: TextStyle(
+                              color: colors.onErrorContainer,
                               fontSize: 12,
                               fontWeight: FontWeight.bold,
                               letterSpacing: 1.1,
@@ -8657,16 +9155,16 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                           ),
                           Icon(
                             Icons.warning_amber_rounded,
-                            color: Colors.white,
+                            color: colors.onErrorContainer,
                             size: 26,
                           ),
                         ],
                       ),
                       const SizedBox(height: 8),
-                      const Text(
+                      Text(
                         'pH ALERT',
                         style: TextStyle(
-                          color: Colors.white,
+                          color: colors.onErrorContainer,
                           fontSize: 24,
                           fontWeight: FontWeight.bold,
                         ),
@@ -8678,8 +9176,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                             : isBed1Warning
                             ? 'Grow bed 1 is outside the target range at ${_bed1.ph.toStringAsFixed(2)} pH. Target range is ${_minPhThreshold.toStringAsFixed(1)} - ${_maxPhThreshold.toStringAsFixed(1)} pH.'
                             : 'Grow bed 2 is outside the target range at ${_bed2.ph.toStringAsFixed(2)} pH. Target range is ${_minPhThreshold.toStringAsFixed(1)} - ${_maxPhThreshold.toStringAsFixed(1)} pH.',
-                        style: const TextStyle(
-                          color: Colors.white70,
+                        style: TextStyle(
+                          color: colors.onErrorContainer.withAlpha(220),
                           fontSize: 13,
                           height: 1.4,
                         ),
@@ -8691,11 +9189,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   width: double.infinity,
                   padding: const EdgeInsets.all(20),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF2DC867),
+                    color: colors.primary,
                     borderRadius: BorderRadius.circular(24),
                     boxShadow: [
                       BoxShadow(
-                        color: const Color(0xFF2DC867).withAlpha(50),
+                        color: colors.primary.withAlpha(50),
                         blurRadius: 10,
                         offset: const Offset(0, 4),
                       ),
@@ -8707,25 +9205,25 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          const Text(
+                          Text(
                             'Current Status',
                             style: TextStyle(
-                              color: Colors.white70,
+                              color: colors.onPrimary.withAlpha(210),
                               fontSize: 14,
                             ),
                           ),
                           Icon(
                             Icons.wb_sunny_outlined,
-                            color: Colors.white.withAlpha(230),
+                            color: colors.onPrimary.withAlpha(230),
                             size: 24,
                           ),
                         ],
                       ),
                       const SizedBox(height: 4),
-                      const Text(
+                      Text(
                         'Optimal Growth',
                         style: TextStyle(
-                          color: Colors.white,
+                          color: colors.onPrimary,
                           fontSize: 26,
                           fontWeight: FontWeight.bold,
                         ),
@@ -8739,13 +9237,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                               vertical: 10,
                             ),
                             decoration: BoxDecoration(
-                              color: Colors.white.withAlpha(45),
+                              color: colors.onPrimary.withAlpha(45),
                               borderRadius: BorderRadius.circular(30),
                             ),
                             child: Text(
                               'Day $currentDayCount',
-                              style: const TextStyle(
-                                color: Colors.white,
+                              style: TextStyle(
+                                color: colors.onPrimary,
                                 fontSize: 13,
                               ),
                             ),
@@ -8774,10 +9272,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             'RESERVOIR',
             reservoirLabel(_reservoir.level),
             _reservoir.online ? 'RAIN online' : 'RAIN offline',
-            _reservoir.online
-                ? const Color(0xFFE8F7ED)
-                : const Color(0xFFFFF3E0),
-            _reservoir.online ? Colors.green.shade800 : Colors.orange,
+            warning: !_reservoir.online,
           ),
         ],
       ),
@@ -8786,6 +9281,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   // TDS, pH, temperature, and water-level metrics
   Widget _buildGrowBedMetrics(String title, GrowBedReading data) {
+    final colors = Theme.of(context).colorScheme;
     final isPhOptimal =
         data.ph >= _minPhThreshold && data.ph <= _maxPhThreshold;
     final isTdsOptimal = data.tds < 900;
@@ -8806,10 +9302,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 'ACIDITY (PH)',
                 data.ph.toStringAsFixed(2),
                 isPhOptimal ? 'Normal' : 'Unstable',
-                isPhOptimal ? const Color(0xFFE8F7ED) : const Color(0xFFFFF3E0),
-                isPhOptimal ? Colors.green : Colors.orange,
+                warning: !isPhOptimal,
                 icon: Icons.science_outlined,
-                iconColor: isPhOptimal ? Colors.green : Colors.orange,
+                iconColor: isPhOptimal ? colors.primary : colors.tertiary,
                 iconSemanticLabel: 'pH measurement',
               ),
             ),
@@ -8819,12 +9314,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 'TDS',
                 '${data.tds.toStringAsFixed(0)} PPM',
                 isTdsOptimal ? 'Optimal' : 'Warning',
-                isTdsOptimal
-                    ? const Color(0xFFE8F7ED)
-                    : const Color(0xFFFFF3E0),
-                isTdsOptimal ? Colors.green : Colors.orange,
+                warning: !isTdsOptimal,
                 icon: Icons.water_drop_outlined,
-                iconColor: const Color(0xFF168AAD),
+                iconColor: colors.primary,
                 iconSemanticLabel: 'Total dissolved solids',
               ),
             ),
@@ -8840,24 +9332,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                     ? '—'
                     : '${data.temperature.toStringAsFixed(1)}°C',
                 temperatureStatus,
-                temperatureHot
-                    ? const Color(0xFFFFEBEE)
-                    : temperatureUnavailable
-                    ? const Color(0xFFF0F0F0)
-                    : const Color(0xFFE8F4FD),
-                temperatureHot
-                    ? Colors.red.shade700
-                    : temperatureUnavailable
-                    ? Colors.grey
-                    : Colors.blue.shade700,
+                warning: temperatureHot,
                 icon: temperatureHot
                     ? Icons.thermostat
                     : Icons.device_thermostat,
                 iconColor: temperatureHot
-                    ? Colors.red.shade700
+                    ? colors.error
                     : temperatureUnavailable
-                    ? Colors.grey
-                    : Colors.blue.shade700,
+                    ? colors.onSurfaceVariant
+                    : colors.secondary,
                 iconSemanticLabel: 'Thermometer, $temperatureStatus',
               ),
             ),
@@ -8867,12 +9350,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 'BED WATER LEVEL',
                 waterLabel,
                 data.waterFull ? 'Full' : 'Low',
-                data.waterFull
-                    ? const Color(0xFFE8F7ED)
-                    : const Color(0xFFFFF3E0),
-                data.waterFull ? Colors.green : Colors.orange,
+                warning: !data.waterFull,
                 icon: data.waterFull ? Icons.water : Icons.water_drop_outlined,
-                iconColor: data.waterFull ? Colors.blue : Colors.blueGrey,
+                iconColor: data.waterFull ? colors.primary : colors.tertiary,
                 iconSemanticLabel: waterLabel,
               ),
             ),
@@ -8886,6 +9366,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   // Control screen
   Widget _buildControlScreen() {
+    final colors = Theme.of(context).colorScheme;
     Widget sectionTitle(String title) => Padding(
       padding: const EdgeInsets.only(top: 18, bottom: 8),
       child: Text(
@@ -8904,77 +9385,90 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       final plusNeeded = bed.ph < _minPhThreshold;
       return Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        color: isCritical ? Colors.red.shade100 : Colors.white,
-        child: Row(
-          children: [
-            Expanded(
-              flex: 2,
-              child: Text(
-                'Grow bed $bedIndex',
-                style: const TextStyle(fontWeight: FontWeight.w600),
-              ),
-            ),
-            Expanded(
-              child: Text(
-                bed.ph.toStringAsFixed(2),
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
+        color: isCritical ? colors.errorContainer : colors.surface,
+        child: DefaultTextStyle(
+          style: TextStyle(
+            color: isCritical ? colors.onErrorContainer : colors.onSurface,
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                flex: 2,
+                child: Text(
+                  'Grow bed $bedIndex',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
                 ),
               ),
-            ),
-            const SizedBox(width: 8),
-            SizedBox(
-              width: 54,
-              height: 52,
-              child: ElevatedButton(
-                onPressed:
-                    _chemicalPumpBusy ||
-                        _actuatorBusy[minusKey] == true ||
-                        _actuatorBusy[plusKey] == true ||
-                        bed.ph < _minPhThreshold
-                    ? null
-                    : () => _toggleActuator(minusKey, minusName),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: minusNeeded
-                      ? Colors.red
-                      : Colors.grey.shade200,
-                  foregroundColor: minusNeeded ? Colors.white : Colors.black87,
-                  padding: EdgeInsets.zero,
-                ),
-                child: const Text(
-                  '-',
-                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+              Expanded(
+                child: Text(
+                  bed.ph.toStringAsFixed(2),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(width: 8),
-            SizedBox(
-              width: 54,
-              height: 52,
-              child: ElevatedButton(
-                onPressed:
-                    _chemicalPumpBusy ||
-                        _actuatorBusy[plusKey] == true ||
-                        _actuatorBusy[minusKey] == true ||
-                        bed.ph > _maxPhThreshold
-                    ? null
-                    : () => _toggleActuator(plusKey, plusName),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: plusNeeded
-                      ? Colors.green
-                      : Colors.grey.shade200,
-                  foregroundColor: plusNeeded ? Colors.white : Colors.black87,
-                  padding: EdgeInsets.zero,
-                ),
-                child: const Text(
-                  '+',
-                  style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+              const SizedBox(width: 8),
+              SizedBox(
+                width: 54,
+                height: 52,
+                child: ElevatedButton(
+                  onPressed:
+                      _chemicalPumpBusy ||
+                          _actuatorBusy[minusKey] == true ||
+                          _actuatorBusy[plusKey] == true ||
+                          bed.ph < _minPhThreshold
+                      ? null
+                      : () => _toggleActuator(minusKey, minusName),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: minusNeeded
+                        ? colors.error
+                        : colors.surfaceContainerHighest,
+                    foregroundColor: minusNeeded
+                        ? colors.onError
+                        : colors.onSurface,
+                    disabledBackgroundColor: colors.surfaceContainerHighest,
+                    disabledForegroundColor: colors.onSurfaceVariant,
+                    padding: EdgeInsets.zero,
+                  ),
+                  child: const Text(
+                    '-',
+                    style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+                  ),
                 ),
               ),
-            ),
-          ],
+              const SizedBox(width: 8),
+              SizedBox(
+                width: 54,
+                height: 52,
+                child: ElevatedButton(
+                  onPressed:
+                      _chemicalPumpBusy ||
+                          _actuatorBusy[plusKey] == true ||
+                          _actuatorBusy[minusKey] == true ||
+                          bed.ph > _maxPhThreshold
+                      ? null
+                      : () => _toggleActuator(plusKey, plusName),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: plusNeeded
+                        ? colors.primary
+                        : colors.surfaceContainerHighest,
+                    foregroundColor: plusNeeded
+                        ? colors.onPrimary
+                        : colors.onSurface,
+                    disabledBackgroundColor: colors.surfaceContainerHighest,
+                    disabledForegroundColor: colors.onSurfaceVariant,
+                    padding: EdgeInsets.zero,
+                  ),
+                  child: const Text(
+                    '+',
+                    style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       );
     }
@@ -8992,59 +9486,72 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         children: [
           Container(
             color: !nutrient && needsWater
-                ? Colors.yellow.shade100
-                : Colors.white,
+                ? colors.tertiaryContainer
+                : colors.surface,
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    'Grow bed $bedIndex',
-                    style: const TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                ),
-                SizedBox(
-                  width: 112,
-                  height: 48,
-                  child: ElevatedButton(
-                    key: nutrient
-                        ? null
-                        : ValueKey('water-pump-$bedIndex-toggle'),
-                    onPressed: nutrient
-                        ? (_actuatorBusy[key] == true || _chemicalPumpBusy
-                              ? null
-                              : () => _toggleActuator(key, actuator))
-                        : (commandPending &&
-                                  (!isOn ||
-                                      _pendingActuatorStates[key] == false)
-                              ? null
-                              : (!isOn &&
-                                        (!rainNodeOnline ||
-                                            _otherWaterPumpIsRunning(actuator))
-                                    ? null
-                                    : () => _toggleActuator(key, actuator))),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: !nutrient && isOn
-                          ? const Color(0xFF2DC867)
-                          : !nutrient && needsWater
-                          ? Colors.amber.shade300
-                          : Colors.grey.shade200,
-                      foregroundColor: !nutrient && isOn
-                          ? Colors.white
-                          : Colors.black87,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                    ),
+            child: DefaultTextStyle(
+              style: TextStyle(
+                color: !nutrient && needsWater
+                    ? colors.onTertiaryContainer
+                    : colors.onSurface,
+              ),
+              child: Row(
+                children: [
+                  Expanded(
                     child: Text(
-                      nutrient
-                          ? 'ADD'
-                          : isOn
-                          ? 'ON'
-                          : 'OFF',
-                      style: const TextStyle(fontWeight: FontWeight.bold),
+                      'Grow bed $bedIndex',
+                      style: const TextStyle(fontWeight: FontWeight.w600),
                     ),
                   ),
-                ),
-              ],
+                  SizedBox(
+                    width: 112,
+                    height: 48,
+                    child: ElevatedButton(
+                      key: nutrient
+                          ? null
+                          : ValueKey('water-pump-$bedIndex-toggle'),
+                      onPressed: nutrient
+                          ? (_actuatorBusy[key] == true || _chemicalPumpBusy
+                                ? null
+                                : () => _toggleActuator(key, actuator))
+                          : (commandPending &&
+                                    (!isOn ||
+                                        _pendingActuatorStates[key] == false)
+                                ? null
+                                : (!isOn &&
+                                          (!rainNodeOnline ||
+                                              _otherWaterPumpIsRunning(
+                                                actuator,
+                                              ))
+                                      ? null
+                                      : () => _toggleActuator(key, actuator))),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: nutrient || isOn
+                            ? colors.primary
+                            : needsWater
+                            ? colors.tertiary
+                            : colors.surfaceContainerHighest,
+                        foregroundColor: nutrient || isOn
+                            ? colors.onPrimary
+                            : needsWater
+                            ? colors.onTertiary
+                            : colors.onSurface,
+                        disabledBackgroundColor: colors.surfaceContainerHighest,
+                        disabledForegroundColor: colors.onSurfaceVariant,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                      ),
+                      child: Text(
+                        nutrient
+                            ? 'ADD'
+                            : isOn
+                            ? 'OFF'
+                            : 'ON',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
@@ -9053,14 +9560,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
     Widget separatedRows(List<Widget> rows) => Container(
       decoration: BoxDecoration(
-        color: Colors.white,
-        border: Border.all(color: Colors.grey.shade200),
+        color: colors.surface,
+        border: Border.all(color: colors.outline),
         borderRadius: BorderRadius.circular(10),
       ),
       child: Column(
         children: [
           for (var index = 0; index < rows.length; index++) ...[
-            if (index > 0) Divider(height: 1, color: Colors.grey.shade200),
+            if (index > 0) Divider(height: 1, color: colors.outline),
             rows[index],
           ],
         ],
@@ -9099,7 +9606,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 Expanded(
                   child: Text(
                     'Reservoir: ${reservoirLabel(_reservoir.level)}',
-                    style: const TextStyle(fontSize: 12, color: Colors.black54),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: colors.onSurfaceVariant,
+                    ),
                   ),
                 ),
                 Text(
@@ -9133,9 +9643,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   : () => _toggleActuator('grow_light', 'growLight'),
               style: ElevatedButton.styleFrom(
                 backgroundColor: growLightOn
-                    ? const Color(0xFF2DC867)
-                    : Colors.grey.shade200,
-                foregroundColor: growLightOn ? Colors.white : Colors.black87,
+                    ? colors.primary
+                    : colors.surfaceContainerHighest,
+                foregroundColor: growLightOn
+                    ? colors.onPrimary
+                    : colors.onSurface,
+                disabledBackgroundColor: colors.surfaceContainerHighest,
+                disabledForegroundColor: colors.onSurfaceVariant,
               ),
               child: Text(
                 growLightOn ? 'ON' : 'OFF',
@@ -9153,6 +9667,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   // Data screen
   Widget _buildDataScreen() {
+    final colors = Theme.of(context).colorScheme;
     List<HistoricalData> filteredLogs = _historyLogs.where((log) {
       if (_selectedFilterDate == null) return true;
       final logDate = _philippineTime(log.timestamp);
@@ -9201,7 +9716,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   Icons.filter_alt_outlined,
                   color: _selectedFilterDate != null
                       ? const Color(0xFF2DC867)
-                      : Colors.grey,
+                      : colors.onSurfaceVariant,
                 ),
                 onPressed: () async {
                   final selected = await showDatePicker(
@@ -9233,29 +9748,29 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 ),
                 TextButton(
                   onPressed: () => setState(() => _selectedFilterDate = null),
-                  child: const Text(
+                  child: Text(
                     'Clear Filter',
-                    style: TextStyle(fontSize: 11, color: Colors.red),
+                    style: TextStyle(fontSize: 11, color: colors.error),
                   ),
                 ),
               ],
             ),
           const SizedBox(height: 12),
-          const Text(
+          Text(
             'Saved ESP32 snapshots (every 20 minutes, Manila time):',
             style: TextStyle(
               fontSize: 11,
-              color: Colors.grey,
+              color: colors.onSurfaceVariant,
               fontStyle: FontStyle.italic,
             ),
           ),
           const SizedBox(height: 10),
           Expanded(
             child: filteredLogs.isEmpty
-                ? const Center(
+                ? Center(
                     child: Text(
                       'No historical snapshots logged on this date.',
-                      style: TextStyle(color: Colors.grey),
+                      style: TextStyle(color: colors.onSurfaceVariant),
                     ),
                   )
                 : ListView.builder(
@@ -9289,13 +9804,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                           margin: const EdgeInsets.only(bottom: 12),
                           padding: const EdgeInsets.only(right: 20),
                           decoration: BoxDecoration(
-                            color: Colors.red.shade700,
+                            color: colors.error,
                             borderRadius: BorderRadius.circular(16),
                           ),
                           alignment: Alignment.centerRight,
-                          child: const Icon(
+                          child: Icon(
                             Icons.delete_outline,
-                            color: Colors.white,
+                            color: colors.onError,
                           ),
                         ),
                         confirmDismiss: (_) async {
@@ -9316,9 +9831,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                                 TextButton(
                                   onPressed: () =>
                                       Navigator.pop(dialogContext, true),
-                                  child: const Text(
+                                  child: Text(
                                     'Delete from device',
-                                    style: TextStyle(color: Colors.red),
+                                    style: TextStyle(color: colors.error),
                                   ),
                                 ),
                               ],
@@ -9361,7 +9876,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                         child: Container(
                           margin: const EdgeInsets.only(bottom: 12),
                           decoration: BoxDecoration(
-                            color: Colors.white,
+                            color: colors.surface,
                             borderRadius: BorderRadius.circular(16),
                           ),
                           child: ListTile(
@@ -9371,15 +9886,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                             ),
                             title: Text(
                               _formatDateTimeToReadable(log.timestamp),
-                              style: const TextStyle(
+                              style: TextStyle(
                                 fontWeight: FontWeight.bold,
                                 fontSize: 13,
-                                color: Colors.black87,
+                                color: colors.onSurface,
                               ),
                             ),
-                            trailing: const Icon(
+                            trailing: Icon(
                               Icons.chevron_right,
-                              color: Colors.grey,
+                              color: colors.onSurfaceVariant,
                             ),
                             onTap: () {
                               Navigator.push(
@@ -9409,6 +9924,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
   // Settings screen
   Widget _buildSettingsScreen() {
+    final colors = Theme.of(context).colorScheme;
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24.0),
       child: Column(
@@ -9422,17 +9938,13 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
 
           const Text(
             'ESP32 Hotspot Setup',
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              fontSize: 15,
-              color: Colors.black87,
-            ),
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
           ),
           const SizedBox(height: 8),
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: colors.surface,
               borderRadius: BorderRadius.circular(16),
             ),
             child: Column(
@@ -9458,12 +9970,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                         ? null
                         : _connectAndProvisionWifi,
                     icon: _isHotspotConnecting
-                        ? const SizedBox(
+                        ? SizedBox(
                             width: 18,
                             height: 18,
                             child: CircularProgressIndicator(
                               strokeWidth: 2,
-                              color: Colors.white,
+                              color: colors.onPrimary,
                             ),
                           )
                         : const Icon(Icons.wifi_find),
@@ -9473,8 +9985,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                           : 'Send Wi-Fi to ESP32',
                     ),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF2DC867),
-                      foregroundColor: Colors.white,
+                      backgroundColor: colors.primary,
+                      foregroundColor: colors.onPrimary,
+                      disabledBackgroundColor: colors.surfaceContainerHighest,
+                      disabledForegroundColor: colors.onSurfaceVariant,
                       padding: const EdgeInsets.symmetric(vertical: 14),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(12),
@@ -9502,7 +10016,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   alignment: Alignment.centerLeft,
                   child: Text(
                     _hotspotStatus,
-                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: colors.onSurfaceVariant,
+                    ),
                   ),
                 ),
               ],
@@ -9510,12 +10027,12 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           ),
           const SizedBox(height: 24),
 
-          const Text(
+          Text(
             'Target Limit Parameters',
             style: TextStyle(
               fontWeight: FontWeight.bold,
               fontSize: 15,
-              color: Colors.black87,
+              color: colors.onSurface,
             ),
           ),
           const SizedBox(height: 8),
@@ -9524,7 +10041,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             padding: const EdgeInsets.all(16),
             margin: const EdgeInsets.only(bottom: 12),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: colors.surface,
               borderRadius: BorderRadius.circular(16),
             ),
             child: Column(
@@ -9539,7 +10056,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                     ),
                     Text(
                       _minPhThreshold.toStringAsFixed(1),
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontWeight: FontWeight.bold,
                         color: Colors.orange,
                       ),
@@ -9555,7 +10072,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                                   4.0) *
                               10)
                           .round(),
-                  activeColor: Colors.orange,
+                  activeColor: colors.tertiary,
                   onChanged: (val) => _updatePhThresholds(val, _maxPhThreshold),
                 ),
               ],
@@ -9566,7 +10083,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             padding: const EdgeInsets.all(16),
             margin: const EdgeInsets.only(bottom: 12),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: colors.surface,
               borderRadius: BorderRadius.circular(16),
             ),
             child: Column(
@@ -9581,9 +10098,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                     ),
                     Text(
                       _maxPhThreshold.toStringAsFixed(1),
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontWeight: FontWeight.bold,
-                        color: Colors.green,
+                        color: colors.primary,
                       ),
                     ),
                   ],
@@ -9599,7 +10116,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                                       .toDouble()) *
                               10)
                           .round(),
-                  activeColor: Colors.green,
+                  activeColor: colors.primary,
                   onChanged: (val) => _updatePhThresholds(_minPhThreshold, val),
                 ),
               ],
@@ -9637,9 +10154,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                         Navigator.pop(context);
                         widget.onEndPlanting();
                       },
-                      child: const Text(
+                      child: Text(
                         'End Cycle',
-                        style: TextStyle(color: Colors.red),
+                        style: TextStyle(color: colors.error),
                       ),
                     ),
                   ],
@@ -9647,8 +10164,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               );
             },
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.redAccent,
-              foregroundColor: Colors.white,
+              backgroundColor: colors.error,
+              foregroundColor: colors.onError,
               minimumSize: const Size(double.infinity, 56),
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(16),
@@ -9667,22 +10184,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   Widget _buildCleanCard(
     String title,
     String value,
-    String? badgeText,
-    Color bg,
-    Color text, {
+    String? badgeText, {
+    required bool warning,
     IconData? icon,
     Color? iconColor,
     String? iconSemanticLabel,
   }) {
+    final colors = Theme.of(context).colorScheme;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: colors.surface,
         borderRadius: BorderRadius.circular(20),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withAlpha(5),
+            color: colors.shadow.withAlpha(30),
             blurRadius: 6,
             offset: const Offset(0, 2),
           ),
@@ -9696,10 +10213,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               Expanded(
                 child: Text(
                   title,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 10,
                     fontWeight: FontWeight.bold,
-                    color: Colors.grey,
+                    color: colors.onSurfaceVariant,
                   ),
                 ),
               ),
@@ -9707,7 +10224,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 Icon(
                   icon,
                   size: 21,
-                  color: iconColor ?? Colors.blueGrey,
+                  color: iconColor ?? colors.primary,
                   semanticLabel: iconSemanticLabel,
                 ),
             ],
@@ -9715,14 +10232,20 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           const SizedBox(height: 6),
           Text(
             value,
-            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            style: TextStyle(
+              color: colors.onSurface,
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
           ),
           if (badgeText != null && badgeText.isNotEmpty) ...[
             const SizedBox(height: 10),
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
-                color: bg,
+                color: warning
+                    ? colors.tertiaryContainer
+                    : colors.secondaryContainer,
                 borderRadius: BorderRadius.circular(6),
               ),
               child: Text(
@@ -9730,7 +10253,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 style: TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.bold,
-                  color: text,
+                  color: warning
+                      ? colors.onTertiaryContainer
+                      : colors.onSecondaryContainer,
                 ),
               ),
             ),
@@ -9835,6 +10360,7 @@ class SnapshotDetailScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
     final bed1 = data.bed1 ?? GrowBedReading.empty();
     final bed2 = data.bed2 ?? GrowBedReading.empty();
     final bed1WaterFull = bed1.waterFull;
@@ -9843,22 +10369,7 @@ class SnapshotDetailScreen extends StatelessWidget {
     final bed2PhOptimal = bed2.ph >= minPh && bed2.ph <= maxPh;
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text(
-          'Data Log Detail',
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-            fontSize: 18,
-            color: Colors.black,
-          ),
-        ),
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Colors.black),
-          onPressed: () => Navigator.pop(context),
-        ),
-      ),
+      appBar: AppBar(title: const Text('Data Log Detail')),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(24.0),
         child: Column(
@@ -9871,8 +10382,8 @@ class SnapshotDetailScreen extends StatelessWidget {
             const SizedBox(height: 6),
             Text(
               'Logged: $formattedTime',
-              style: const TextStyle(
-                color: Colors.grey,
+              style: TextStyle(
+                color: colors.onSurfaceVariant,
                 fontWeight: FontWeight.bold,
                 fontSize: 13,
               ),
@@ -9884,7 +10395,7 @@ class SnapshotDetailScreen extends StatelessWidget {
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
-            _buildStaticGrid(bed1, bed1WaterFull, bed1PhOptimal),
+            _buildStaticGrid(context, bed1, bed1WaterFull, bed1PhOptimal),
 
             const SizedBox(height: 24),
             const Text(
@@ -9892,7 +10403,7 @@ class SnapshotDetailScreen extends StatelessWidget {
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
-            _buildStaticGrid(bed2, bed2WaterFull, bed2PhOptimal),
+            _buildStaticGrid(context, bed2, bed2WaterFull, bed2PhOptimal),
             const SizedBox(height: 24),
             const Text(
               'Shared Reservoir',
@@ -9900,15 +10411,16 @@ class SnapshotDetailScreen extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             _buildStaticCard(
+              context,
               'RESERVOIR',
               reservoirLabel(data.reservoir.level),
               data.reservoir.online ? 'RAIN online' : 'RAIN offline',
               bgOverride: data.reservoir.online
-                  ? const Color(0xFFE8F7ED)
-                  : const Color(0xFFFFF3E0),
+                  ? colors.secondaryContainer
+                  : colors.tertiaryContainer,
               textOverride: data.reservoir.online
-                  ? Colors.green.shade800
-                  : Colors.orange,
+                  ? colors.onSecondaryContainer
+                  : colors.onTertiaryContainer,
             ),
           ],
         ),
@@ -9917,10 +10429,12 @@ class SnapshotDetailScreen extends StatelessWidget {
   }
 
   Widget _buildStaticGrid(
+    BuildContext context,
     GrowBedReading bed,
     bool isWaterFull,
     bool isPhOptimal,
   ) {
+    final colors = Theme.of(context).colorScheme;
     final isTdsOptimal = bed.tds < 900;
 
     return Column(
@@ -9929,25 +10443,31 @@ class SnapshotDetailScreen extends StatelessWidget {
           children: [
             Expanded(
               child: _buildStaticCard(
+                context,
                 'ACIDITY (PH)',
                 '${bed.ph.toStringAsFixed(2)} pH',
                 isPhOptimal ? 'Normal' : 'Unstable',
                 bgOverride: isPhOptimal
-                    ? const Color(0xFFE8F7ED)
-                    : const Color(0xFFFFF3E0),
-                textOverride: isPhOptimal ? Colors.green : Colors.orange,
+                    ? colors.secondaryContainer
+                    : colors.tertiaryContainer,
+                textOverride: isPhOptimal
+                    ? colors.onSecondaryContainer
+                    : colors.onTertiaryContainer,
               ),
             ),
             const SizedBox(width: 16),
             Expanded(
               child: _buildStaticCard(
+                context,
                 'TDS',
                 '${bed.tds.toStringAsFixed(0)} PPM',
                 isTdsOptimal ? 'Optimal' : 'Warning',
                 bgOverride: isTdsOptimal
-                    ? const Color(0xFFE8F7ED)
-                    : const Color(0xFFFFF3E0),
-                textOverride: isTdsOptimal ? Colors.green : Colors.orange,
+                    ? colors.secondaryContainer
+                    : colors.tertiaryContainer,
+                textOverride: isTdsOptimal
+                    ? colors.onSecondaryContainer
+                    : colors.onTertiaryContainer,
               ),
             ),
           ],
@@ -9957,6 +10477,7 @@ class SnapshotDetailScreen extends StatelessWidget {
           children: [
             Expanded(
               child: _buildStaticCard(
+                context,
                 'WATER TEMP',
                 '${bed.temperature.toStringAsFixed(1)}°C',
                 'Log Data',
@@ -9965,13 +10486,16 @@ class SnapshotDetailScreen extends StatelessWidget {
             const SizedBox(width: 16),
             Expanded(
               child: _buildStaticCard(
+                context,
                 'GROW BED WATER LEVEL',
                 isWaterFull ? 'Water Full' : 'Needs Water',
                 isWaterFull ? 'Optimal' : 'Warning',
                 bgOverride: isWaterFull
-                    ? const Color(0xFFE8F7ED)
-                    : const Color(0xFFFFF3E0),
-                textOverride: isWaterFull ? Colors.green : Colors.orange,
+                    ? colors.secondaryContainer
+                    : colors.tertiaryContainer,
+                textOverride: isWaterFull
+                    ? colors.onSecondaryContainer
+                    : colors.onTertiaryContainer,
               ),
             ),
           ],
@@ -9981,21 +10505,23 @@ class SnapshotDetailScreen extends StatelessWidget {
   }
 
   Widget _buildStaticCard(
+    BuildContext context,
     String title,
     String value,
     String? badgeText, {
     Color? bgOverride,
     Color? textOverride,
   }) {
+    final colors = Theme.of(context).colorScheme;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: colors.surface,
         borderRadius: BorderRadius.circular(20),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withAlpha(5),
+            color: colors.shadow.withAlpha(30),
             blurRadius: 6,
             offset: const Offset(0, 2),
           ),
@@ -10006,23 +10532,27 @@ class SnapshotDetailScreen extends StatelessWidget {
         children: [
           Text(
             title,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 10,
               fontWeight: FontWeight.bold,
-              color: Colors.grey,
+              color: colors.onSurfaceVariant,
             ),
           ),
           const SizedBox(height: 6),
           Text(
             value,
-            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            style: TextStyle(
+              color: colors.onSurface,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
           ),
           if (badgeText != null && badgeText.isNotEmpty) ...[
             const SizedBox(height: 10),
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
-                color: bgOverride ?? const Color(0xFFF0F0F0),
+                color: bgOverride ?? colors.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(6),
               ),
               child: Text(
@@ -10030,7 +10560,7 @@ class SnapshotDetailScreen extends StatelessWidget {
                 style: TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.bold,
-                  color: textOverride ?? Colors.grey,
+                  color: textOverride ?? colors.onSurfaceVariant,
                 ),
               ),
             ),

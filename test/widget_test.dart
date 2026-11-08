@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:hydrodeck_test/main.dart';
+import 'package:hydrodeck_test/weather_service.dart';
 
 void main() {
   testWidgets('HydroDeck logo PNG renders within its square bounds', (
@@ -438,7 +439,8 @@ void main() {
 
     final growLightButton = find.byKey(const ValueKey('grow-light-button'));
     expect(growLightButton, findsOneWidget);
-    expect(find.text('OFF'), findsNWidgets(3));
+    expect(find.text('OFF'), findsOneWidget);
+    expect(find.text('ON'), findsNWidgets(2));
     expect(find.byKey(const ValueKey('water-pump-1-toggle')), findsOneWidget);
     expect(find.byKey(const ValueKey('water-pump-2-toggle')), findsOneWidget);
 
@@ -462,6 +464,9 @@ void main() {
     expect(find.text('hydrodeck.local'), findsNothing);
     expect(find.text('ESP32 Hotspot Setup'), findsOneWidget);
     expect(find.text('Connect to ESP32 Hotspot'), findsOneWidget);
+    expect(find.text('Theme'), findsNothing);
+    expect(find.text('Light'), findsNothing);
+    expect(find.text('System'), findsNothing);
 
     await tester.tap(find.text('DATA'));
     await tester.pumpAndSettle();
@@ -574,5 +579,72 @@ void main() {
     await tester.enterText(fields.first, 'grower@example.com');
     await tester.pump();
     expect(find.text('Please enter a valid email address.'), findsNothing);
+  });
+
+  testWidgets('weather screen uses current location and offers a retry', (
+    WidgetTester tester,
+  ) async {
+    var attempts = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: WeatherDetailScreen(
+          weatherLoader: () async {
+            attempts++;
+            if (attempts == 1) {
+              throw const WeatherException(
+                'Location services are turned off. Turn them on, then retry.',
+              );
+            }
+            return const WeatherConditions(
+              location: WeatherLocation(
+                name: 'Current location',
+                latitude: 14.6,
+                longitude: 121.0,
+              ),
+              temperature: 27,
+              feelsLike: 29,
+              humidity: 70,
+              precipitation: 0,
+              windSpeed: 10,
+              weatherCode: 0,
+              hourly: [],
+              forecast: [],
+            );
+          },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Current weather'), findsOneWidget);
+    expect(find.text('City or place'), findsNothing);
+    expect(find.byIcon(Icons.search), findsNothing);
+    expect(find.text('Retry'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.tap(find.text('Retry'));
+    await tester.pumpAndSettle();
+    expect(attempts, 2);
+    expect(find.text('Retry'), findsNothing);
+  });
+
+  testWidgets('signup form remains scrollable on a small keyboard viewport', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(360, 640);
+    tester.view.devicePixelRatio = 1;
+    tester.view.viewInsets = const FakeViewPadding(bottom: 260);
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SignupScreen(onLogin: () {}, onAuthenticated: (_) {}),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.byType(SingleChildScrollView), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.ensureVisible(find.text('Sign up'));
+    expect(find.text('Sign up'), findsOneWidget);
   });
 }

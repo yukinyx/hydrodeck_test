@@ -19,10 +19,10 @@ void main() {
         ),
       );
 
-      expect(find.text('Send another code in 00:03'), findsOneWidget);
+      expect(find.text('Resend code in 00:03'), findsOneWidget);
       var resendButton = tester.widget<TextButton>(
         find.ancestor(
-          of: find.text('Send another code in 00:03'),
+          of: find.text('Resend code in 00:03'),
           matching: find.byType(TextButton),
         ),
       );
@@ -30,24 +30,21 @@ void main() {
 
       now = now.add(const Duration(seconds: 1));
       await tester.pump(const Duration(seconds: 1));
-      expect(find.text('Send another code in 00:02'), findsOneWidget);
-      now = now.add(const Duration(seconds: 1));
-      await tester.pump(const Duration(seconds: 1));
-      expect(find.text('Send another code in 00:01'), findsOneWidget);
-      now = now.add(const Duration(seconds: 1));
-      await tester.pump(const Duration(seconds: 1));
-      expect(find.text('Send another code'), findsOneWidget);
+      expect(find.text('Resend code in 00:02'), findsOneWidget);
+      now = now.add(const Duration(seconds: 2));
+      await tester.pump(const Duration(seconds: 2));
+      expect(find.text('Resend code'), findsOneWidget);
 
       service.failNextSend = true;
-      await tester.tap(find.text('Send another code'));
+      await tester.tap(find.text('Resend code'));
       await tester.pump();
       expect(find.text('The mail service is unavailable.'), findsOneWidget);
-      expect(find.text('Send another code'), findsOneWidget);
+      expect(find.text('Resend code'), findsOneWidget);
 
       service.failNextSend = false;
-      await tester.tap(find.text('Send another code'));
+      await tester.tap(find.text('Resend code'));
       await tester.pump();
-      expect(find.text('Send another code in 03:00'), findsOneWidget);
+      expect(find.text('Resend code in 03:00'), findsOneWidget);
       expect(
         service.verifyCode(email: 'grower@example.com', code: '111111'),
         isFalse,
@@ -59,7 +56,7 @@ void main() {
 
       now = now.add(const Duration(seconds: 1));
       await tester.pump(const Duration(seconds: 1));
-      expect(find.text('Send another code in 02:59'), findsOneWidget);
+      expect(find.text('Resend code in 02:59'), findsOneWidget);
 
       await tester.pumpWidget(const SizedBox.shrink());
     },

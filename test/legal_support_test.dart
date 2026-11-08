@@ -92,7 +92,10 @@ void main() {
     expect(privacyScreen.title, 'Privacy Policy');
     expect(privacyScreen.document, contains('6. Retention and deletion'));
     expect(privacyScreen.document, contains('Retention schedule'));
-    expect(privacyScreen.document, contains('Official Personal Information Controller'));
+    expect(
+      privacyScreen.document,
+      contains('Official Personal Information Controller'),
+    );
   });
 
   testWidgets('signup policy links open the same policy screens', (
@@ -104,13 +107,12 @@ void main() {
       ),
     );
 
-    await tester.ensureVisible(
-      find.byKey(const ValueKey('signup-terms-link')),
-    );
+    await tester.ensureVisible(find.byKey(const ValueKey('signup-terms-link')));
     await tester.tap(find.byKey(const ValueKey('signup-terms-link')));
     await tester.pumpAndSettle();
     expect(
-      tester.widget<PolicyDocumentScreen>(find.byType(PolicyDocumentScreen))
+      tester
+          .widget<PolicyDocumentScreen>(find.byType(PolicyDocumentScreen))
           .document,
       contains('1. About HydroDeck'),
     );
@@ -123,7 +125,8 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('signup-privacy-link')));
     await tester.pumpAndSettle();
     expect(
-      tester.widget<PolicyDocumentScreen>(find.byType(PolicyDocumentScreen))
+      tester
+          .widget<PolicyDocumentScreen>(find.byType(PolicyDocumentScreen))
           .document,
       contains('1. Who is responsible for your information?'),
     );
@@ -189,6 +192,35 @@ void main() {
     );
     await tester.pumpWidget(const SizedBox.shrink());
     client.close();
+  });
+
+  testWidgets('support app bar inherits the current theme', (
+    WidgetTester tester,
+  ) async {
+    const surface = Color(0xFF103C36);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: ThemeData.dark().copyWith(
+          appBarTheme: const AppBarTheme(
+            backgroundColor: surface,
+            foregroundColor: Color(0xFFEAF3EF),
+          ),
+        ),
+        home: SupportRequestScreen(
+          client: MockClient((_) async => http.Response('{}', 200)),
+        ),
+      ),
+    );
+
+    final appBar = tester.widget<AppBar>(find.byType(AppBar));
+    expect(appBar.backgroundColor, isNull);
+    expect(appBar.foregroundColor, isNull);
+    final appBarMaterial = tester.widget<Material>(
+      find
+          .descendant(of: find.byType(AppBar), matching: find.byType(Material))
+          .first,
+    );
+    expect(appBarMaterial.color, surface);
   });
 }
 

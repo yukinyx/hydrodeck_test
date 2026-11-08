@@ -149,13 +149,9 @@ class _SupportRequestScreenState extends State<SupportRequestScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Contact Customer Support'),
-        backgroundColor: Colors.white,
-        foregroundColor: Colors.black,
-        elevation: 0,
-      ),
+      appBar: AppBar(title: const Text('Contact Customer Support')),
       body: SafeArea(
         child: Form(
           key: _formKey,
@@ -167,9 +163,9 @@ class _SupportRequestScreenState extends State<SupportRequestScreen> {
                 style: TextStyle(fontSize: 16),
               ),
               const SizedBox(height: 8),
-              const Text(
+              Text(
                 'Do not include passwords, Wi-Fi credentials, or other secrets.',
-                style: TextStyle(color: Colors.black54),
+                style: TextStyle(color: colors.onSurfaceVariant),
               ),
               const SizedBox(height: 20),
               TextFormField(
@@ -223,9 +219,7 @@ class _SupportRequestScreenState extends State<SupportRequestScreen> {
                   _statusMessage!,
                   key: const ValueKey('support-status'),
                   style: TextStyle(
-                    color: _submissionSucceeded
-                        ? const Color(0xFF168A43)
-                        : Colors.red.shade700,
+                    color: _submissionSucceeded ? colors.primary : colors.error,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
@@ -235,20 +229,22 @@ class _SupportRequestScreenState extends State<SupportRequestScreen> {
                 key: const ValueKey('support-submit'),
                 onPressed: _submitting ? null : _submit,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2DC867),
-                  foregroundColor: Colors.white,
+                  backgroundColor: colors.primary,
+                  foregroundColor: colors.onPrimary,
+                  disabledBackgroundColor: colors.surfaceContainerHighest,
+                  disabledForegroundColor: colors.onSurfaceVariant,
                   minimumSize: const Size.fromHeight(52),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(14),
                   ),
                 ),
                 child: _submitting
-                    ? const SizedBox(
+                    ? SizedBox(
                         height: 22,
                         width: 22,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
-                          color: Colors.white,
+                          color: colors.onPrimary,
                         ),
                       )
                     : const Text('Send request'),

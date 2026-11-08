@@ -178,17 +178,10 @@ class PolicyDocumentScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text(title),
-        backgroundColor: Colors.white,
-        foregroundColor: Colors.black,
-        elevation: 0,
-      ),
+      appBar: AppBar(title: Text(title), elevation: 0),
       body: ListView(
         padding: const EdgeInsets.all(24),
-        children: [
-          for (final line in document.split('\n')) _buildLine(line),
-        ],
+        children: [for (final line in document.split('\n')) _buildLine(line)],
       ),
     );
   }
@@ -275,20 +268,21 @@ class PolicySettingsSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
+        Text(
           'Legal & Support',
           style: TextStyle(
             fontWeight: FontWeight.bold,
             fontSize: 15,
-            color: Colors.black87,
+            color: colors.onSurface,
           ),
         ),
         const SizedBox(height: 8),
         Material(
-          color: Colors.white,
+          color: colors.surface,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
           ),
@@ -326,36 +320,38 @@ class PolicySettingsSection extends StatelessWidget {
 Widget policyConsentText({
   required VoidCallback onTermsTap,
   required VoidCallback onPrivacyTap,
-}) {
-  final linkStyle = TextButton.styleFrom(
-    foregroundColor: const Color(0xFF168A43),
-    padding: EdgeInsets.zero,
-    minimumSize: Size.zero,
-    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-    visualDensity: VisualDensity.compact,
-    textStyle: const TextStyle(
-      fontWeight: FontWeight.w600,
-      decoration: TextDecoration.underline,
-    ),
-  );
-  return Wrap(
-    crossAxisAlignment: WrapCrossAlignment.center,
-    children: [
-      const Text('By signing up, you agree to the '),
-      TextButton(
-        key: const ValueKey('signup-terms-link'),
-        onPressed: onTermsTap,
-        style: linkStyle,
-        child: const Text('Terms of Use'),
+}) => Builder(
+  builder: (context) {
+    final linkStyle = TextButton.styleFrom(
+      foregroundColor: Theme.of(context).colorScheme.primary,
+      padding: EdgeInsets.zero,
+      minimumSize: Size.zero,
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      visualDensity: VisualDensity.compact,
+      textStyle: const TextStyle(
+        fontWeight: FontWeight.w600,
+        decoration: TextDecoration.underline,
       ),
-      const Text(' and '),
-      TextButton(
-        key: const ValueKey('signup-privacy-link'),
-        onPressed: onPrivacyTap,
-        style: linkStyle,
-        child: const Text('Privacy Policy'),
-      ),
-      const Text('.'),
-    ],
-  );
-}
+    );
+    return Wrap(
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        const Text('By signing up, you agree to the '),
+        TextButton(
+          key: const ValueKey('signup-terms-link'),
+          onPressed: onTermsTap,
+          style: linkStyle,
+          child: const Text('Terms of Use'),
+        ),
+        const Text(' and '),
+        TextButton(
+          key: const ValueKey('signup-privacy-link'),
+          onPressed: onPrivacyTap,
+          style: linkStyle,
+          child: const Text('Privacy Policy'),
+        ),
+        const Text('.'),
+      ],
+    );
+  },
+);

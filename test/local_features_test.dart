@@ -3,7 +3,6 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'package:hydrodeck_test/main.dart';
 import 'package:hydrodeck_test/critical_ph_policy.dart';
-import 'package:hydrodeck_test/weather_service.dart';
 
 void main() {
   sqfliteFfiInit();
@@ -31,14 +30,6 @@ void main() {
               pH REAL NOT NULL,
               createdAt TEXT NOT NULL,
               isRead INTEGER NOT NULL DEFAULT 0
-            )
-          ''');
-          await db.execute('''
-            CREATE TABLE weather_location (
-              id INTEGER PRIMARY KEY,
-              name TEXT NOT NULL,
-              latitude REAL NOT NULL,
-              longitude REAL NOT NULL
             )
           ''');
           await db.execute(
@@ -116,20 +107,6 @@ void main() {
       expect(await DatabaseHelper.instance.getUnreadPhAlertCount(), 0);
     },
   );
-
-  test('weather location is stored locally for later refreshes', () async {
-    const location = WeatherLocation(
-      name: 'Quezon City, Metro Manila, Philippines',
-      latitude: 14.676,
-      longitude: 121.0437,
-    );
-    await DatabaseHelper.instance.saveWeatherLocation(location);
-
-    final saved = await DatabaseHelper.instance.getWeatherLocation();
-    expect(saved?.name, location.name);
-    expect(saved?.latitude, location.latitude);
-    expect(saved?.longitude, location.longitude);
-  });
 
   test('a pH episode keeps one deduplication ID until it resets', () {
     final episode = CriticalPhEpisode();

@@ -1,5 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 
 class WeatherLocation {
@@ -30,13 +33,29 @@ class WeatherForecastDay {
   });
 }
 
+class WeatherForecastHour {
+  final DateTime time;
+  final double? temperature;
+  final int? weatherCode;
+  final int? precipitationProbability;
+
+  const WeatherForecastHour({
+    required this.time,
+    required this.temperature,
+    required this.weatherCode,
+    required this.precipitationProbability,
+  });
+}
+
 class WeatherConditions {
   final WeatherLocation location;
   final double? temperature;
   final double? feelsLike;
   final int? humidity;
+  final double? precipitation;
   final double? windSpeed;
   final int? weatherCode;
+  final List<WeatherForecastHour> hourly;
   final List<WeatherForecastDay> forecast;
 
   const WeatherConditions({
@@ -44,52 +63,70 @@ class WeatherConditions {
     required this.temperature,
     required this.feelsLike,
     required this.humidity,
+    required this.precipitation,
     required this.windSpeed,
     required this.weatherCode,
+    required this.hourly,
     required this.forecast,
   });
 }
 
 class WeatherService {
-  static Future<List<WeatherLocation>> searchLocations(String query) async {
-    final trimmed = query.trim();
-    if (trimmed.length < 2) return const [];
-    final uri = Uri.https('geocoding-api.open-meteo.com', '/v1/search', {
-      'name': trimmed,
-      'count': '5',
-      'language': 'en',
-      'format': 'json',
-    });
-    final response = await http.get(uri).timeout(const Duration(seconds: 8));
-    if (response.statusCode != 200) {
-      throw const WeatherException('Location search is unavailable.');
-    }
-    final decoded = jsonDecode(response.body);
-    if (decoded is! Map<String, dynamic>) {
-      throw const WeatherException('Location search returned invalid data.');
-    }
-    final results = decoded['results'];
-    if (results is! List) return const [];
-    return results.whereType<Map<String, dynamic>>().map((result) {
-      final name = result['name'];
-      final latitude = result['latitude'];
-      final longitude = result['longitude'];
-      if (name is! String || latitude is! num || longitude is! num) {
-        throw const WeatherException('Location search returned invalid data.');
+  static Future<WeatherLocation> currentLocation() async {
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        throw const WeatherException(
+          'Location services are turned off. Turn them on, then retry.',
+        );
       }
-      final region = result['admin1'] as String?;
-      final country = result['country'] as String?;
-      final label = [
-        name,
-        region,
-        country,
-      ].whereType<String>().where((part) => part.isNotEmpty).toSet().join(', ');
-      return WeatherLocation(
-        name: label,
-        latitude: latitude.toDouble(),
-        longitude: longitude.toDouble(),
+
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.deniedForever) {
+        throw const WeatherException(
+          'Location permission is permanently denied. Allow location access in app settings, then retry.',
+          canOpenSettings: true,
+        );
+      }
+      if (permission != LocationPermission.whileInUse &&
+          permission != LocationPermission.always) {
+        throw const WeatherException(
+          'Location permission was denied. Allow location access, then retry.',
+        );
+      }
+
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.medium,
+          timeLimit: Duration(seconds: 15),
+        ),
       );
-    }).toList();
+      return WeatherLocation(
+        name: 'Current location',
+        latitude: position.latitude,
+        longitude: position.longitude,
+      );
+    } on WeatherException {
+      rethrow;
+    } on TimeoutException {
+      throw const WeatherException(
+        'Getting your current location timed out. Check location services, then retry.',
+      );
+    } on MissingPluginException {
+      throw const WeatherException('Location is not supported on this device.');
+    } on UnsupportedError {
+      throw const WeatherException('Location is not supported on this device.');
+    } on PlatformException {
+      throw const WeatherException(
+        'Could not access device location. Check location permissions and services, then retry.',
+      );
+    } on Exception {
+      throw const WeatherException(
+        'Could not get your current location. Check location permissions and services, then retry.',
+      );
+    }
   }
 
   static Future<WeatherConditions> fetch(WeatherLocation location) async {
@@ -97,13 +134,26 @@ class WeatherService {
       'latitude': location.latitude.toString(),
       'longitude': location.longitude.toString(),
       'current':
-          'temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m',
+          'temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m',
+      'hourly': 'temperature_2m,precipitation_probability,weather_code',
+      'forecast_hours': '24',
       'daily':
           'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max',
       'forecast_days': '5',
       'timezone': 'auto',
     });
-    final response = await http.get(uri).timeout(const Duration(seconds: 8));
+    late final http.Response response;
+    try {
+      response = await http.get(uri).timeout(const Duration(seconds: 8));
+    } on TimeoutException {
+      throw const WeatherException(
+        'The weather request timed out. Check your connection, then retry.',
+      );
+    } on http.ClientException {
+      throw const WeatherException(
+        'Could not connect to the weather service. Check your connection, then retry.',
+      );
+    }
     if (response.statusCode != 200) {
       throw const WeatherException('Weather is temporarily unavailable.');
     }
@@ -112,9 +162,35 @@ class WeatherService {
       throw const WeatherException('Weather returned invalid data.');
     }
     final current = decoded['current'];
+    final hourly = decoded['hourly'];
     final daily = decoded['daily'];
-    if (current is! Map<String, dynamic> || daily is! Map<String, dynamic>) {
+    if (current is! Map<String, dynamic> ||
+        hourly is! Map<String, dynamic> ||
+        daily is! Map<String, dynamic>) {
       throw const WeatherException('Weather returned incomplete data.');
+    }
+    final hourlyTimes = hourly['time'];
+    final hourlyTemperatures = hourly['temperature_2m'];
+    final hourlyCodes = hourly['weather_code'];
+    final hourlyPrecipitation = hourly['precipitation_probability'];
+    final hourlyForecast = <WeatherForecastHour>[];
+    if (hourlyTimes is List &&
+        hourlyTemperatures is List &&
+        hourlyCodes is List) {
+      final now = DateTime.now();
+      for (var index = 0; index < hourlyTimes.length; index++) {
+        final time = DateTime.tryParse(hourlyTimes[index].toString());
+        if (time == null || time.isBefore(now)) continue;
+        hourlyForecast.add(
+          WeatherForecastHour(
+            time: time,
+            temperature: _numberAt(hourlyTemperatures, index),
+            weatherCode: _integerAt(hourlyCodes, index),
+            precipitationProbability: _integerAt(hourlyPrecipitation, index),
+          ),
+        );
+        if (hourlyForecast.length == 12) break;
+      }
     }
     final times = daily['time'];
     final min = daily['temperature_2m_min'];
@@ -142,8 +218,10 @@ class WeatherService {
       temperature: _number(current['temperature_2m']),
       feelsLike: _number(current['apparent_temperature']),
       humidity: _integer(current['relative_humidity_2m']),
+      precipitation: _number(current['precipitation']),
       windSpeed: _number(current['wind_speed_10m']),
       weatherCode: _integer(current['weather_code']),
+      hourly: hourlyForecast,
       forecast: forecast,
     );
   }
@@ -163,8 +241,9 @@ class WeatherService {
 
 class WeatherException implements Exception {
   final String message;
+  final bool canOpenSettings;
 
-  const WeatherException(this.message);
+  const WeatherException(this.message, {this.canOpenSettings = false});
 
   @override
   String toString() => message;
