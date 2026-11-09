@@ -907,11 +907,21 @@ class NotificationHelper {
 
     await _notificationsPlugin.initialize(settings: settings);
 
-    _notificationsPlugin
+    final androidPlugin = _notificationsPlugin
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
-        >()
-        ?.requestNotificationsPermission();
+        >();
+    await androidPlugin?.createNotificationChannel(
+      const AndroidNotificationChannel(
+        'ph_alerts_channel_v2',
+        'pH Level Alerts',
+        description: 'Alerts when pH is out of range',
+        importance: Importance.max,
+        playSound: true,
+        sound: RawResourceAndroidNotificationSound('hydrodeck_drop'),
+      ),
+    );
+    androidPlugin?.requestNotificationsPermission();
   }
 
   static Future<void> showPhAlertNotification(
@@ -933,11 +943,13 @@ class NotificationHelper {
 
     const AndroidNotificationDetails androidDetails =
         AndroidNotificationDetails(
-          'ph_alerts_channel',
+          'ph_alerts_channel_v2',
           'pH Level Alerts',
-          channelDescription: 'Notifications for critical pH level limits',
+          channelDescription: 'Alerts when pH is out of range',
           importance: Importance.max,
           priority: Priority.high,
+          playSound: true,
+          sound: RawResourceAndroidNotificationSound('hydrodeck_drop'),
         );
 
     const NotificationDetails details = NotificationDetails(
@@ -1992,6 +2004,7 @@ Future<void> initializeBackgroundService() async {
 void onBackgroundServiceStart(ServiceInstance service) async {
   DartPluginRegistrant.ensureInitialized();
   initializeHydrodeckTimeZones();
+  await NotificationHelper.init();
 
   try {
     if (Firebase.apps.isEmpty) {
@@ -2014,7 +2027,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   GrowBedReading lastBed2 = GrowBedReading.empty();
   ReservoirReading lastReservoir = const ReservoirReading();
 
-  bool isAppClosed = false;
+  bool isAppClosed = true;
   bool isPlantingActive = false;
   int? activeBatchNumber;
 
@@ -4439,17 +4452,21 @@ class _ProfileScreenState extends State<ProfileScreen> {
       return;
     }
 
-    if ((newPassword.isNotEmpty || confirmPassword.isNotEmpty) &&
-        newPassword.length < 6) {
-      setState(() => _message = 'New password must be at least 6 characters.');
-      return;
-    }
+    if (newPassword.isNotEmpty || confirmPassword.isNotEmpty) {
+      final passwordError = validateSignupPasswordField(newPassword);
+      if (passwordError != null) {
+        setState(() => _message = passwordError);
+        return;
+      }
 
-    if (newPassword != confirmPassword) {
-      setState(
-        () => _message = 'New password and confirm password must match.',
+      final confirmationError = validateConfirmPasswordField(
+        newPassword,
+        confirmPassword,
       );
-      return;
+      if (confirmationError != null) {
+        setState(() => _message = confirmationError);
+        return;
+      }
     }
 
     if ((email != user.email || newPassword.isNotEmpty) &&
@@ -4469,7 +4486,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       if (email != user.email || newPassword.isNotEmpty) {
         final credential = EmailAuthProvider.credential(
           email: user.email ?? email,
-          password: _currentPasswordController.text.trim(),
+          password: _currentPasswordController.text,
         );
         await user.reauthenticateWithCredential(credential);
       }

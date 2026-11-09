@@ -169,7 +169,58 @@ void main() {
     });
 
     group('critical pH notifications', () {
-      test('requires over five continuous minutes and alerts once per episode', () {
+      test(
+        'alerts low and high readings only after more than five minutes',
+        () {
+          final startedAt = DateTime.utc(2026, 11, 5, 5);
+
+          for (final ph in [5.0, 7.5]) {
+            final tracker = CriticalPhEpisode();
+            expect(
+              tracker.shouldNotify(
+                ph: ph,
+                minimum: 5.5,
+                maximum: 7.0,
+                now: startedAt,
+              ),
+              isFalse,
+            );
+            expect(
+              tracker.shouldNotify(
+                ph: ph,
+                minimum: 5.5,
+                maximum: 7.0,
+                now: startedAt.add(const Duration(minutes: 5)),
+              ),
+              isFalse,
+            );
+            final firstAlert = startedAt.add(
+              const Duration(minutes: 5, milliseconds: 1),
+            );
+            expect(
+              tracker.shouldNotify(
+                ph: ph,
+                minimum: 5.5,
+                maximum: 7.0,
+                now: firstAlert,
+              ),
+              isTrue,
+            );
+            tracker.markNotified();
+            expect(
+              tracker.shouldNotify(
+                ph: ph,
+                minimum: 5.5,
+                maximum: 7.0,
+                now: firstAlert.add(const Duration(minutes: 10)),
+              ),
+              isFalse,
+            );
+          }
+        },
+      );
+
+      test('resets for in-range or invalid readings before a new episode', () {
         final tracker = CriticalPhEpisode();
         final startedAt = DateTime.utc(2026, 11, 5, 5);
 
@@ -184,53 +235,19 @@ void main() {
         );
         expect(
           tracker.shouldNotify(
-            ph: 5.0,
-            minimum: 5.5,
-            maximum: 7.0,
-            now: startedAt.add(const Duration(minutes: 5)),
-          ),
-          isFalse,
-        );
-        final firstAlert = startedAt.add(
-          const Duration(minutes: 5, milliseconds: 1),
-        );
-        expect(
-          tracker.shouldNotify(
-            ph: 5.0,
-            minimum: 5.5,
-            maximum: 7.0,
-            now: firstAlert,
-          ),
-          isTrue,
-        );
-        tracker.markNotified();
-        expect(
-          tracker.shouldNotify(
-            ph: 5.0,
-            minimum: 5.5,
-            maximum: 7.0,
-            now: firstAlert.add(const Duration(minutes: 10)),
-          ),
-          isFalse,
-        );
-      });
-
-      test('resets the episode for in-range or invalid readings', () {
-        final tracker = CriticalPhEpisode();
-        final startedAt = DateTime.utc(2026, 11, 5, 5);
-
-        tracker.shouldNotify(
-          ph: 5.0,
-          minimum: 5.5,
-          maximum: 7.0,
-          now: startedAt,
-        );
-        expect(
-          tracker.shouldNotify(
             ph: 6.0,
             minimum: 5.5,
             maximum: 7.0,
             now: startedAt.add(const Duration(minutes: 3)),
+          ),
+          isFalse,
+        );
+        expect(
+          tracker.shouldNotify(
+            ph: double.nan,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: startedAt.add(const Duration(minutes: 4)),
           ),
           isFalse,
         );
@@ -245,10 +262,10 @@ void main() {
         );
         expect(
           tracker.shouldNotify(
-            ph: double.nan,
+            ph: 5.0,
             minimum: 5.5,
             maximum: 7.0,
-            now: startedAt.add(const Duration(minutes: 14)),
+            now: startedAt.add(const Duration(minutes: 13)),
           ),
           isFalse,
         );
@@ -257,9 +274,37 @@ void main() {
             ph: 5.0,
             minimum: 5.5,
             maximum: 7.0,
-            now: startedAt.add(const Duration(minutes: 19)),
+            now: startedAt.add(const Duration(minutes: 13, milliseconds: 1)),
+          ),
+          isTrue,
+        );
+        tracker.markNotified();
+        expect(
+          tracker.shouldNotify(
+            ph: 6.0,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: startedAt.add(const Duration(minutes: 14)),
           ),
           isFalse,
+        );
+        expect(
+          tracker.shouldNotify(
+            ph: 7.5,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: startedAt.add(const Duration(minutes: 15)),
+          ),
+          isFalse,
+        );
+        expect(
+          tracker.shouldNotify(
+            ph: 7.5,
+            minimum: 5.5,
+            maximum: 7.0,
+            now: startedAt.add(const Duration(minutes: 20, milliseconds: 1)),
+          ),
+          isTrue,
         );
       });
     });
@@ -390,6 +435,20 @@ void main() {
     test('validates empty and malformed login fields', () {
       expect(validateLoginFields(email: ' ', password: ''), isNotNull);
       expect(
+        validateLoginFields(
+          email: 'grower@example.com',
+          password: '  1       ',
+        ),
+        passwordWhitespaceError,
+      );
+      expect(
+        validateLoginFields(
+          email: 'grower@example.com',
+          password: ' \t\n ',
+        ),
+        passwordWhitespaceError,
+      );
+      expect(
         validateLoginFields(email: 'not-an-email', password: 'secret'),
         'Please enter a valid email address.',
       );
@@ -412,6 +471,20 @@ void main() {
       expect(
         validateSignupPasswordField('short'),
         'Password must be at least 6 characters.',
+      );
+      expect(validateSignupPasswordField('       '), passwordWhitespaceError);
+      expect(validateSignupPasswordField('secret\t1'), passwordWhitespaceError);
+      expect(validateSignupPasswordField('secret\n1'), passwordWhitespaceError);
+      expect(validateSignupPasswordField('secret1'), isNull);
+      expect(validatePasswordField('  1       '), passwordWhitespaceError);
+      expect(validatePasswordField(' \t\n '), passwordWhitespaceError);
+      expect(validatePasswordField('secret\t1'), passwordWhitespaceError);
+      expect(validatePasswordField('secret\n1'), passwordWhitespaceError);
+      expect(validatePasswordField('secret1'), isNull);
+      expect(validateConfirmPasswordField('secret1', 'secret1'), isNull);
+      expect(
+        validateConfirmPasswordField('secret1', 'secret\t1'),
+        passwordWhitespaceError,
       );
       expect(validateConfirmPasswordField('secret1', 'secret2'), 'Passwords do not match.');
     });

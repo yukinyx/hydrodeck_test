@@ -2,6 +2,10 @@ import 'package:firebase_auth/firebase_auth.dart';
 
 final RegExp loginEmailPattern = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
 final RegExp signupPhonePattern = RegExp(r'^09\d{9}$');
+final RegExp _passwordWhitespacePattern = RegExp(r'\s');
+
+const String passwordWhitespaceError =
+    'Passwords cannot contain spaces or other whitespace.';
 
 String? validateEmailField(String email) {
   if (email.trim().isEmpty) return 'Please enter your email address.';
@@ -11,9 +15,13 @@ String? validateEmailField(String email) {
   return null;
 }
 
-String? validatePasswordField(String password) => password.isEmpty
-    ? 'Please enter your password.'
-    : null;
+String? validatePasswordField(String password) {
+  if (password.isEmpty) return 'Please enter your password.';
+  if (_passwordWhitespacePattern.hasMatch(password)) {
+    return passwordWhitespaceError;
+  }
+  return null;
+}
 
 String? validateSignupPhoneField(String phone) {
   if (phone.trim().isEmpty) return 'Please enter your phone number.';
@@ -25,20 +33,24 @@ String? validateSignupPhoneField(String phone) {
 
 String? validateSignupPasswordField(String password) {
   if (password.isEmpty) return 'Please enter a password.';
+  if (_passwordWhitespacePattern.hasMatch(password)) {
+    return passwordWhitespaceError;
+  }
   if (password.length < 6) return 'Password must be at least 6 characters.';
   return null;
 }
 
 String? validateConfirmPasswordField(String password, String confirmation) {
   if (confirmation.isEmpty) return 'Please confirm your password.';
+  if (_passwordWhitespacePattern.hasMatch(password) ||
+      _passwordWhitespacePattern.hasMatch(confirmation)) {
+    return passwordWhitespaceError;
+  }
   if (password != confirmation) return 'Passwords do not match.';
   return null;
 }
 
-String? validateLoginFields({
-  required String email,
-  required String password,
-}) {
+String? validateLoginFields({required String email, required String password}) {
   final trimmedEmail = email.trim();
   if (trimmedEmail.isEmpty && password.isEmpty) {
     return 'Please enter your email address and password.';
@@ -49,7 +61,7 @@ String? validateLoginFields({
   if (password.isEmpty) {
     return 'Please enter your password.';
   }
-  return validateEmailField(trimmedEmail);
+  return validateEmailField(trimmedEmail) ?? validatePasswordField(password);
 }
 
 String friendlyLoginAuthMessage(String code) {
