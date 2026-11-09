@@ -498,7 +498,7 @@ class DatabaseHelper {
       'recordType': log.recordType,
       'recordId': log.identity,
       'source': log.source,
-      'reservoir': normalizeReservoirLevel(log.reservoir.level),
+      'reservoir': jsonEncode(log.reservoir.toMap()),
       'rainNodeOnline': log.reservoir.online ? 1 : 0,
     };
   }
@@ -892,6 +892,10 @@ class DatabaseHelper {
 }
 
 // --- NOTIFICATION SERVICE ---
+int notificationIdFor(String alertId) =>
+    (int.tryParse(alertId) ?? DateTime.now().millisecondsSinceEpoch) &
+    0x7FFFFFFF;
+
 class NotificationHelper {
   static final FlutterLocalNotificationsPlugin _notificationsPlugin =
       FlutterLocalNotificationsPlugin();
@@ -956,13 +960,19 @@ class NotificationHelper {
       android: androidDetails,
     );
 
-    await _notificationsPlugin.show(
-      id: int.tryParse(alertId) ?? DateTime.now().millisecondsSinceEpoch,
-      title: '⚠️ Critical pH Alert',
-      body:
-          'pH level has remained outside the configured range (${ph.toStringAsFixed(2)}) for more than 5 minutes.',
-      notificationDetails: details,
-    );
+    try {
+      await _notificationsPlugin.show(
+        id: notificationIdFor(alertId),
+        title: '⚠️ Critical pH Alert',
+        body:
+            'pH level has remained outside the configured range (${ph.toStringAsFixed(2)}) for more than 5 minutes.',
+        notificationDetails: details,
+      );
+    } catch (error, stackTrace) {
+      debugPrint('Could not show pH alert notification: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      rethrow;
+    }
   }
 }
 
@@ -1148,15 +1158,24 @@ class _WeatherHomeCardState extends State<WeatherHomeCard> {
   String? _locationName;
   Object? _error;
   bool _loading = true;
+  bool _refreshInProgress = false;
+  int _failedRefreshes = 0;
+  Timer? _retryTimer;
+  Timer? _refreshTimer;
 
   @override
   void initState() {
     super.initState();
+    _refreshTimer = Timer.periodic(
+      const Duration(minutes: 15),
+      (_) => unawaited(_refresh()),
+    );
     unawaited(_refresh());
   }
 
   Future<void> _refresh() async {
-    if (!mounted) return;
+    if (!mounted || _refreshInProgress) return;
+    _refreshInProgress = true;
     setState(() {
       _loading = true;
       _error = null;
@@ -1164,6 +1183,8 @@ class _WeatherHomeCardState extends State<WeatherHomeCard> {
     try {
       final conditions = await _fetchCurrentWeather();
       if (!mounted) return;
+      _failedRefreshes = 0;
+      _retryTimer?.cancel();
       setState(() {
         _locationName = conditions.location.name;
         _conditions = conditions;
@@ -1172,10 +1193,23 @@ class _WeatherHomeCardState extends State<WeatherHomeCard> {
     } catch (error) {
       if (!mounted) return;
       debugPrint('Current weather load failed: $error');
+      _failedRefreshes++;
+      final cachedConditions = WeatherService.lastSuccessfulConditions;
       setState(() {
+        _conditions = cachedConditions ?? _conditions;
+        _locationName = _conditions?.location.name ?? _locationName;
         _error = error;
         _loading = false;
       });
+      _retryTimer?.cancel();
+      _retryTimer = Timer(
+        _failedRefreshes <= 3
+            ? const Duration(seconds: 30)
+            : const Duration(minutes: 10),
+        () => unawaited(_refresh()),
+      );
+    } finally {
+      _refreshInProgress = false;
     }
   }
 
@@ -1184,6 +1218,13 @@ class _WeatherHomeCardState extends State<WeatherHomeCard> {
       context,
       MaterialPageRoute(builder: (_) => const WeatherDetailScreen()),
     ).then((_) => _refresh());
+  }
+
+  @override
+  void dispose() {
+    _retryTimer?.cancel();
+    _refreshTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -1201,59 +1242,73 @@ class _WeatherHomeCardState extends State<WeatherHomeCard> {
           constraints: const BoxConstraints(maxWidth: 164),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
-            child: Row(
+            child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(
-                  weatherIcon(conditions?.weatherCode),
-                  size: 18,
-                  color: colors.primary,
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      weatherIcon(conditions?.weatherCode),
+                      size: 18,
+                      color: colors.primary,
+                    ),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(
+                        _locationName ?? 'Weather',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: colors.onSurface,
+                          fontWeight: FontWeight.w600,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    if (_loading && temperature == null)
+                      Icon(
+                        Icons.location_searching,
+                        size: 15,
+                        color: colors.primary,
+                      )
+                    else if (temperature != null)
+                      Text(
+                        '${temperature.toStringAsFixed(0)}°',
+                        style: TextStyle(
+                          color: colors.onSurface,
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      )
+                    else if (conditions?.weatherCode != null)
+                      Text(
+                        weatherDescription(conditions!.weatherCode),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: colors.onSurface,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      )
+                    else
+                      Icon(
+                        _error == null
+                            ? Icons.chevron_right
+                            : Icons.info_outline,
+                        size: 18,
+                        color: colors.onSurfaceVariant,
+                      ),
+                  ],
                 ),
-                const SizedBox(width: 6),
-                Flexible(
-                  child: Text(
-                    _locationName ?? 'Weather',
+                if (_error != null && conditions != null)
+                  const Text(
+                    'Showing last available weather',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: colors.onSurface,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 12,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 6),
-                if (_loading && temperature == null)
-                  Icon(
-                    Icons.location_searching,
-                    size: 15,
-                    color: colors.primary,
-                  )
-                else if (temperature != null)
-                  Text(
-                    '${temperature.toStringAsFixed(0)}°',
-                    style: TextStyle(
-                      color: colors.onSurface,
-                      fontSize: 14,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  )
-                else if (conditions?.weatherCode != null)
-                  Text(
-                    weatherDescription(conditions!.weatherCode),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: colors.onSurface,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  )
-                else
-                  Icon(
-                    _error == null ? Icons.chevron_right : Icons.info_outline,
-                    size: 18,
-                    color: colors.onSurfaceVariant,
+                    style: TextStyle(fontSize: 9),
                   ),
               ],
             ),
@@ -1304,6 +1359,7 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
     } on WeatherException catch (error) {
       if (!mounted) return;
       setState(() {
+        _conditions = WeatherService.lastSuccessfulConditions ?? _conditions;
         _error = error.message;
         _canOpenSettings = error.canOpenSettings;
         _loading = false;
@@ -1312,7 +1368,8 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
       if (!mounted) return;
       debugPrint('Weather detail load failed: $error');
       setState(() {
-        _error = 'Could not load current weather. Please retry.';
+        _conditions = WeatherService.lastSuccessfulConditions ?? _conditions;
+        _error = '${error.runtimeType}: $error';
         _loading = false;
       });
     }
@@ -1381,7 +1438,7 @@ class _WeatherDetailScreenState extends State<WeatherDetailScreen> {
                 Text(
                   conditions == null
                       ? 'Weather unavailable: $_error'
-                      : 'Showing the last available weather. Refresh failed: $_error',
+                      : 'Showing last available weather. Refresh failed: $_error',
                   style: TextStyle(
                     color: conditions == null
                         ? colors.error
@@ -1633,12 +1690,18 @@ IconData weatherIcon(int? code) => switch (code) {
 class ReservoirReading {
   final String level;
   final bool online;
+  final bool cloud;
 
-  const ReservoirReading({this.level = 'not_full', this.online = false});
+  const ReservoirReading({
+    this.level = 'not_full',
+    this.online = false,
+    this.cloud = false,
+  });
 
   Map<String, dynamic> toMap() => {
     'level': normalizeReservoirLevel(level),
     'online': online,
+    'cloud': cloud,
   };
 
   static ReservoirReading fromSources({
@@ -1687,6 +1750,7 @@ class ReservoirReading {
     return ReservoirReading(
       level: normalizeReservoirLevel(sharedLevel ?? legacyLevel),
       online: sharedOnline ?? legacyOnline ?? false,
+      cloud: sharedMap?['cloud'] == true,
     );
   }
 }
@@ -1697,6 +1761,23 @@ String normalizeReservoirLevel(dynamic value) =>
       'not_full' || 'above_50' || '50_or_below' => 'not_full',
       _ => 'not_full',
     };
+
+ReservoirReading? freshRainNodeStatus(dynamic payload, {DateTime? now}) {
+  if (payload is! Map) return null;
+  final status = payload['rainNodeStatus'];
+  if (status is! Map || status['online'] != true) return null;
+  if (!isRainStatusFresh(_parseHeartbeatMillis(status['updatedAt']), now: now)) {
+    return null;
+  }
+  final reservoir = status['reservoir'];
+  return ReservoirReading(
+    level: normalizeReservoirLevel(
+      reservoir is Map ? reservoir['level'] : null,
+    ),
+    online: true,
+    cloud: true,
+  );
+}
 
 class GrowBedReading {
   final double temperature;
@@ -2239,6 +2320,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     double? currentPhReading;
     String telemetrySource = 'offline';
     bool firebaseHeartbeatFresh = false;
+    ReservoirReading? directRainReservoir;
     String cleanTargetIp = sanitizeHost(targetIp);
 
     // 1. Fast attempt to primary target IP
@@ -2265,6 +2347,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       lastReservoir = ReservoirReading.fromSources(
         shared: normalized['reservoir'],
       );
+      directRainReservoir = lastReservoir;
       lastGrowLight = HydrodeckTelemetry._readBoolLike(
         {'growLight': normalized['growLight']},
         const ['growLight'],
@@ -2329,6 +2412,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
           lastReservoir = ReservoirReading.fromSources(
             shared: normalized['reservoir'],
           );
+          directRainReservoir = lastReservoir;
           lastGrowLight = HydrodeckTelemetry._readBoolLike(
             {'growLight': normalized['growLight']},
             const ['growLight'],
@@ -2383,6 +2467,11 @@ void onBackgroundServiceStart(ServiceInstance service) async {
           lastBed1 = telemetry.bed1;
           lastBed2 = telemetry.bed2;
           lastReservoir = telemetry.reservoir;
+          directRainReservoir = telemetry.reservoir;
+          final cloudRainReservoir = freshRainNodeStatus(data);
+          if (!lastReservoir.online && cloudRainReservoir != null) {
+            lastReservoir = cloudRainReservoir;
+          }
           lastGrowLight = telemetry.growLightOn;
           lastPh = lastBed2.ph;
           lastTemp = '${lastBed2.temperature.toStringAsFixed(1)}°C';
@@ -2418,14 +2507,16 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         isAppClosed) {
       final alertId = criticalPhEpisode.notificationId;
       if (alertId != null) {
-        unawaited(
-          NotificationHelper.showPhAlertNotification(
+        try {
+          await NotificationHelper.showPhAlertNotification(
             currentPhReading!,
             alertId: alertId,
-          ),
-        );
+          );
+          criticalPhEpisode.markNotified();
+        } catch (_) {
+          // Leave the episode pending so the next poll can retry the notification.
+        }
       }
-      criticalPhEpisode.markNotified();
     }
 
     service.invoke('telemetryUpdate', {
@@ -2441,6 +2532,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       'bed1': lastBed1.toMap(),
       'bed2': lastBed2.toMap(),
       'reservoir': lastReservoir.toMap(),
+      'rainDirectReservoir': directRainReservoir?.toMap(),
       'growLight': lastGrowLight,
     });
 
@@ -6696,6 +6788,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
   GrowBedReading _bed1 = GrowBedReading.empty();
   GrowBedReading _bed2 = GrowBedReading.empty();
   ReservoirReading _reservoir = const ReservoirReading();
+  ReservoirReading _rainDirectReservoir = const ReservoirReading();
+  ReservoirReading? _rainCloudReservoir;
+  int? _rainCloudStatusUpdatedAtMillis;
+  bool _rainDirectLinkOnline = false;
   final Map<String, bool> _controlStates = {
     'bed1_water': false,
     'bed1_ph_up': false,
@@ -6783,7 +6879,10 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
     _connectionTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       if (mounted) {
         unawaited(_refreshConnectivity(showLoading: false));
-        setState(_updateConnectionStatus);
+        setState(() {
+          _updateRainDisplay();
+          _updateConnectionStatus();
+        });
         if (_firebaseConnected == true) {
           _offlinePromptShown = false;
           _offlineBannerDismissed = false;
@@ -6912,6 +7011,11 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           final heartbeatMillis = _parseHeartbeatMillis(lastSeen);
           final heartbeatFresh = isDeviceHeartbeatFresh(heartbeatMillis);
           final telemetry = HydrodeckTelemetry.fromJson(payload);
+          final cloudRainReservoir = freshRainNodeStatus(payload);
+          final rainNodeStatus = payload['rainNodeStatus'];
+          final rainStatusUpdatedAtMillis = rainNodeStatus is Map
+              ? _parseHeartbeatMillis(rainNodeStatus['updatedAt'])
+              : null;
           final settings = payload['settings'];
           double? sharedMinPh;
           double? sharedMaxPh;
@@ -6933,11 +7037,15 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
             localTelemetryFresh: _hasFreshLocalTelemetry,
           );
           setState(() {
+            _rainCloudReservoir = cloudRainReservoir;
+            _rainCloudStatusUpdatedAtMillis = cloudRainReservoir == null
+                ? null
+                : rainStatusUpdatedAtMillis;
             if (heartbeatFresh) {
               _lastFirebaseTelemetryAt = DateTime.now();
             }
             if (applyFirebaseDeviceState) {
-              _reservoir = telemetry.reservoir;
+              _setRainDirectReservoir(telemetry.reservoir);
               if (payload.containsKey('temp1') ||
                   payload.containsKey('ph1') ||
                   payload.containsKey('tds1') ||
@@ -6982,6 +7090,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
               );
               _applyGrowLightTelemetry(telemetry.growLightOn);
             }
+            _updateRainDisplay();
             _updateConnectionStatus();
             if (payload['ip'] != null) {
               _esp32Ip = payload['ip'].toString();
@@ -7404,7 +7513,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         setState(() {
           _bed1 = result.value.bed1;
           _bed2 = result.value.bed2;
-          _reservoir = result.value.reservoir;
+          _setRainDirectReservoir(result.value.reservoir);
+          _updateRainDisplay();
           _applyGrowLightTelemetry(result.value.growLightOn);
           _updateActuatorStates(result.value.actuatorStates, isLocal: true);
           _esp32Ip = result.key;
@@ -7475,6 +7585,22 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
       localTelemetryFresh: _hasFreshLocalTelemetry,
       firebaseHeartbeatFresh: _hasFreshFirebaseTelemetry,
     );
+  }
+
+  void _setRainDirectReservoir(ReservoirReading reservoir) {
+    _rainDirectReservoir = reservoir;
+    _rainDirectLinkOnline = reservoir.online;
+  }
+
+  void _updateRainDisplay() {
+    if (_rainCloudReservoir != null &&
+        !isRainStatusFresh(_rainCloudStatusUpdatedAtMillis)) {
+      _rainCloudReservoir = null;
+      _rainCloudStatusUpdatedAtMillis = null;
+    }
+    _reservoir = _rainDirectLinkOnline
+        ? _rainDirectReservoir
+        : _rainCloudReservoir ?? _rainDirectReservoir;
   }
 
   bool get _hasFreshLocalTelemetry =>
@@ -7690,9 +7816,20 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 );
               }
               if (event['reservoir'] is Map) {
-                _reservoir = ReservoirReading.fromSources(
-                  shared: event['reservoir'],
-                );
+                if (isLocalUpdate) {
+                  _setRainDirectReservoir(
+                    ReservoirReading.fromSources(
+                      shared: event['reservoir'],
+                    ),
+                  );
+                } else if (applyDeviceState &&
+                    event['rainDirectReservoir'] is Map) {
+                  _setRainDirectReservoir(
+                    ReservoirReading.fromSources(
+                      shared: event['rainDirectReservoir'],
+                    ),
+                  );
+                }
               }
               if (event['bed2'] != null) {
                 _bed2 = GrowBedReading.fromMap(
@@ -7747,6 +7884,7 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                 );
               }
             }
+            _updateRainDisplay();
             if (event['water'] != null) {
               _lastValidWaterStatus = event['water'];
             }
@@ -8079,8 +8217,14 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         (_pendingActuatorStates[key] == false || requestedOn)) {
       return;
     }
-    if (isWaterPump && requestedOn && !_reservoir.online) {
-      _showCommandMessage(actuatorName, 'Rainwater unit offline.');
+    if (isWaterPump &&
+        requestedOn &&
+        !(_rainCloudReservoir?.online == true &&
+            isRainStatusFresh(_rainCloudStatusUpdatedAtMillis))) {
+      _showCommandMessage(
+        actuatorName,
+        'Rainwater unit offline.',
+      );
       return;
     }
     if (isWaterPump && requestedOn && _otherWaterPumpIsRunning(actuatorName)) {
@@ -8287,7 +8431,8 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
         _lastLocalTelemetryAt = DateTime.now();
         _bed1 = telemetry.bed1;
         _bed2 = telemetry.bed2;
-        _reservoir = telemetry.reservoir;
+        _setRainDirectReservoir(telemetry.reservoir);
+        _updateRainDisplay();
         _applyGrowLightTelemetry(telemetry.growLightOn);
         _updateActuatorStates(telemetry.actuatorStates, isLocal: true);
         _hotspotStatus = 'Connected to ESP32 hotspot for local control.';
@@ -9288,7 +9433,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           _buildCleanCard(
             'RESERVOIR',
             reservoirLabel(_reservoir.level),
-            _reservoir.online ? 'RAIN online' : 'RAIN offline',
+            _reservoir.online
+                ? (_reservoir.cloud ? 'RAIN online (cloud)' : 'RAIN online')
+                : 'RAIN offline',
             warning: !_reservoir.online,
           ),
         ],
@@ -9497,7 +9644,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
           : (bedIndex == 1 ? 'waterPump1' : 'waterPump2');
       final needsWater = bedIndex == 1 ? !_bed1.waterFull : !_bed2.waterFull;
       final isOn = _controlStates[key] ?? false;
-      final rainNodeOnline = _reservoir.online;
+      final rainNodeOnline =
+          _rainCloudReservoir?.online == true &&
+          isRainStatusFresh(_rainCloudStatusUpdatedAtMillis);
       final commandPending = _pendingCommandIds.containsKey(actuator);
       return Column(
         children: [
@@ -9630,7 +9779,9 @@ class _HydroponicsDashboardState extends State<HydroponicsDashboard>
                   ),
                 ),
                 Text(
-                  _reservoir.online ? 'Online' : 'Offline',
+                  _reservoir.online
+                      ? (_reservoir.cloud ? 'Online (cloud)' : 'Online')
+                      : 'Offline',
                   style: TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
@@ -10431,7 +10582,11 @@ class SnapshotDetailScreen extends StatelessWidget {
               context,
               'RESERVOIR',
               reservoirLabel(data.reservoir.level),
-              data.reservoir.online ? 'RAIN online' : 'RAIN offline',
+              data.reservoir.online
+                  ? (data.reservoir.cloud
+                        ? 'RAIN online (cloud)'
+                        : 'RAIN online')
+                  : 'RAIN offline',
               bgOverride: data.reservoir.online
                   ? colors.secondaryContainer
                   : colors.tertiaryContainer,

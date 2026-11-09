@@ -48,8 +48,26 @@ const unsigned long WIFI_CONNECT_TIMEOUT_MS = 8000UL;
 const unsigned long WIFI_RETRY_BASE_MS = 30000UL;
 const unsigned long WIFI_RETRY_MAX_MS = 120000UL;
 const unsigned long FIREBASE_STATUS_INTERVAL_MS = 5000UL;
-const unsigned long FIREBASE_RESULT_TIMEOUT_MS = 15000UL;
+const unsigned long FIREBASE_RESULT_TIMEOUT_MS = 10000UL;
 const unsigned long RAIN_PROVISION_ACK_RETRY_MS = 500UL;
+
+// Low-memory protection: restart before the heap is exhausted so the unit keeps
+// running 24/7. A restart needs the condition to persist for several checks and
+// is skipped during the first minutes after boot, so it can never reboot-loop.
+const uint32_t LOW_HEAP_FREE_BYTES = 20000;          // free heap below this = low
+const uint32_t LOW_HEAP_LARGEST_BLOCK_BYTES = 10000; // largest allocatable block below this = low
+const uint8_t LOW_HEAP_CONSECUTIVE_CHECKS = 3;       // consecutive low checks before restart
+const unsigned long LOW_HEAP_CHECK_INTERVAL_MS = 10000UL;
+const unsigned long LOW_HEAP_BOOT_GRACE_MS = 300000UL; // no restart in the first 5 minutes
+const unsigned long HEAP_LOG_INTERVAL_MS = 60000UL;
+
+// Fast path: Firebase uploads failing/stuck for this long while memory is
+// nearly full (too little left for a TLS handshake) = restart right away
+// instead of staying offline.
+const unsigned long UPLOAD_FAIL_RESTART_MS = 10000UL;
+const unsigned long UPLOAD_FAIL_BOOT_GRACE_MS = 90000UL;
+const uint32_t NEAR_FULL_FREE_BYTES = 40000;          // free heap below this = near full
+const uint32_t NEAR_FULL_LARGEST_BLOCK_BYTES = 30000; // largest block below this = near full
 const uint8_t RAIN_PROVISION_ACK_MAX_ATTEMPTS = 10;
 const uint16_t ESPNOW_MAGIC = 0x4859;
 const uint8_t ESPNOW_VERSION = 2;
@@ -222,6 +240,36 @@ unsigned long wifiCredentialsConnectAfter = 0;
 bool firebaseInitialized = false;
 bool firebaseStatusWritePending = false;
 unsigned long firebaseStatusWriteStartedAt = 0;
+// 0 = Firebase uploads healthy; otherwise millis() when they started failing.
+// The memory guard uses it to restart quickly when uploads fail while memory
+// is nearly full.
+unsigned long firebaseUploadFailingSince = 0;
+
+void noteFirebaseUploadFailure() {
+  if (firebaseUploadFailingSince != 0) return;
+  firebaseUploadFailingSince = millis();
+  if (firebaseUploadFailingSince == 0) firebaseUploadFailingSince = 1;
+}
+
+void noteFirebaseUploadSuccess() {
+  firebaseUploadFailingSince = 0;
+}
+
+// ---- Direct Firebase pump control (works without the MAIN unit) ----
+const unsigned long REMOTE_COMMAND_INTERVAL_MS = 1000UL;  // how often RAIN checks Firebase for pump commands
+const unsigned long CLOUD_REQUEST_TIMEOUT_MS = 10000UL;
+const unsigned long CLOUD_LINK_TIMEOUT_MS = 30000UL;      // a Firebase-started pump stops if Firebase is unreachable this long
+const long CLOUD_COMMAND_MAX_AGE_S = 120;                 // start commands older than this are ignored
+const unsigned long ACTUATOR_RESYNC_MS = 30000UL;         // re-publish pump state this often
+bool pump1Cloud = false;          // pump is running because of a Firebase command
+bool pump2Cloud = false;
+bool startingFromCloud = false;
+unsigned long lastCloudPollOkAt = 0;
+bool cloudPollPending = false;
+unsigned long cloudPollStartedAt = 0;
+unsigned long lastCloudPollAt = 0;
+bool cloudWritePending = false;
+unsigned long cloudWriteStartedAt = 0;
 unsigned long lastFirebaseStatusWriteAt = 0;
 bool ntpConfigured = false;
 uint32_t lastProvisionRequestId = 0;
@@ -237,6 +285,7 @@ bool reservoirFullWet = false;
 bool reservoirFullCandidate = false;
 unsigned long reservoirFullCandidateAt = 0;
 Preferences wifiPreferences;
+Preferences cloudCommandPreferences;  // pump-command bookkeeping (survives restarts)
 String savedSsid;
 String savedPassword;
 WiFiClientSecure sslClient;
@@ -438,17 +487,20 @@ void setPumpRelays(bool pump1Requested, bool pump2Requested, unsigned long now) 
   if (pump1Requested && pump2On) {
     digitalWrite(WATER_PUMP2_PIN, PUMP_OFF);
     pump2On = false;
+    pump2Cloud = false;
     pump2ActiveCommandId = "";
   }
   if (pump2Requested && pump1On) {
     digitalWrite(WATER_PUMP1_PIN, PUMP_OFF);
     pump1On = false;
+    pump1Cloud = false;
     pump1ActiveCommandId = "";
   }
 
   if (pump1Requested != pump1On) {
     digitalWrite(WATER_PUMP1_PIN, pump1Requested ? PUMP_ON : PUMP_OFF);
     pump1On = pump1Requested;
+    pump1Cloud = pump1On && startingFromCloud;
     if (pump1On) {
       pump1StartedAt = now;
       if (LOCAL_MAX_RUN_MS > 0) pump1MaxRunAt = now + LOCAL_MAX_RUN_MS;
@@ -461,6 +513,7 @@ void setPumpRelays(bool pump1Requested, bool pump2Requested, unsigned long now) 
   if (pump2Requested != pump2On) {
     digitalWrite(WATER_PUMP2_PIN, pump2Requested ? PUMP_ON : PUMP_OFF);
     pump2On = pump2Requested;
+    pump2Cloud = pump2On && startingFromCloud;
     if (pump2On) {
       pump2StartedAt = now;
       if (LOCAL_MAX_RUN_MS > 0) pump2MaxRunAt = now + LOCAL_MAX_RUN_MS;
@@ -493,9 +546,17 @@ void stopPumpForMaxRun(int pumpNumber) {
 }
 
 void servicePumpSafety(unsigned long now) {
-  if (!mainSessionKnown || now - lastMainSeenAt >= MAIN_BEACON_TIMEOUT_MS) {
-    if (pump1On || pump2On) stopAllPumpsForRecovery(now);
-    return;
+  // Losing the MAIN unit stops only pumps that MAIN is controlling. Pumps
+  // started from Firebase keep running while the Firebase link is alive.
+  const bool mainLost = !mainSessionKnown || now - lastMainSeenAt >= MAIN_BEACON_TIMEOUT_MS;
+  if (mainLost && ((pump1On && !pump1Cloud) || (pump2On && !pump2Cloud))) {
+    stopMainControlledPumpsForRecovery(now);
+  }
+
+  // A Firebase-started pump needs a live Firebase link (command polls).
+  if (((pump1On && pump1Cloud) || (pump2On && pump2Cloud)) &&
+      now - lastCloudPollOkAt >= CLOUD_LINK_TIMEOUT_MS) {
+    stopCloudControlledPumps("cloud_link_lost");
   }
 
   if (LOCAL_MAX_RUN_MS > 0) {
@@ -691,6 +752,8 @@ void stopAllPumpsForRecovery(unsigned long now) {
   desiredPump2On = false;
   pump1ActiveCommandId = "";
   pump2ActiveCommandId = "";
+  pump1Cloud = false;
+  pump2Cloud = false;
   statusUpdatePending = true;
   mainSessionKnown = false;
   requireFreshOffCommand = true;
@@ -700,6 +763,51 @@ void stopAllPumpsForRecovery(unsigned long now) {
   mainCommandSequenceKnown = false;
   lastMainSeenAt = now;
   Serial.println("RAIN safety: MAIN heartbeat lost; pumps OFF, awaiting fresh OFF commands");
+}
+
+// Same as above, but leaves pumps that were started from Firebase running.
+void stopMainControlledPumpsForRecovery(unsigned long now) {
+  if (pump1On && !pump1Cloud) {
+    digitalWrite(WATER_PUMP1_PIN, PUMP_OFF);
+    pump1On = false;
+    pump1ActiveCommandId = "";
+  }
+  if (pump2On && !pump2Cloud) {
+    digitalWrite(WATER_PUMP2_PIN, PUMP_OFF);
+    pump2On = false;
+    pump2ActiveCommandId = "";
+  }
+  if (!pump1Cloud) desiredPump1On = false;
+  if (!pump2Cloud) desiredPump2On = false;
+  statusUpdatePending = true;
+  mainSessionKnown = false;
+  requireFreshOffCommand = true;
+  if (mainPeerKnown) esp_now_del_peer(mainMac);
+  mainPeerKnown = false;
+  mainBeaconSequenceKnown = false;
+  mainCommandSequenceKnown = false;
+  lastMainSeenAt = now;
+  Serial.println("RAIN safety: MAIN heartbeat lost; MAIN-controlled pumps OFF (Firebase-started pumps unaffected)");
+}
+
+void stopCloudControlledPumps(const char* reason) {
+  if (pump1On && pump1Cloud) {
+    digitalWrite(WATER_PUMP1_PIN, PUMP_OFF);
+    pump1On = false;
+    pump1ActiveCommandId = "";
+  }
+  if (pump2On && pump2Cloud) {
+    digitalWrite(WATER_PUMP2_PIN, PUMP_OFF);
+    pump2On = false;
+    pump2ActiveCommandId = "";
+  }
+  if (pump1Cloud) desiredPump1On = false;
+  if (pump2Cloud) desiredPump2On = false;
+  pump1Cloud = false;
+  pump2Cloud = false;
+  faultCode = reason;
+  statusUpdatePending = true;
+  Serial.printf("RAIN safety: Firebase-started pumps OFF reason=%s\n", reason);
 }
 
 void processPumpCommand(const ReceivedPacket& received,
@@ -1037,6 +1145,9 @@ void processRainFirebaseStatus(AsyncResult& result) {
   if (result.isError()) {
     Serial.printf("RAIN Firebase status write failed code=%d\n",
         result.error().code());
+    noteFirebaseUploadFailure();
+  } else {
+    noteFirebaseUploadSuccess();
   }
   result.clear();
 }
@@ -1073,13 +1184,16 @@ void serviceRainFirebase(unsigned long now) {
   if (firebaseStatusWritePending) {
     if (now - firebaseStatusWriteStartedAt < FIREBASE_RESULT_TIMEOUT_MS) return;
     firebaseStatusWritePending = false;
+    noteFirebaseUploadFailure();
     Serial.println("RAIN Firebase status write timed out; retrying.");
   }
   if (now - lastFirebaseStatusWriteAt < FIREBASE_STATUS_INTERVAL_MS) return;
   lastFirebaseStatusWriteAt = now;
   firebaseStatusWriteStartedAt = now;
   firebaseStatusWritePending = true;
-  String statusJson = "{";
+  String statusJson;
+  statusJson.reserve(256);
+  statusJson += "{";
   statusJson += "\"online\":true,";
   statusJson += "\"reservoir\":{\"level\":\"" + reservoirLevel() +
       "\",\"full\":" + String(reservoirFullWet ? "true" : "false") + "},";
@@ -1096,6 +1210,7 @@ void serviceRainFirebase(unsigned long now) {
   );
   if (firebaseClient.lastError().code() != 0) {
     firebaseStatusWritePending = false;
+    noteFirebaseUploadFailure();
     Serial.printf("RAIN Firebase status enqueue failed code=%d\n",
         firebaseClient.lastError().code());
   }
@@ -1167,7 +1282,12 @@ void setup() {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(false);
   wifiPreferences.begin("wifi", false);
-  savedSsid = wifiPreferences.getString("ssid", "");
+  cloudCommandPreferences.begin("raincmd", false);
+  if (wifiPreferences.getBool("lowMemReboot", false)) {
+    Serial.println("RAIN previous restart was triggered by the low-memory guard.");
+    wifiPreferences.putBool("lowMemReboot", false);
+  }
+  savedSsid =wifiPreferences.getString("ssid", "");
   savedPassword = wifiPreferences.getString("password", "");
   lastProvisionRequestId = wifiPreferences.getUInt("provId", 0);
   lastProvisionRequestKnown = lastProvisionRequestId != 0;
@@ -1187,8 +1307,474 @@ void setup() {
   }
 }
 
+// Modem sleep (the ESP32 default) can drop the connection and delay responses.
+// Re-apply "no sleep" periodically because a Wi-Fi restart can restore the default.
+void keepWifiAwake() {
+  WiFi.setSleep(false);
+  wifi_ps_type_t powerSave = WIFI_PS_MIN_MODEM;
+  if (esp_wifi_get_ps(&powerSave) != ESP_OK || powerSave != WIFI_PS_NONE) {
+    esp_wifi_set_ps(WIFI_PS_NONE);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Direct Firebase pump control. RAIN reads /hydrodeck/commands/waterPump1 and
+// /waterPump2 itself, so the water pumps work even when the MAIN unit is out
+// of ESP-NOW range. RAIN is the only writer of /hydrodeck/actuators/waterPump1|2.
+// ---------------------------------------------------------------------------
+enum : uint8_t { CLOUD_OP_SET_STRING = 1, CLOUD_OP_SET_BOOL = 2, CLOUD_OP_REMOVE = 3 };
+
+struct CloudWriteOp {
+  uint8_t kind;
+  bool boolValue;
+  char path[96];
+  char value[16];
+};
+
+struct CloudRun {
+  bool active;
+  bool runningAcked;
+  String id;
+};
+
+const uint8_t CLOUD_WRITE_QUEUE_SIZE = 12;
+CloudWriteOp cloudWriteQueue[CLOUD_WRITE_QUEUE_SIZE];
+uint8_t cloudWriteHead = 0;
+uint8_t cloudWriteCount = 0;
+CloudRun cloudRun[2];
+int8_t lastPublishedPump[2] = {-1, -1};
+unsigned long lastActuatorPublishAt[2] = {0, 0};
+DynamicJsonDocument cloudCommandDoc(768);
+
+bool pushCloudWrite(uint8_t kind, const String& path, const char* value, bool boolValue) {
+  if (cloudWriteCount >= CLOUD_WRITE_QUEUE_SIZE ||
+      path.length() >= sizeof(cloudWriteQueue[0].path)) {
+    Serial.println("RAIN cloud write queue full; dropped one write.");
+    return false;
+  }
+  CloudWriteOp& op = cloudWriteQueue[(cloudWriteHead + cloudWriteCount) % CLOUD_WRITE_QUEUE_SIZE];
+  op.kind = kind;
+  op.boolValue = boolValue;
+  strncpy(op.path, path.c_str(), sizeof(op.path) - 1);
+  op.path[sizeof(op.path) - 1] = '\0';
+  strncpy(op.value, value != nullptr ? value : "", sizeof(op.value) - 1);
+  op.value[sizeof(op.value) - 1] = '\0';
+  cloudWriteCount++;
+  return true;
+}
+
+// The rejection reason must be written before the ack: the app reads it when
+// it sees "rejected".
+void queueCloudAck(const String& id, const char* status, const char* reason) {
+  if (reason != nullptr && reason[0] != '\0') {
+    pushCloudWrite(CLOUD_OP_SET_STRING, "/hydrodeck/commandAckReasons/" + id, reason, false);
+  }
+  pushCloudWrite(CLOUD_OP_SET_STRING, "/hydrodeck/commandAcks/" + id, status, false);
+}
+
+void queueCloudRemove(const String& path) {
+  pushCloudWrite(CLOUD_OP_REMOVE, path, "", false);
+}
+
+void queueCloudActuator(int index, bool on) {
+  pushCloudWrite(CLOUD_OP_SET_BOOL,
+      String("/hydrodeck/actuators/") + (index == 0 ? "waterPump1" : "waterPump2"),
+      "", on);
+}
+
+void processCloudWriteResult(AsyncResult& result) {
+  if (result.uid() != "cloudWrite") {
+    result.clear();
+    return;
+  }
+  cloudWritePending = false;
+  if (result.isError()) {
+    Serial.printf("RAIN cloud write failed code=%d\n", result.error().code());
+    noteFirebaseUploadFailure();
+  } else {
+    noteFirebaseUploadSuccess();
+  }
+  result.clear();
+}
+
+void serviceCloudWrites(unsigned long now) {
+  if (cloudWritePending) {
+    if (now - cloudWriteStartedAt < CLOUD_REQUEST_TIMEOUT_MS) return;
+    cloudWritePending = false;
+    noteFirebaseUploadFailure();
+    Serial.println("RAIN cloud write timed out.");
+  }
+  if (cloudWriteCount == 0 || !firebaseInitialized || !firebaseApp.ready()) return;
+
+  const CloudWriteOp op = cloudWriteQueue[cloudWriteHead];
+  cloudWriteHead = (cloudWriteHead + 1) % CLOUD_WRITE_QUEUE_SIZE;
+  cloudWriteCount--;
+  cloudWritePending = true;
+  cloudWriteStartedAt = now;
+  if (op.kind == CLOUD_OP_SET_STRING) {
+    firebaseDatabase.set<String>(firebaseClient, String(op.path), String(op.value),
+        processCloudWriteResult, "cloudWrite");
+  } else if (op.kind == CLOUD_OP_SET_BOOL) {
+    firebaseDatabase.set<bool>(firebaseClient, String(op.path), op.boolValue,
+        processCloudWriteResult, "cloudWrite");
+  } else {
+    firebaseDatabase.remove(firebaseClient, String(op.path),
+        processCloudWriteResult, "cloudWrite");
+  }
+  if (firebaseClient.lastError().code() != 0) {
+    cloudWritePending = false;
+    noteFirebaseUploadFailure();
+    Serial.printf("RAIN cloud write enqueue failed code=%d\n",
+        firebaseClient.lastError().code());
+  }
+}
+
+// ---- command bookkeeping (survives restarts so a command never runs twice) ----
+String cloudConsumedStatus(const String& requestId) {
+  const String entries = cloudCommandPreferences.getString("recentIds", "");
+  int start = 0;
+  while (start < static_cast<int>(entries.length())) {
+    const int separator = entries.indexOf(',', start);
+    const int end = separator < 0 ? entries.length() : separator;
+    const String entry = entries.substring(start, end);
+    const int statusSeparator = entry.indexOf('=');
+    const String storedId = statusSeparator < 0 ? entry : entry.substring(0, statusSeparator);
+    if (storedId == requestId) {
+      return statusSeparator < 0 ? "completed" : entry.substring(statusSeparator + 1);
+    }
+    if (separator < 0) break;
+    start = separator + 1;
+  }
+  return "";
+}
+
+void cloudRememberConsumed(const String& requestId, const char* status) {
+  String entries = cloudCommandPreferences.getString("recentIds", "");
+  String retained;
+  int start = 0;
+  while (start < static_cast<int>(entries.length())) {
+    const int separator = entries.indexOf(',', start);
+    const int end = separator < 0 ? entries.length() : separator;
+    const String entry = entries.substring(start, end);
+    const int statusSeparator = entry.indexOf('=');
+    const String storedId = statusSeparator < 0 ? entry : entry.substring(0, statusSeparator);
+    if (storedId != requestId && entry.length() > 0) {
+      if (retained.length() > 0) retained += ",";
+      retained += entry;
+    }
+    if (separator < 0) break;
+    start = separator + 1;
+  }
+  if (retained.length() > 0) retained += ",";
+  retained += requestId + "=" + status;
+  while (retained.length() > 480) {
+    const int separator = retained.indexOf(',');
+    if (separator < 0) break;
+    retained.remove(0, separator + 1);
+  }
+  cloudCommandPreferences.putString("recentIds", retained);
+}
+
+// App IDs are Firebase push IDs ("-..." 20 chars) or the cmd_* fallback.
+bool validCloudRequestId(const String& id) {
+  if (id.length() < 4 || id.length() > 48) return false;
+  if (!(id.startsWith("cmd_") || (id.startsWith("-") && id.length() >= 16))) return false;
+  for (size_t i = 0; i < id.length(); i++) {
+    const char c = id[i];
+    const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') || c == '_' || c == '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
+// Firebase push IDs start with a millisecond timestamp, so an old queued
+// start command (for example from before a Wi-Fi outage) can be ignored.
+bool cloudCommandTooOld(const String& id) {
+  if (id.length() != 20 || id[0] != '-') return false;
+  static const char kChars[] = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+  uint64_t createdMs = 0;
+  for (int i = 0; i < 8; i++) {
+    const char* position = strchr(kChars, id[i]);
+    if (position == nullptr || id[i] == '\0') return false;
+    createdMs = createdMs * 64 + static_cast<uint64_t>(position - kChars);
+  }
+  const time_t nowS = time(nullptr);
+  if (nowS < 1600000000) return false;  // clock not synced yet: cannot tell
+  const long ageS = static_cast<long>(nowS) - static_cast<long>(createdMs / 1000ULL);
+  return ageS > CLOUD_COMMAND_MAX_AGE_S;
+}
+
+bool cloudStartPump(int index, const String& id, const char*& reason) {
+  const bool pumpOn = index == 0 ? pump1On : pump2On;
+  const bool otherOn = index == 0 ? pump2On : pump1On;
+  const bool locked = index == 0 ? pump1MaxRunLocked : pump2MaxRunLocked;
+  if (pumpOn) { reason = "pump_already_active"; return false; }
+  if (otherOn) { reason = "other_bed_water_pump_active"; return false; }
+  if (locked) { reason = "max_run_locked"; return false; }
+
+  faultCode = "";
+  if (index == 0) desiredPump1On = true; else desiredPump2On = true;
+  startingFromCloud = true;
+  setPumpRelays(desiredPump1On, desiredPump2On, millis());
+  startingFromCloud = false;
+  if (!(index == 0 ? pump1On : pump2On)) {
+    if (index == 0) desiredPump1On = false; else desiredPump2On = false;
+    reason = faultCode == "reservoir_low" ? "reservoir_low" : "start_blocked";
+    return false;
+  }
+  if (index == 0) pump1ActiveCommandId = id; else pump2ActiveCommandId = id;
+  return true;
+}
+
+void cloudStopPump(int index) {
+  if (index == 0) desiredPump1On = false; else desiredPump2On = false;
+  setPumpRelays(desiredPump1On, desiredPump2On, millis());
+}
+
+void rejectCloudCommand(const String& id, const String& commandPath, const char* reason) {
+  cloudRememberConsumed(id, "rejected");
+  queueCloudAck(id, "rejected", reason);
+  queueCloudRemove(commandPath);
+  Serial.printf("RAIN cloud command rejected id=%s reason=%s\n", id.c_str(), reason);
+}
+
+void processCloudCommand(int index, const String& id, const String& value) {
+  const char* actuator = index == 0 ? "waterPump1" : "waterPump2";
+  const String commandPath = String("/hydrodeck/commands/") + actuator + "/" + id;
+  if (!validCloudRequestId(id)) {
+    queueCloudRemove(commandPath);
+    Serial.printf("RAIN cloud command removed reason=invalid_id actuator=%s\n", actuator);
+    return;
+  }
+
+  const String previous = cloudConsumedStatus(id);
+  if (previous.length() > 0) {
+    // Already handled (leftover after a failed cleanup or a restart): never run it again.
+    if (!(cloudRun[index].active && cloudRun[index].id == id)) {
+      const bool terminal = previous == "completed" || previous == "rejected" ||
+          previous == "timed_out";
+      queueCloudAck(id, terminal ? previous.c_str() : "completed", "");
+    }
+    queueCloudRemove(commandPath);
+    Serial.printf("RAIN cloud command duplicate ignored id=%s\n", id.c_str());
+    return;
+  }
+
+  const bool isStart = value == "1";
+  const bool isStop = value == "0";
+  if (!isStart && !isStop) {
+    rejectCloudCommand(id, commandPath, "invalid_value");
+    return;
+  }
+  if (isStart && cloudCommandTooOld(id)) {
+    rejectCloudCommand(id, commandPath, "stale_command");
+    return;
+  }
+
+  cloudRememberConsumed(id, "accepted");
+  queueCloudAck(id, "accepted", "");
+
+  if (isStop) {
+    cloudStopPump(index);
+    cloudRememberConsumed(id, "completed");
+    queueCloudAck(id, "completed", "");
+    queueCloudRemove(commandPath);
+    Serial.printf("RAIN cloud stop id=%s actuator=%s\n", id.c_str(), actuator);
+    return;
+  }
+
+  const char* reason = "";
+  if (cloudStartPump(index, id, reason)) {
+    cloudRun[index].active = true;
+    cloudRun[index].runningAcked = false;
+    cloudRun[index].id = id;
+    cloudRememberConsumed(id, "running");
+    queueCloudRemove(commandPath);
+    Serial.printf("RAIN cloud start id=%s actuator=%s\n", id.c_str(), actuator);
+  } else {
+    rejectCloudCommand(id, commandPath, reason);
+  }
+}
+
+void processCloudCommandsResult(AsyncResult& result) {
+  if (result.uid() != "cloudCommands") {
+    result.clear();
+    return;
+  }
+  cloudPollPending = false;
+  if (result.isError()) {
+    Serial.printf("RAIN cloud command poll failed code=%d\n", result.error().code());
+    noteFirebaseUploadFailure();
+    result.clear();
+    return;
+  }
+  // A poll that reached Firebase keeps the link alive even when the queue is empty.
+  lastCloudPollOkAt = millis();
+  noteFirebaseUploadSuccess();
+  if (!result.available()) {
+    result.clear();
+    return;
+  }
+
+  const String payload = result.to<RealtimeDatabaseResult>().to<String>();
+  result.clear();
+  if (payload.length() < 3) return;  // "null" or empty: nothing queued
+
+  DynamicJsonDocument filter(64);
+  filter["waterPump1"] = true;
+  filter["waterPump2"] = true;
+  cloudCommandDoc.clear();
+  const DeserializationError parseError = deserializeJson(
+      cloudCommandDoc, payload, DeserializationOption::Filter(filter));
+  if (parseError || !cloudCommandDoc.is<JsonObject>()) return;
+
+  uint8_t handled = 0;  // a couple per poll keeps the write queue short
+  for (int index = 0; index < 2 && handled < 2; index++) {
+    JsonObject queue = cloudCommandDoc[index == 0 ? "waterPump1" : "waterPump2"].as<JsonObject>();
+    if (queue.isNull()) continue;
+    for (JsonPair entry : queue) {
+      if (handled >= 2) break;
+      const String id = entry.key().c_str();
+      const String value = entry.value().is<const char*>()
+          ? String(entry.value().as<const char*>()) : String("");
+      processCloudCommand(index, id, value);
+      handled++;
+    }
+  }
+}
+
+void serviceCloudCommands(unsigned long now) {
+  if (cloudPollPending) {
+    if (now - cloudPollStartedAt < CLOUD_REQUEST_TIMEOUT_MS) return;
+    cloudPollPending = false;
+    noteFirebaseUploadFailure();
+    Serial.println("RAIN cloud command poll timed out.");
+  }
+  if (!firebaseInitialized || !firebaseApp.ready()) return;
+  // Let queued acks/cleanups finish first so a command is never seen twice.
+  if (cloudWritePending || cloudWriteCount > 0) return;
+  if (lastCloudPollAt != 0 && now - lastCloudPollAt < REMOTE_COMMAND_INTERVAL_MS) return;
+  lastCloudPollAt = now;
+  cloudPollStartedAt = now;
+  cloudPollPending = true;
+  firebaseDatabase.get(firebaseClient, "/hydrodeck/commands",
+      processCloudCommandsResult, false, "cloudCommands");
+  if (firebaseClient.lastError().code() != 0) {
+    cloudPollPending = false;
+    noteFirebaseUploadFailure();
+    Serial.printf("RAIN cloud command poll enqueue failed code=%d\n",
+        firebaseClient.lastError().code());
+  }
+}
+
+// Publishes the pump's real state (RAIN owns the relays) and the running /
+// completed acks for Firebase-started runs.
+void serviceCloudPumpFeedback(unsigned long now) {
+  const bool firebaseReady = firebaseInitialized && firebaseApp.ready();
+  for (int index = 0; index < 2; index++) {
+    const bool on = index == 0 ? pump1On : pump2On;
+    const bool cloud = index == 0 ? pump1Cloud : pump2Cloud;
+    CloudRun& run = cloudRun[index];
+    if (run.active) {
+      if (on && cloud) {
+        if (!run.runningAcked) {
+          queueCloudAck(run.id, "running", "");
+          run.runningAcked = true;
+        }
+      } else {
+        // Ended: stop command, MAIN OFF, safety stop, or reservoir/relay fault.
+        queueCloudAck(run.id, "completed", "");
+        cloudRememberConsumed(run.id, "completed");
+        run.active = false;
+        run.id = "";
+      }
+    }
+    if (firebaseReady &&
+        (lastPublishedPump[index] != (on ? 1 : 0) ||
+         now - lastActuatorPublishAt[index] >= ACTUATOR_RESYNC_MS)) {
+      queueCloudActuator(index, on);
+      lastPublishedPump[index] = on ? 1 : 0;
+      lastActuatorPublishAt[index] = now;
+    }
+  }
+}
+
+// Switch both pumps off, flag the next boot, and restart. The pumps stay off
+// after boot until the main unit sends a fresh command.
+void restartForMemory(const char* reason) {
+  Serial.printf("RAIN MEMORY GUARD: %s; switching pumps off and restarting.\n", reason);
+  digitalWrite(WATER_PUMP1_PIN, PUMP_OFF);
+  digitalWrite(WATER_PUMP2_PIN, PUMP_OFF);
+  wifiPreferences.putBool("lowMemReboot", true);
+  Serial.flush();
+  delay(100);
+  ESP.restart();
+}
+
+// Restart cleanly when memory is nearly exhausted instead of letting Wi-Fi,
+// TLS and ESP-NOW fail one after another.
+void serviceMemoryGuard(unsigned long now) {
+  static unsigned long lastCheckAt = 0;
+  static unsigned long lastLowCheckAt = 0;
+  static unsigned long lastHeapLogAt = 0;
+  static uint8_t lowChecks = 0;
+  if (now - lastCheckAt < 1000UL) return;
+  lastCheckAt = now;
+
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t largestBlock = ESP.getMaxAllocHeap();
+  if (now - lastHeapLogAt >= HEAP_LOG_INTERVAL_MS) {
+    lastHeapLogAt = now;
+    Serial.printf("RAIN heap free=%u minFree=%u largestBlock=%u\n",
+        static_cast<unsigned>(freeHeap),
+        static_cast<unsigned>(ESP.getMinFreeHeap()),
+        static_cast<unsigned>(largestBlock));
+  }
+
+  // Fast path: uploads failing or stuck for 10 s while memory is nearly full.
+  if (now >= UPLOAD_FAIL_BOOT_GRACE_MS && WiFi.status() == WL_CONNECTED) {
+    const bool uploadsFailing = firebaseUploadFailingSince != 0 &&
+        now - firebaseUploadFailingSince >= UPLOAD_FAIL_RESTART_MS;
+    const bool uploadsStuck =
+        (firebaseStatusWritePending &&
+            now - firebaseStatusWriteStartedAt >= UPLOAD_FAIL_RESTART_MS) ||
+        (cloudPollPending && now - cloudPollStartedAt >= UPLOAD_FAIL_RESTART_MS) ||
+        (cloudWritePending && now - cloudWriteStartedAt >= UPLOAD_FAIL_RESTART_MS);
+    const bool memoryNearFull =
+        freeHeap < NEAR_FULL_FREE_BYTES || largestBlock < NEAR_FULL_LARGEST_BLOCK_BYTES;
+    if ((uploadsFailing || uploadsStuck) && memoryNearFull) {
+      Serial.printf("RAIN uploads failing/stuck >%lus with heapFree=%u heapLargestBlock=%u\n",
+          UPLOAD_FAIL_RESTART_MS / 1000UL,
+          static_cast<unsigned>(freeHeap), static_cast<unsigned>(largestBlock));
+      restartForMemory("Firebase uploads failing while memory is nearly full");
+    }
+  }
+
+  // Slow path: memory critically low for several checks in a row.
+  if (now - lastLowCheckAt < LOW_HEAP_CHECK_INTERVAL_MS) return;
+  lastLowCheckAt = now;
+  if (now < LOW_HEAP_BOOT_GRACE_MS) return;
+  if (freeHeap >= LOW_HEAP_FREE_BYTES && largestBlock >= LOW_HEAP_LARGEST_BLOCK_BYTES) {
+    lowChecks = 0;
+    return;
+  }
+  lowChecks++;
+  Serial.printf("RAIN LOW MEMORY check %u/%u heapFree=%u heapLargestBlock=%u\n",
+      lowChecks, LOW_HEAP_CONSECUTIVE_CHECKS,
+      static_cast<unsigned>(freeHeap), static_cast<unsigned>(largestBlock));
+  if (lowChecks < LOW_HEAP_CONSECUTIVE_CHECKS) return;
+  restartForMemory("memory critically low");
+}
+
 void loop() {
   const unsigned long now = millis();
+  serviceMemoryGuard(now);
+  static unsigned long lastWifiPowerCheck = 0;
+  if (now - lastWifiPowerCheck >= 30000UL) {
+    lastWifiPowerCheck = now;
+    keepWifiAwake();
+  }
   const bool previousReservoirFull = reservoirFullWet;
   updateDebouncedSensor(
     RES_FULL_PIN,
@@ -1203,6 +1789,9 @@ void loop() {
   firebaseApp.loop();
   serviceRainWifi(now);
   serviceRainFirebase(now);
+  serviceCloudCommands(now);
+  serviceCloudPumpFeedback(now);
+  serviceCloudWrites(now);
   if (!espNowReady && now - lastEspNowRetryAt >= ESPNOW_INIT_RETRY_MS) {
     lastEspNowRetryAt = now;
     Serial.println("RAIN retrying ESP-NOW initialization");

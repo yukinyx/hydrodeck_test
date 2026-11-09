@@ -106,15 +106,6 @@ PumpRunDecision decidePumpCommand({
       durationMs: 0,
     );
   }
-  if (isWaterPump && !rainNodeOnline) {
-    return const PumpRunDecision(
-      start: false,
-      reject: true,
-      alreadyRunningSameCommand: false,
-      status: 'rejected',
-      durationMs: 0,
-    );
-  }
   if (pumpActive && activeRequestId == requestId && requestId.isNotEmpty) {
     return const PumpRunDecision(
       start: false,

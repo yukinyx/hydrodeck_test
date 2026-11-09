@@ -301,6 +301,41 @@ void main() {
     expect(reservoirColor('not_full'), Colors.orange);
   });
 
+  test('water-pump cloud availability requires fresh RAIN Firebase status', () {
+    final now = DateTime.utc(2026, 11, 9, 9);
+    final fresh = freshRainNodeStatus({
+      'rainNodeStatus': {
+        'online': true,
+        'reservoir': {'level': 'full'},
+        'updatedAt': now.millisecondsSinceEpoch,
+      },
+    }, now: now);
+    expect(fresh?.online, isTrue);
+    expect(fresh?.cloud, isTrue);
+    expect(
+      freshRainNodeStatus({
+        'rainNodeStatus': {
+          'online': true,
+          'reservoir': {'level': 'full'},
+          'updatedAt': now
+              .subtract(const Duration(seconds: 46))
+              .millisecondsSinceEpoch,
+        },
+      }, now: now),
+      isNull,
+    );
+    expect(
+      freshRainNodeStatus({
+        'rainNodeStatus': {
+          'online': false,
+          'reservoir': {'level': 'full'},
+          'updatedAt': now.millisecondsSinceEpoch,
+        },
+      }, now: now),
+      isNull,
+    );
+  });
+
   test('scheduled cloud snapshots retain reservoir fields for both beds', () {
     const bed = GrowBedReading(
       temperature: 24.5,

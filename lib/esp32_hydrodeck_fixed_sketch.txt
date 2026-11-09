@@ -4,6 +4,7 @@
 #include <WiFiClientSecure.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_system.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/md.h>
 #include <freertos/FreeRTOS.h>
@@ -227,6 +228,23 @@ const unsigned long activeBatchPollInterval = 10000;
 const unsigned long firebaseInitRetryInterval = 10000UL;
 const unsigned long connectionDiagnosticInterval = 10000UL;
 
+// Low-memory protection: restart before the heap is exhausted so the unit keeps
+// running 24/7. A restart needs the condition to persist for several checks and
+// is skipped during the first minutes after boot, so it can never reboot-loop.
+const uint32_t lowHeapFreeBytes = 20000;          // free heap below this = low
+const uint32_t lowHeapLargestBlockBytes = 10000;  // largest allocatable block below this = low
+const uint8_t lowHeapConsecutiveChecks = 3;       // consecutive low checks before restart
+const unsigned long lowHeapCheckInterval = 10000UL;
+const unsigned long lowHeapBootGraceMs = 300000UL; // no restart in the first 5 minutes
+
+// Fast path: Firebase uploads failing/stuck for this long while memory is
+// nearly full (too little left for a TLS handshake) = restart right away
+// instead of staying offline.
+const unsigned long uploadFailRestartMs = 10000UL;
+const unsigned long uploadFailBootGraceMs = 90000UL;
+const uint32_t nearFullFreeBytes = 40000;          // free heap below this = near full
+const uint32_t nearFullLargestBlockBytes = 30000;  // largest block below this = near full
+
 struct WifiDiagnosticEvent {
   uint8_t kind;
   uint16_t disconnectReason;
@@ -261,7 +279,7 @@ const char* remoteActuatorNames[] = {
   "waterPump2", "phUp2", "phDown2", "nutrient2", "growLight"
 };
 // Pump requests are one-shot values under /commands; actual state is reported separately.
-const unsigned long remoteCommandInterval = 500;
+const unsigned long remoteCommandInterval = 1000;  // was 500: halves TLS request/heap churn
 unsigned long lastRemoteCommandPoll = 0;
 bool remoteCommandPending = false;
 unsigned int pendingCommandCleanupWrites = 0;
@@ -354,13 +372,37 @@ unsigned long lastPhCheck = 0;
 unsigned long lastFirebasePush = 0;
 unsigned long lastFirebaseHeartbeat = 0;
 String lastFirebaseTelemetryJson;
+
+// Firebase upload health. The memory guard uses this to restart the board
+// quickly when uploads keep failing while memory is nearly full.
+unsigned long firebaseUploadFailingSince = 0;  // 0 = uploads are healthy
+bool telemetryUpdatePending = false;
+unsigned long telemetryUpdateStartedAt = 0;
+// Fixed buffer for the live telemetry JSON: building it from ~30 temporary
+// String objects every push fragments the heap over days of uptime.
+char liveTelemetryBuffer[768];
+
+void noteFirebaseUploadFailure() {
+  if (firebaseUploadFailingSince != 0) return;
+  firebaseUploadFailingSince = millis();
+  if (firebaseUploadFailingSince == 0) firebaseUploadFailingSince = 1;
+}
+
+void noteFirebaseUploadSuccess() {
+  firebaseUploadFailingSince = 0;
+}
+
+const char* jsonBoolText(bool value) {
+  return value ? "true" : "false";
+}
+
 const unsigned long firebaseInterval = 5000;
 const unsigned long tempInterval = 1000;
 const unsigned long phInterval = 1000;
 float minPhThreshold = 5.5;
 float maxPhThreshold = 7.0;
 unsigned long lastPhLimitPoll = 0;
-const unsigned long phLimitPollInterval = 5000;
+const unsigned long phLimitPollInterval = 10000;  // was 5000
 bool phLimitRequestPending = false;
 unsigned long phLimitRequestStartedAt = 0;
 uint32_t phLimitRequestSequence = 0;
@@ -776,6 +818,8 @@ void rememberConsumedCommand(const String& requestId, const String& status = "ac
 }
 
 void publishActuatorState(const String& actuator, bool state) {
+  // RAIN owns the water-pump relays and publishes their real state itself.
+  if (actuator == "waterPump1" || actuator == "waterPump2") return;
   if (!firebaseInitialized || !app.ready()) return;
   Database.set<bool>(aClient, "/hydrodeck/actuators/" + actuator, state);
 }
@@ -1761,6 +1805,9 @@ void processRemoteActuatorResult(AsyncResult& result) {
     JsonObject allActuatorQueues = commandDocument.as<JsonObject>();
     for (JsonPair actuatorEntry : allActuatorQueues) {
       const String actuator = actuatorEntry.key().c_str();
+      // RAIN reads the water-pump queues from Firebase itself; handling them here
+      // too would run every command twice.
+      if (actuator == "waterPump1" || actuator == "waterPump2") continue;
       bool knownActuator = false;
       for (int index = 0; index < 9; index++) {
         if (actuator == remoteActuatorNames[index]) knownActuator = true;
@@ -2087,9 +2134,11 @@ void processQueuedSnapshotUpload(AsyncResult& result) {
   if (result.isError()) {
     Serial.printf("Snapshot upload failed identity=%s code=%d; retry queued\n",
         identity.c_str(), result.error().code());
+    noteFirebaseUploadFailure();
     snapshotUploadPending = false;
     lastSnapshotUploadAttemptAt = millis();
   } else if (slot >= 0 && commandPreferences.getString(queueKey, "") == payload) {
+    noteFirebaseUploadSuccess();
     SnapshotStorageRequest request = {};
     request.operation = SNAPSHOT_STORAGE_REMOVE;
     request.slot = slot;
@@ -2132,6 +2181,7 @@ void serviceQueuedSnapshotUpload(unsigned long now) {
     if (now - snapshotUploadStartedAt < SNAPSHOT_UPLOAD_TIMEOUT_MS) return;
     Serial.printf("Snapshot upload timed out identity=%s; retry queued\n",
         pendingSnapshotUploadIdentity.c_str());
+    noteFirebaseUploadFailure();
     snapshotUploadPending = false;
     lastSnapshotUploadAttemptAt = now;
   }
@@ -2427,7 +2477,9 @@ void handleCombinedStatus() {
       ? now - lastFirebaseHeartbeatSuccessAt : 0;
   const bool heartbeatFresh = heartbeatKnown &&
       heartbeatAge <= firebaseHeartbeatFreshWindow;
-  String json = "{";
+  String json;
+  json.reserve(1024);
+  json += "{";
   json += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"full\":" +
       String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
       String(rainNodeOnline ? "true" : "false") + "},";
@@ -2463,6 +2515,18 @@ void handleCombinedStatus() {
   server.send(200, "application/json", json);
 }
 
+// Modem sleep (the ESP32 default) lets the radio doze between router beacons,
+// which causes dropped connections and delayed responses. Keep the radio fully
+// awake for 24/7 operation. This is re-applied on every Wi-Fi (re)connect and
+// periodically, because a Wi-Fi restart can silently restore the default mode.
+void keepWifiAwake() {
+  WiFi.setSleep(false);
+  wifi_ps_type_t powerSave = WIFI_PS_MIN_MODEM;
+  if (esp_wifi_get_ps(&powerSave) != ESP_OK || powerSave != WIFI_PS_NONE) {
+    esp_wifi_set_ps(WIFI_PS_NONE);
+  }
+}
+
 void maintainProvisioningHotspot() {
   if (WiFi.getMode() == WIFI_AP_STA && provisioningApRunning &&
       WiFi.softAPIP() == apIp) return;
@@ -2479,7 +2543,7 @@ void maintainProvisioningHotspot() {
     Serial.println("Wi-Fi mode restored to AP+STA.");
   }
 
-  WiFi.setSleep(false);
+  keepWifiAwake();
   if (WiFi.softAPIP() != IPAddress(0, 0, 0, 0) &&
       WiFi.softAPIP() != apIp) {
     Serial.println("Setup AP has an unexpected IP; restarting AP service.");
@@ -2661,11 +2725,14 @@ void processMainWifiDiagnostics() {
         }
       }
     } else if (diagnostic.kind == 2) {
+      keepWifiAwake();
       Serial.printf("MAIN Wi-Fi associated channel=%d\n", WiFi.channel());
     } else if (diagnostic.kind == 3) {
+      keepWifiAwake();
       Serial.printf("MAIN Wi-Fi got IP channel=%d RSSI=%d\n",
           WiFi.channel(), WiFi.RSSI());
     } else if (diagnostic.kind == 4) {
+      keepWifiAwake();
       provisioningApRunning = true;
       Serial.printf("ESP32 setup AP started at %s\n", WiFi.softAPIP().toString().c_str());
     } else if (diagnostic.kind == 5) {
@@ -2679,10 +2746,25 @@ void processFirebaseHeartbeatResult(AsyncResult& result) {
   firebaseHeartbeatPending = false;
   if (result.isError()) {
     Serial.printf("Firebase heartbeat failed code=%d\n", result.error().code());
+    noteFirebaseUploadFailure();
   } else {
+    noteFirebaseUploadSuccess();
     lastFirebaseHeartbeatSuccessAt = millis();
     Serial.printf("Firebase heartbeat succeeded uptimeMs=%lu\n",
         lastFirebaseHeartbeatSuccessAt);
+  }
+  result.clear();
+}
+
+void processFirebaseTelemetryResult(AsyncResult& result) {
+  telemetryUpdatePending = false;
+  if (result.isError()) {
+    Serial.printf("Firebase live telemetry result error code=%d\n",
+        result.error().code());
+    lastFirebaseTelemetryJson = "";  // force a resend on the next push
+    noteFirebaseUploadFailure();
+  } else {
+    noteFirebaseUploadSuccess();
   }
   result.clear();
 }
@@ -2726,18 +2808,103 @@ void serviceConnectionDiagnostics(unsigned long now) {
   const unsigned long heartbeatAge = lastFirebaseHeartbeatSuccessAt == 0
       ? 0 : now - lastFirebaseHeartbeatSuccessAt;
   Serial.printf(
-      "MAIN diagnostics wifi=%s channel=%d RSSI=%d firebase=%s heartbeatAgeMs=%lu RAIN=%s RAINChannel=%d\n",
+      "MAIN diagnostics wifi=%s channel=%d RSSI=%d firebase=%s heartbeatAgeMs=%lu RAIN=%s RAINChannel=%d heapFree=%u heapMinFree=%u heapLargestBlock=%u\n",
       WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
       WiFi.channel(),
       WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
       firebaseReady ? "ready" : "not_ready",
       heartbeatAge,
       rainNodeOnline ? "online" : "offline",
-      lastLoggedRainChannel);
+      lastLoggedRainChannel,
+      static_cast<unsigned>(ESP.getFreeHeap()),
+      static_cast<unsigned>(ESP.getMinFreeHeap()),
+      static_cast<unsigned>(ESP.getMaxAllocHeap()));
+}
+
+// Switch every pump off, flag the next boot, and restart.
+void restartForMemory(const char* reason) {
+  Serial.printf("MEMORY GUARD: %s; switching pumps off and restarting.\n", reason);
+  const int pumpPins[] = {
+    phUp1Pin, phDown1Pin, nutrientPump1Pin,
+    phUp2Pin, phDown2Pin, nutrientPump2Pin
+  };
+  for (const int pin : pumpPins) digitalWrite(pin, PUMP_OFF);
+  commandPreferences.putBool("lowMemReboot", true);
+  Serial.flush();
+  delay(100);
+  ESP.restart();
+}
+
+// Restart cleanly when memory is nearly exhausted instead of letting Wi-Fi,
+// TLS and ESP-NOW fail one after another. The grow light state is restored
+// from flash on boot.
+void serviceMemoryGuard(unsigned long now) {
+  static unsigned long lastCheckAt = 0;
+  static unsigned long lastLowCheckAt = 0;
+  static uint8_t lowChecks = 0;
+  if (now - lastCheckAt < 1000UL) return;
+  lastCheckAt = now;
+
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t largestBlock = ESP.getMaxAllocHeap();
+
+  // Fast path: uploads failing or stuck for 10 s while memory is nearly full.
+  if (now >= uploadFailBootGraceMs && WiFi.status() == WL_CONNECTED) {
+    const bool uploadsFailing = firebaseUploadFailingSince != 0 &&
+        now - firebaseUploadFailingSince >= uploadFailRestartMs;
+    const bool uploadsStuck =
+        (telemetryUpdatePending &&
+            now - telemetryUpdateStartedAt >= uploadFailRestartMs) ||
+        (firebaseHeartbeatPending &&
+            now - firebaseHeartbeatStartedAt >= uploadFailRestartMs) ||
+        (snapshotUploadPending &&
+            now - snapshotUploadStartedAt >= uploadFailRestartMs);
+    const bool memoryNearFull =
+        freeHeap < nearFullFreeBytes || largestBlock < nearFullLargestBlockBytes;
+    if ((uploadsFailing || uploadsStuck) && memoryNearFull) {
+      Serial.printf("Uploads failing/stuck >%lus with heapFree=%u heapLargestBlock=%u\n",
+          uploadFailRestartMs / 1000UL,
+          static_cast<unsigned>(freeHeap), static_cast<unsigned>(largestBlock));
+      restartForMemory("Firebase uploads failing while memory is nearly full");
+    }
+  }
+
+  // Slow path: memory critically low for several checks in a row.
+  if (now - lastLowCheckAt < lowHeapCheckInterval) return;
+  lastLowCheckAt = now;
+  if (now < lowHeapBootGraceMs) return;
+  if (freeHeap >= lowHeapFreeBytes && largestBlock >= lowHeapLargestBlockBytes) {
+    lowChecks = 0;
+    return;
+  }
+  lowChecks++;
+  Serial.printf("LOW MEMORY check %u/%u heapFree=%u heapLargestBlock=%u\n",
+      lowChecks, lowHeapConsecutiveChecks,
+      static_cast<unsigned>(freeHeap), static_cast<unsigned>(largestBlock));
+  if (lowChecks < lowHeapConsecutiveChecks) return;
+  restartForMemory("memory critically low");
 }
 
 void setup() {
   Serial.begin(115200);
+  lastFirebaseTelemetryJson.reserve(sizeof(liveTelemetryBuffer));
+  // Why did the board (re)start? BROWNOUT means a weak/noisy power supply
+  // (often pumps/relays switching), which looks like Wi-Fi and hotspot drops.
+  {
+    const esp_reset_reason_t resetReason = esp_reset_reason();
+    const char* resetName = "OTHER";
+    switch (resetReason) {
+      case ESP_RST_POWERON: resetName = "POWERON"; break;
+      case ESP_RST_SW: resetName = "SOFTWARE"; break;
+      case ESP_RST_PANIC: resetName = "PANIC_CRASH"; break;
+      case ESP_RST_INT_WDT:
+      case ESP_RST_TASK_WDT:
+      case ESP_RST_WDT: resetName = "WATCHDOG"; break;
+      case ESP_RST_BROWNOUT: resetName = "BROWNOUT"; break;
+      default: break;
+    }
+    Serial.printf("Boot reset reason=%d (%s)\n", static_cast<int>(resetReason), resetName);
+  }
   wifiDiagnosticQueue = xQueueCreate(8, sizeof(WifiDiagnosticEvent));
   if (wifiDiagnosticQueue == nullptr) {
     Serial.println("Wi-Fi diagnostic event queue allocation failed");
@@ -2793,6 +2960,10 @@ void setup() {
   // Wi-Fi and hotspot setup
   wifiPreferences.begin("wifi", false);
   commandPreferences.begin("pumpcmd", false);
+  if (commandPreferences.getBool("lowMemReboot", false)) {
+    Serial.println("Previous restart was triggered by the low-memory guard.");
+    commandPreferences.putBool("lowMemReboot", false);
+  }
   snapshotStorageQueue = xQueueCreate(2, sizeof(SnapshotStorageRequest));
   snapshotStorageResultQueue = xQueueCreate(2, sizeof(SnapshotStorageResult));
   if (snapshotStorageQueue == nullptr || snapshotStorageResultQueue == nullptr ||
@@ -2859,6 +3030,12 @@ void loop() {
   serviceRemotePumpFeedback(now);
 
   maintainProvisioningHotspot();
+  static unsigned long lastWifiPowerCheck = 0;
+  if (now - lastWifiPowerCheck >= 30000UL) {
+    lastWifiPowerCheck = now;
+    keepWifiAwake();
+  }
+  serviceMemoryGuard(now);
   serviceEspNow(now);
   if (WiFi.status() == WL_CONNECTED && !mdnsStarted) {
     mdnsStarted = MDNS.begin("hydrodeck");
@@ -2997,6 +3174,14 @@ void loop() {
   requestIntervalSnapshot();
   serviceQueuedSnapshotUpload(now);
 
+  if (telemetryUpdatePending &&
+      now - telemetryUpdateStartedAt >= SNAPSHOT_UPLOAD_TIMEOUT_MS) {
+    telemetryUpdatePending = false;
+    lastFirebaseTelemetryJson = "";
+    noteFirebaseUploadFailure();
+    Serial.println("Firebase live telemetry callback timed out; retrying");
+  }
+
   if (firebaseHeartbeatPending &&
       now - firebaseHeartbeatStartedAt >= firebaseHeartbeatTimeout) {
     firebaseHeartbeatPending = false;
@@ -3092,64 +3277,67 @@ void loop() {
       now - lastFirebasePush >= firebaseInterval) {
     lastFirebasePush = now;
 
-    String liveTelemetryJson = "{";
-    liveTelemetryJson += "\"tds1\":" + String(currentTdsValue1, 0) + ",";
-    liveTelemetryJson += "\"ph1\":" + String(currentPhValue1, 2) + ",";
     const bool ph1Valid = phSensorValid1 &&
       now - lastPhValidAt1 <= 5000UL && isfinite(currentPhValue1) &&
       currentPhValue1 >= 0.0f && currentPhValue1 <= 14.0f;
-    liveTelemetryJson += "\"ph1Valid\":" +
-      String(ph1Valid ? "true" : "false") + ",";
-    liveTelemetryJson += "\"temp1\":" + String(currentTemperature1, 1) + ",";
     const bool temperature1Valid = temperatureSensorValid1 &&
       now - lastTemperatureValidAt1 <= 5000UL;
-    liveTelemetryJson += "\"temp1Valid\":" +
-      String(temperature1Valid ? "true" : "false") + ",";
-    liveTelemetryJson += "\"water1\":\"" + String(digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low") + "\",";
-    liveTelemetryJson += "\"tds2\":" + String(currentTdsValue2, 0) + ",";
-    liveTelemetryJson += "\"ph2\":" + String(currentPhValue2, 2) + ",";
     const bool ph2Valid = phSensorValid2 &&
       now - lastPhValidAt2 <= 5000UL && isfinite(currentPhValue2) &&
       currentPhValue2 >= 0.0f && currentPhValue2 <= 14.0f;
-    liveTelemetryJson += "\"ph2Valid\":" +
-      String(ph2Valid ? "true" : "false") + ",";
-    liveTelemetryJson += "\"temp2\":" + String(currentTemperature2, 1) + ",";
     const bool temperature2Valid = temperatureSensorValid2 &&
       now - lastTemperatureValidAt2 <= 5000UL;
-    liveTelemetryJson += "\"temp2Valid\":" +
-      String(temperature2Valid ? "true" : "false") + ",";
-    liveTelemetryJson += "\"water2\":\"" + String(digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low") + "\",";
-    liveTelemetryJson += "\"actuators\":{";
-    liveTelemetryJson += "\"waterPump1\":" + String(rainPump1On ? "true" : "false") + ",";
-    liveTelemetryJson += "\"phUp1\":" + String(digitalRead(phUp1Pin) == PUMP_ON ? "true" : "false") + ",";
-    liveTelemetryJson += "\"phDown1\":" + String(digitalRead(phDown1Pin) == PUMP_ON ? "true" : "false") + ",";
-    liveTelemetryJson += "\"nutrient1\":" + String(digitalRead(nutrientPump1Pin) == PUMP_ON ? "true" : "false") + ",";
-    liveTelemetryJson += "\"waterPump2\":" + String(rainPump2On ? "true" : "false") + ",";
-    liveTelemetryJson += "\"phUp2\":" + String(digitalRead(phUp2Pin) == PUMP_ON ? "true" : "false") + ",";
-    liveTelemetryJson += "\"phDown2\":" + String(digitalRead(phDown2Pin) == PUMP_ON ? "true" : "false") + ",";
-    liveTelemetryJson += "\"nutrient2\":" + String(digitalRead(nutrientPump2Pin) == PUMP_ON ? "true" : "false") + ",";
-    liveTelemetryJson += "\"growLight\":" + String(digitalRead(growLightPin) == LIGHT_ON ? "true" : "false") + "},";
-    liveTelemetryJson += "\"reservoir\":{\"level\":\"" + reservoirLevel + "\",\"full\":" +
-      String(reservoirFullWet ? "true" : "false") + ",\"online\":" +
-      String(rainNodeOnline ? "true" : "false") + "},";
-    liveTelemetryJson += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-    liveTelemetryJson += "\"firebaseReady\":" + String(firebaseInitialized && app.ready() ? "true" : "false") + ",";
     const bool firebaseHeartbeatFresh = lastFirebaseHeartbeatSuccessAt != 0 &&
       now - lastFirebaseHeartbeatSuccessAt <= firebaseHeartbeatFreshWindow;
-    liveTelemetryJson += "\"firebaseHeartbeatFresh\":" +
-      String(firebaseHeartbeatFresh ? "true" : "false");
-    liveTelemetryJson += "}";
-    if (liveTelemetryJson != lastFirebaseTelemetryJson) {
+    const int jsonLength = snprintf(
+      liveTelemetryBuffer, sizeof(liveTelemetryBuffer),
+      "{\"tds1\":%.0f,\"ph1\":%.2f,\"ph1Valid\":%s,\"temp1\":%.1f,\"temp1Valid\":%s,"
+      "\"water1\":\"%s\",\"tds2\":%.0f,\"ph2\":%.2f,\"ph2Valid\":%s,\"temp2\":%.1f,"
+      "\"temp2Valid\":%s,\"water2\":\"%s\",\"actuators/phUp1\":%s,"
+      "\"actuators/phDown1\":%s,\"actuators/nutrient1\":%s,\"actuators/phUp2\":%s,"
+      "\"actuators/phDown2\":%s,\"actuators/nutrient2\":%s,"
+      "\"actuators/growLight\":%s,\"reservoir\":{\"level\":\"%s\",\"full\":%s,"
+      "\"online\":%s},\"wifiConnected\":%s,\"firebaseReady\":%s,"
+      "\"firebaseHeartbeatFresh\":%s}",
+      currentTdsValue1, currentPhValue1, jsonBoolText(ph1Valid),
+      currentTemperature1, jsonBoolText(temperature1Valid),
+      digitalRead(WATER_SENSOR_PIN1) == HIGH ? "full" : "low",
+      currentTdsValue2, currentPhValue2, jsonBoolText(ph2Valid),
+      currentTemperature2, jsonBoolText(temperature2Valid),
+      digitalRead(WATER_SENSOR_PIN2) == HIGH ? "full" : "low",
+      jsonBoolText(digitalRead(phUp1Pin) == PUMP_ON),
+      jsonBoolText(digitalRead(phDown1Pin) == PUMP_ON),
+      jsonBoolText(digitalRead(nutrientPump1Pin) == PUMP_ON),
+      jsonBoolText(digitalRead(phUp2Pin) == PUMP_ON),
+      jsonBoolText(digitalRead(phDown2Pin) == PUMP_ON),
+      jsonBoolText(digitalRead(nutrientPump2Pin) == PUMP_ON),
+      jsonBoolText(digitalRead(growLightPin) == LIGHT_ON),
+      reservoirLevel.c_str(), jsonBoolText(reservoirFullWet),
+      jsonBoolText(rainNodeOnline),
+      jsonBoolText(WiFi.status() == WL_CONNECTED),
+      jsonBoolText(firebaseInitialized && app.ready()),
+      jsonBoolText(firebaseHeartbeatFresh));
+    if (jsonLength <= 0 ||
+        jsonLength >= static_cast<int>(sizeof(liveTelemetryBuffer))) {
+      Serial.println("Live telemetry JSON did not fit its buffer; push skipped.");
+    } else if (!telemetryUpdatePending &&
+               !lastFirebaseTelemetryJson.equals(liveTelemetryBuffer)) {
+      telemetryUpdatePending = true;
+      telemetryUpdateStartedAt = now;
       Database.update<object_t>(
         aClient,
         "/hydrodeck",
-        object_t(liveTelemetryJson.c_str())
+        object_t(liveTelemetryBuffer),
+        processFirebaseTelemetryResult,
+        "liveTelemetry"
       );
       if (aClient.lastError().code() != 0) {
+        telemetryUpdatePending = false;
+        noteFirebaseUploadFailure();
         Serial.print("Firebase live telemetry update failed, code: ");
         Serial.println(aClient.lastError().code());
       } else {
-        lastFirebaseTelemetryJson = liveTelemetryJson;
+        lastFirebaseTelemetryJson = liveTelemetryBuffer;
         Serial.println("Firebase changed telemetry update sent.");
       }
     }

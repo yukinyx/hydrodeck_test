@@ -59,6 +59,39 @@ void main() {
         isFalse,
       );
     });
+
+    test('RAIN status freshness allows a short future skew', () {
+      final now = DateTime.utc(2026, 11, 4, 8);
+      expect(
+        isRainStatusFresh(
+          now.subtract(const Duration(seconds: 45)).millisecondsSinceEpoch,
+          now: now,
+        ),
+        isTrue,
+      );
+      expect(
+        isRainStatusFresh(
+          now.subtract(const Duration(seconds: 46)).millisecondsSinceEpoch,
+          now: now,
+        ),
+        isFalse,
+      );
+      expect(isRainStatusFresh(null, now: now), isFalse);
+      expect(
+        isRainStatusFresh(
+          now.add(const Duration(seconds: 5)).millisecondsSinceEpoch,
+          now: now,
+        ),
+        isTrue,
+      );
+      expect(
+        isRainStatusFresh(
+          now.add(const Duration(seconds: 6)).millisecondsSinceEpoch,
+          now: now,
+        ),
+        isFalse,
+      );
+    });
   });
 
   group('Manila history intervals', () {
@@ -408,7 +441,7 @@ void main() {
       expect(canStartActuatorAlongside('phDown1', {'phUp1'}), isFalse);
     });
 
-    test('rejects either water pump while the RAIN node is offline', () {
+    test('does not require the MAIN ESP-NOW link to start water pumps', () {
       for (final actuator in ['waterPump1', 'waterPump2']) {
         final decision = decidePumpCommand(
           actuator: actuator,
@@ -418,9 +451,9 @@ void main() {
           activeRequestId: '',
           rainNodeOnline: false,
         );
-        expect(decision.start, isFalse);
-        expect(decision.reject, isTrue);
-        expect(decision.status, 'rejected');
+        expect(decision.start, isTrue);
+        expect(decision.reject, isFalse);
+        expect(decision.status, 'running');
       }
     });
 

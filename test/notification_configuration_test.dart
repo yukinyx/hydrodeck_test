@@ -7,6 +7,14 @@ import 'package:hydrodeck_test/main.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('notification IDs stay within the Android integer range', () {
+    final largeTimestampId = notificationIdFor('1794195673734000');
+    final invalidId = notificationIdFor('not-a-number');
+
+    expect(largeTimestampId, inInclusiveRange(0, 0x7FFFFFFF));
+    expect(invalidId, inInclusiveRange(0, 0x7FFFFFFF));
+  });
+
   test('initializes the pH alert channel with its raw custom sound', () async {
     final previousPlatform = debugDefaultTargetPlatformOverride;
     debugDefaultTargetPlatformOverride = TargetPlatform.android;

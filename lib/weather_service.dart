@@ -72,13 +72,12 @@ class WeatherConditions {
 }
 
 class WeatherService {
+  static WeatherConditions? lastSuccessfulConditions;
+
   static Future<WeatherLocation> currentLocation() async {
     try {
-      if (!await Geolocator.isLocationServiceEnabled()) {
-        throw const WeatherException(
-          'Location services are turned off. Turn them on, then retry.',
-        );
-      }
+      final locationServiceEnabled =
+          await Geolocator.isLocationServiceEnabled();
 
       var permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
@@ -97,12 +96,37 @@ class WeatherService {
         );
       }
 
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.medium,
-          timeLimit: Duration(seconds: 15),
-        ),
-      );
+      Position? position;
+      Object? locationError;
+      if (locationServiceEnabled) {
+        try {
+          position = await Geolocator.getCurrentPosition(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.low,
+              timeLimit: Duration(seconds: 15),
+            ),
+          );
+        } catch (error) {
+          locationError = error;
+        }
+      } else {
+        locationError = const WeatherException(
+          'Location services are turned off. Turn them on, then retry.',
+        );
+      }
+      if (position == null) {
+        try {
+          position = await Geolocator.getLastKnownPosition();
+        } catch (error) {
+          locationError ??= error;
+        }
+      }
+      if (position == null) {
+        if (locationError != null) throw locationError;
+        throw const WeatherException(
+          'Could not get your current location. Check location permissions and services, then retry.',
+        );
+      }
       return WeatherLocation(
         name: 'Current location',
         latitude: position.latitude,
@@ -142,20 +166,37 @@ class WeatherService {
       'forecast_days': '5',
       'timezone': 'auto',
     });
-    late final http.Response response;
-    try {
-      response = await http.get(uri).timeout(const Duration(seconds: 8));
-    } on TimeoutException {
+    http.Response? response;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        response = await http.get(uri).timeout(const Duration(seconds: 15));
+        break;
+      } catch (error) {
+        final retryable =
+            error is TimeoutException ||
+            error is http.ClientException ||
+            error.runtimeType.toString() == 'SocketException';
+        if (!retryable) rethrow;
+        if (attempt == 0) continue;
+        if (error is TimeoutException) {
+          throw const WeatherException(
+            'The weather request timed out. Check your connection, then retry.',
+          );
+        }
+        throw const WeatherException(
+          'No internet connection. If you\'re connected to the Hydrodeck hotspot, switch to home Wi-Fi or mobile data.',
+        );
+      }
+    }
+    if (response == null) {
       throw const WeatherException(
-        'The weather request timed out. Check your connection, then retry.',
-      );
-    } on http.ClientException {
-      throw const WeatherException(
-        'Could not connect to the weather service. Check your connection, then retry.',
+        'Could not connect to the weather service. Please retry.',
       );
     }
     if (response.statusCode != 200) {
-      throw const WeatherException('Weather is temporarily unavailable.');
+      throw WeatherException(
+        'Weather service returned HTTP ${response.statusCode}.',
+      );
     }
     final decoded = jsonDecode(response.body);
     if (decoded is! Map<String, dynamic>) {
@@ -213,7 +254,7 @@ class WeatherService {
         );
       }
     }
-    return WeatherConditions(
+    final conditions = WeatherConditions(
       location: location,
       temperature: _number(current['temperature_2m']),
       feelsLike: _number(current['apparent_temperature']),
@@ -224,6 +265,8 @@ class WeatherService {
       hourly: hourlyForecast,
       forecast: forecast,
     );
+    lastSuccessfulConditions = conditions;
+    return conditions;
   }
 
   static double? _number(Object? value) =>
